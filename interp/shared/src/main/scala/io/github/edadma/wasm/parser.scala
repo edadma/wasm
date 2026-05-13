@@ -132,7 +132,7 @@ object Parser:
       case 0x7f => ValueType.I32Type
       case 0x7e => ValueType.I64Type
       case 0x7d => ValueType.F32Type
-      case 0x7c => fail(WasmError.InvalidModule("f64 valtype not supported in MVP"))
+      case 0x7c => ValueType.F64Type
       case b    => fail(WasmError.InvalidModule(s"unknown valtype 0x${b.toHexString}"))
 
   // === Import section ===
