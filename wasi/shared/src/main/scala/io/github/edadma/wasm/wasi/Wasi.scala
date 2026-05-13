@@ -86,8 +86,12 @@ object Wasi:
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
-        "fd_write"  -> ((mem, args) => fdWrite(mem, args, ctx)),
-        "proc_exit" -> ((_,   args) => procExit(args)),
+        "fd_write"         -> ((mem, args) => fdWrite(mem, args, ctx)),
+        "proc_exit"        -> ((_,   args) => procExit(args)),
+        "args_sizes_get"   -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
+        "args_get"         -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
+        "environ_sizes_get"-> ((mem, args) => sizesGet(mem, args, envEntries(ctx))),
+        "environ_get"      -> ((mem, args) => entriesGet(mem, args, envEntries(ctx))),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -173,6 +177,112 @@ object Wasi:
             Seq(I32(ESUCCESS))
 
       case _ => Seq(I32(EINVAL))
+
+  // === args + environ (Phase 7.B) ===========================================
+  //
+  // WASI presents process args and the environment block through two pairs
+  // of syscalls with an identical shape — only the source list differs.
+  // We share the implementation: `sizesGet` writes the two i32 size words
+  // and `entriesGet` writes the pointer-vector + NUL-terminated buffer.
+  //
+  // Each entry is laid out on the wasi side as a NUL-terminated UTF-8
+  // byte sequence. For environ entries we use the conventional
+  // `NAME=VALUE` form. The host pre-computes each entry's bytes once per
+  // call: that lets `sizes_get` and `_get` agree on byte counts even when
+  // (a future caller) hands us non-ASCII strings.
+
+  /** Compute the wasi-side byte representation of each arg as
+    * `UTF-8 bytes + 0x00`. The trailing NUL is part of the entry from
+    * the wasi caller's perspective — that's how `args_sizes_get` and
+    * `args_get` must agree. */
+  private def argEntries(ctx: WasiContext): Array[Array[Byte]] =
+    ctx.args.iterator.map(s => nulTerminated(s)).toArray
+
+  /** Compute the wasi-side byte representation of each environ entry as
+    * `NAME=VALUE` UTF-8 bytes + 0x00. */
+  private def envEntries(ctx: WasiContext): Array[Array[Byte]] =
+    ctx.envs.iterator.map { case (k, v) => nulTerminated(s"$k=$v") }.toArray
+
+  private def nulTerminated(s: String): Array[Byte] =
+    val raw = s.getBytes("UTF-8")
+    val out = new Array[Byte](raw.length + 1)
+    System.arraycopy(raw, 0, out, 0, raw.length)
+    out(raw.length) = 0
+    out
+
+  /** `*_sizes_get(count_ptr: i32, buf_size_ptr: i32) -> errno`
+    *
+    * Writes the number of entries at `count_ptr` and the total byte size
+    * (sum of NUL-terminated UTF-8 lengths) at `buf_size_ptr`. Either
+    * pointer being out-of-range yields EFAULT and neither slot is
+    * written.
+    *
+    * Shared between `args_sizes_get` and `environ_sizes_get` — the
+    * caller picks the entry list. */
+  private def sizesGet(memory: Memory, args: Seq[Value],
+                       entries: Array[Array[Byte]]): Seq[Value] =
+    args match
+      case Seq(I32(countPtr), I32(bufSizePtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if !fits4(countPtr,   dataLen) then return Seq(I32(EFAULT))
+        if !fits4(bufSizePtr, dataLen) then return Seq(I32(EFAULT))
+        var totalBytes = 0
+        var i          = 0
+        while i < entries.length do
+          totalBytes += entries(i).length
+          i          += 1
+        writeI32LE(data, countPtr,   entries.length)
+        writeI32LE(data, bufSizePtr, totalBytes)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `*_get(ptr_vec_ptr: i32, buf_ptr: i32) -> errno`
+    *
+    * Writes `count` 32-bit pointers at `ptr_vec_ptr` followed by the
+    * NUL-terminated UTF-8 buffer at `buf_ptr`. Each pointer addresses
+    * the start of the matching entry inside `buf_ptr`'s region.
+    *
+    * Bounds-check both regions up front using Long arithmetic so a
+    * deliberately-wrapping i32 multiply can't sneak past. On EFAULT we
+    * write nothing — partial writes would leak state from a malformed
+    * call and the wasi spec gives us the latitude to fail atomically.
+    *
+    * Shared between `args_get` and `environ_get`. */
+  private def entriesGet(memory: Memory, args: Seq[Value],
+                         entries: Array[Array[Byte]]): Seq[Value] =
+    args match
+      case Seq(I32(ptrVecPtr), I32(bufPtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+
+        var totalBytes = 0
+        var i          = 0
+        while i < entries.length do
+          totalBytes += entries(i).length
+          i          += 1
+
+        val ptrVecEnd = ptrVecPtr.toLong + entries.length.toLong * 4L
+        val bufEnd    = bufPtr.toLong    + totalBytes.toLong
+        if ptrVecPtr < 0 || bufPtr < 0 ||
+           ptrVecEnd > dataLen || bufEnd > dataLen
+        then return Seq(I32(EFAULT))
+
+        var bufCursor = bufPtr
+        i = 0
+        while i < entries.length do
+          val entry = entries(i)
+          writeI32LE(data, ptrVecPtr + i * 4, bufCursor)
+          System.arraycopy(entry, 0, data, bufCursor, entry.length)
+          bufCursor += entry.length
+          i         += 1
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** Does a 4-byte little-endian word fit at `ptr` in a buffer of
+    * length `dataLen`? Negative `ptr` always fails. */
+  private inline def fits4(ptr: Int, dataLen: Int): Boolean =
+    ptr >= 0 && ptr.toLong + 4L <= dataLen
 
   /** `proc_exit(rval: i32) -> noreturn`
     *
