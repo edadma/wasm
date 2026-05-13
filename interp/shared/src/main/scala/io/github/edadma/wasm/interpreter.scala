@@ -173,10 +173,12 @@ object Interpreter:
       // likewise take no immediates — `step` is the gate on what's executable.
       case b if b >= 0x45 && b <= 0x75 =>
         Right(pc + 1)
-      // 0x79–0xA6: i64 unary + i64 numeric/bitwise/shift/rotate (0x79–0x8A),
-      // f32 unary + f32 numeric/min/max/copysign (0x8B–0x98), and f64 unary
-      // + f64 numeric (0x99–0xA6). All single-byte.
-      case b if b >= 0x79 && b <= 0xa6 =>
+      // 0x79–0xBF: i64 unary + i64 numeric/bitwise/shift/rotate (0x79–0x8A),
+      // f32 unary + f32 numeric/min/max/copysign (0x8B–0x98), f64 unary
+      // + f64 numeric (0x99–0xA6), and every numeric conversion opcode
+      // (0xA7–0xBF: wrap/extend/trunc/convert/demote/promote/reinterpret).
+      // All single-byte.
+      case b if b >= 0x79 && b <= 0xbf =>
         Right(pc + 1)
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -754,9 +756,203 @@ final class Interpreter private[wasm] (
       case 0xa5 => binopF64((a, b) => jl.Math.max     (a, b));     f.pc += 1              // f64.max
       case 0xa6 => binopF64((a, b) => jl.Math.copySign(a, b));     f.pc += 1              // f64.copysign
 
+      // === conversions (Phase 1.4) =======================================
+      //
+      // Three flavours, all single-byte opcodes, all popping one operand and
+      // pushing one of a different type (or same bits reinterpreted):
+      //
+      //   * integer-only (wrap_i64, extend_i32_{s,u}) — no traps;
+      //   * float→int trunc — TRAPS on NaN / ±Inf / out-of-range (post-trunc);
+      //   * int→float convert — no trap, but may round (precision loss);
+      //   * f32⇄f64 demote/promote — no trap;
+      //   * reinterpret — pure bit-cast, never inspects the value.
+      //
+      // Boundary checks for trunc are written in the FLOAT space (against
+      // exact-power-of-two limits like 2^31, 2^32, 2^63, 2^64), all of which
+      // are representable in both Float and Double. The comparisons evaluate
+      // to false for NaN so the explicit NaN check is needed first.
+
+      case 0xa7 =>                                                                          // i32.wrap_i64
+        val v = popI64()
+        pushI32(v.toInt)
+        f.pc += 1
+
+      case 0xa8 =>                                                                          // i32.trunc_f32_s
+        val v = popF32()
+        if jl.Float.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v < -2147483648.0f || v >= 2147483648.0f then fail(WasmError.InvalidModule("i32.trunc_f32_s: out of range"))
+        pushI32(v.toInt)
+        f.pc += 1
+
+      case 0xa9 =>                                                                          // i32.trunc_f32_u
+        val v = popF32()
+        if jl.Float.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v <= -1.0f || v >= 4294967296.0f then fail(WasmError.InvalidModule("i32.trunc_f32_u: out of range"))
+        pushI32(v.toLong.toInt)
+        f.pc += 1
+
+      case 0xaa =>                                                                          // i32.trunc_f64_s
+        val v = popF64()
+        if jl.Double.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v < -2147483648.0 || v >= 2147483648.0 then fail(WasmError.InvalidModule("i32.trunc_f64_s: out of range"))
+        pushI32(v.toInt)
+        f.pc += 1
+
+      case 0xab =>                                                                          // i32.trunc_f64_u
+        val v = popF64()
+        if jl.Double.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v <= -1.0 || v >= 4294967296.0 then fail(WasmError.InvalidModule("i32.trunc_f64_u: out of range"))
+        pushI32(v.toLong.toInt)
+        f.pc += 1
+
+      case 0xac =>                                                                          // i64.extend_i32_s
+        val v = popI32()
+        pushI64(v.toLong)
+        f.pc += 1
+
+      case 0xad =>                                                                          // i64.extend_i32_u
+        val v = popI32()
+        pushI64(v.toLong & 0xffffffffL)
+        f.pc += 1
+
+      // i64.trunc_f32_s: signed range is [-2^63, 2^63). 2^63 as Float rounds
+      // to exactly 9223372036854775808.0f (the next representable float above
+      // 9223372036854774784.0, the largest in-range value). So `>= 2^63f`
+      // rejects 2^63 and everything above; `< -2^63f` rejects -2^63 - ulp
+      // and below. The boundary value -2^63 itself is in range and produces
+      // Long.MinValue.
+      case 0xae =>                                                                          // i64.trunc_f32_s
+        val v = popF32()
+        if jl.Float.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v < -9223372036854775808.0f || v >= 9223372036854775808.0f then
+          fail(WasmError.InvalidModule("i64.trunc_f32_s: out of range"))
+        pushI64(v.toLong)
+        f.pc += 1
+
+      // i64.trunc_f32_u: unsigned range is [0, 2^64). `v.toLong` doesn't
+      // cover the [2^63, 2^64) range correctly (Java clamps to Long.MaxValue
+      // for Float→Long when the float exceeds Long range). Use the
+      // bit-splice trick: shift the high half into the low half via a
+      // subtraction by 2^63, convert, then OR back the sign bit.
+      case 0xaf =>                                                                          // i64.trunc_f32_u
+        val v = popF32()
+        if jl.Float.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v <= -1.0f || v >= 18446744073709551616.0f then
+          fail(WasmError.InvalidModule("i64.trunc_f32_u: out of range"))
+        val result =
+          if v < 9223372036854775808.0f then v.toLong
+          else (v - 9223372036854775808.0f).toLong | Long.MinValue
+        pushI64(result)
+        f.pc += 1
+
+      case 0xb0 =>                                                                          // i64.trunc_f64_s
+        val v = popF64()
+        if jl.Double.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v < -9223372036854775808.0 || v >= 9223372036854775808.0 then
+          fail(WasmError.InvalidModule("i64.trunc_f64_s: out of range"))
+        pushI64(v.toLong)
+        f.pc += 1
+
+      case 0xb1 =>                                                                          // i64.trunc_f64_u
+        val v = popF64()
+        if jl.Double.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
+        if v <= -1.0 || v >= 18446744073709551616.0 then
+          fail(WasmError.InvalidModule("i64.trunc_f64_u: out of range"))
+        val result =
+          if v < 9223372036854775808.0 then v.toLong
+          else (v - 9223372036854775808.0).toLong | Long.MinValue
+        pushI64(result)
+        f.pc += 1
+
+      // Int→float convert: no traps, but a Long → Float may lose precision
+      // (Float has 24 bits of mantissa; Long has 64). Spec says round to
+      // nearest, ties to even — which is what Java's primitive cast does.
+
+      case 0xb2 =>                                                                          // f32.convert_i32_s
+        val v = popI32()
+        pushF32(v.toFloat)
+        f.pc += 1
+
+      case 0xb3 =>                                                                          // f32.convert_i32_u
+        val v = popI32()
+        pushF32((v.toLong & 0xffffffffL).toFloat)
+        f.pc += 1
+
+      case 0xb4 =>                                                                          // f32.convert_i64_s
+        val v = popI64()
+        pushF32(v.toFloat)
+        f.pc += 1
+
+      // f32.convert_i64_u: Java's Long→Float is signed. For unsigned values
+      // with the high bit set, halve, convert, double, and add the low bit
+      // back. The `(a >>> 1) | (a & 1L)` trick preserves the rounding parity
+      // by OR-ing in the low bit before the halve drops it — without that,
+      // `(a >>> 1).toFloat * 2.0f` would round half-to-even incorrectly for
+      // unsigned-Long values that fall on a tie between two floats.
+      case 0xb5 =>                                                                          // f32.convert_i64_u
+        val v = popI64()
+        if v >= 0L then pushF32(v.toFloat)
+        else pushF32(((v >>> 1) | (v & 1L)).toFloat * 2.0f)
+        f.pc += 1
+
+      case 0xb6 =>                                                                          // f32.demote_f64
+        val v = popF64()
+        pushF32(v.toFloat)
+        f.pc += 1
+
+      case 0xb7 =>                                                                          // f64.convert_i32_s
+        val v = popI32()
+        pushF64(v.toDouble)
+        f.pc += 1
+
+      case 0xb8 =>                                                                          // f64.convert_i32_u
+        val v = popI32()
+        pushF64((v.toLong & 0xffffffffL).toDouble)
+        f.pc += 1
+
+      case 0xb9 =>                                                                          // f64.convert_i64_s
+        val v = popI64()
+        pushF64(v.toDouble)
+        f.pc += 1
+
+      case 0xba =>                                                                          // f64.convert_i64_u
+        val v = popI64()
+        if v >= 0L then pushF64(v.toDouble)
+        else pushF64(((v >>> 1) | (v & 1L)).toDouble * 2.0)
+        f.pc += 1
+
+      case 0xbb =>                                                                          // f64.promote_f32
+        val v = popF32()
+        pushF64(v.toDouble)
+        f.pc += 1
+
+      // Reinterpret: pure bit-cast. `floatToRawIntBits` / `doubleToRawLongBits`
+      // (vs `floatToIntBits` / `doubleToLongBits`) preserve NaN payloads —
+      // the non-raw versions canonicalise NaN to a single representation,
+      // which would lose information that the wasm value carries.
+
+      case 0xbc =>                                                                          // i32.reinterpret_f32
+        val v = popF32()
+        pushI32(jl.Float.floatToRawIntBits(v))
+        f.pc += 1
+
+      case 0xbd =>                                                                          // i64.reinterpret_f64
+        val v = popF64()
+        pushI64(jl.Double.doubleToRawLongBits(v))
+        f.pc += 1
+
+      case 0xbe =>                                                                          // f32.reinterpret_i32
+        val v = popI32()
+        pushF32(jl.Float.intBitsToFloat(v))
+        f.pc += 1
+
+      case 0xbf =>                                                                          // f64.reinterpret_i64
+        val v = popI64()
+        pushF64(jl.Double.longBitsToDouble(v))
+        f.pc += 1
+
       // === unsupported ===================================================
 
-      // TODO: conversions (0xA7–0xC4) — Phase 1.4.
       // TODO: 0x11 call_indirect — needs tables.
       // TODO: 0x3F memory.size, 0x40 memory.grow.
       case other => fail(WasmError.UnknownOpcode(other))

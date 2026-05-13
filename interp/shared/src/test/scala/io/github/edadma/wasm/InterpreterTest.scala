@@ -1037,6 +1037,258 @@ object InterpreterTest:
       check(callF64(inst, "select", F64(1.5), F64(2.5), I32(0)) == 2.5, "cond=0 picks b")
     }
 
+    // --- Phase 1.4: conversions --------------------------------------------
+
+    test("conv: i32.wrap_i64 drops the high 32 bits") {
+      val inst = instantiate(Fixtures.conv_int_int)
+      check(callI32V(inst, "wrap_i64", I64(0x1_2345_6789L))         == 0x2345_6789, "high bits dropped")
+      check(callI32V(inst, "wrap_i64", I64(-1L))                    == -1,          "all ones survives")
+      check(callI32V(inst, "wrap_i64", I64(0x0000_0001_0000_0000L)) == 0,           "low 32 bits zero")
+      check(callI32V(inst, "wrap_i64", I64(Long.MinValue))          == 0,           "MIN_LONG low half = 0")
+    }
+
+    test("conv: i64.extend_i32_s sign-extends; i64.extend_i32_u zero-extends") {
+      val inst = instantiate(Fixtures.conv_int_int)
+      check(callI64(inst, "extend_i32_s", I32( 1))          ==  1L,                "+1 stays +1")
+      check(callI64(inst, "extend_i32_s", I32(-1))          == -1L,                "-1 sign-extends to all ones")
+      check(callI64(inst, "extend_i32_s", I32(Int.MinValue))== Int.MinValue.toLong, "MIN_INT sign-extends")
+      check(callI64(inst, "extend_i32_u", I32(-1))          == 0xffffffffL,        "0xffffffff zero-extends")
+      check(callI64(inst, "extend_i32_u", I32(Int.MinValue))== 0x80000000L,        "high-bit-set treated unsigned")
+    }
+
+    test("conv: i32.trunc_f32_s — in-range values truncate toward zero") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI32V(inst, "i32_trunc_f32_s", F32( 1.9f)) ==  1, " 1.9 -> 1")
+      check(callI32V(inst, "i32_trunc_f32_s", F32(-1.9f)) == -1, "-1.9 -> -1 (toward zero)")
+      check(callI32V(inst, "i32_trunc_f32_s", F32( 0.0f)) ==  0, " 0   -> 0")
+      // Boundary just inside the signed-i32 range. 2147483520.0f is the largest
+      // exactly-representable Float strictly less than 2^31.
+      check(callI32V(inst, "i32_trunc_f32_s", F32(2147483520.0f))  ==  2147483520,  "near MAX_INT")
+      check(callI32V(inst, "i32_trunc_f32_s", F32(-2147483648.0f)) == Int.MinValue, "exactly -2^31")
+    }
+
+    test("conv: i32.trunc_f32_s — traps on NaN, ±Inf, and out-of-range") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      expectError(inst, "i32_trunc_f32_s", Seq(F32(Float.NaN))) {
+        case WasmError.InvalidModule(m) => m.contains("NaN")
+      }
+      expectError(inst, "i32_trunc_f32_s", Seq(F32(Float.PositiveInfinity))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i32_trunc_f32_s", Seq(F32(Float.NegativeInfinity))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      // 2147483648.0f is the next Float above 2147483520.0f and equals 2^31 exactly
+      // — out of signed range at the top boundary.
+      expectError(inst, "i32_trunc_f32_s", Seq(F32(2147483648.0f))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      // The next Float below -2^31 is -2147483904.0f.
+      expectError(inst, "i32_trunc_f32_s", Seq(F32(-2147483904.0f))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: i32.trunc_f32_u — in-range and traps") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI32V(inst, "i32_trunc_f32_u", F32(0.0f))  == 0, "0 -> 0")
+      check(callI32V(inst, "i32_trunc_f32_u", F32(1.9f))  == 1, "1.9 -> 1")
+      // 2147483648.0f is 2^31 — valid unsigned, would be negative as i32.
+      check(callI32V(inst, "i32_trunc_f32_u", F32(2147483648.0f)) == Int.MinValue, "2^31 -> i32 0x80000000")
+      // -0.5 is in the open interval (-1, 0), so it trunc-floors to 0 and is in range.
+      check(callI32V(inst, "i32_trunc_f32_u", F32(-0.5f)) == 0, "-0.5 -> 0 (in range)")
+      // Trap paths
+      expectError(inst, "i32_trunc_f32_u", Seq(F32(Float.NaN))) {
+        case WasmError.InvalidModule(m) => m.contains("NaN")
+      }
+      expectError(inst, "i32_trunc_f32_u", Seq(F32(-1.0f))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i32_trunc_f32_u", Seq(F32(4294967296.0f))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: i32.trunc_f64_s — in-range and traps") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI32V(inst, "i32_trunc_f64_s", F64( 12345.678)) ==  12345, "positive truncates")
+      check(callI32V(inst, "i32_trunc_f64_s", F64(-12345.678)) == -12345, "negative truncates toward zero")
+      check(callI32V(inst, "i32_trunc_f64_s", F64(Int.MaxValue.toDouble))  == Int.MaxValue, "MAX_INT exact")
+      check(callI32V(inst, "i32_trunc_f64_s", F64(Int.MinValue.toDouble))  == Int.MinValue, "MIN_INT exact")
+      expectError(inst, "i32_trunc_f64_s", Seq(F64(Double.NaN))) {
+        case WasmError.InvalidModule(m) => m.contains("NaN")
+      }
+      expectError(inst, "i32_trunc_f64_s", Seq(F64(2147483648.0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i32_trunc_f64_s", Seq(F64(-2147483649.0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: i32.trunc_f64_u — in-range and traps") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI32V(inst, "i32_trunc_f64_u", F64(0.0))           == 0,           "0 -> 0")
+      check(callI32V(inst, "i32_trunc_f64_u", F64(4294967295.0))  == -1,          "2^32-1 as i32 bits = -1")
+      check(callI32V(inst, "i32_trunc_f64_u", F64(-0.5))          == 0,           "-0.5 -> 0 (in range)")
+      expectError(inst, "i32_trunc_f64_u", Seq(F64(-1.0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i32_trunc_f64_u", Seq(F64(4294967296.0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: i64.trunc_f32_s / _u — in-range and traps") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI64(inst, "i64_trunc_f32_s", F32( 12345.5f)) ==  12345L, "positive truncates")
+      check(callI64(inst, "i64_trunc_f32_s", F32(-12345.5f)) == -12345L, "negative truncates toward zero")
+      // -2^63 is exactly representable in Float; the round-down-to-Long is Long.MinValue.
+      check(callI64(inst, "i64_trunc_f32_s", F32(-9223372036854775808.0f)) == Long.MinValue, "-2^63 exact")
+
+      // Unsigned: confirm values past 2^63 fit into the Long bit pattern.
+      // 1.8e19f rounds to a Float in [2^63, 2^64), so the result is interpretable
+      // as an unsigned i64. We check via Long.compareUnsigned vs the expected.
+      val r = callI64(inst, "i64_trunc_f32_u", F32(1.8e19f))
+      check(jl.Long.compareUnsigned(r, 0L) > 0, "1.8e19 -> positive unsigned i64")
+      check(jl.Long.compareUnsigned(r, -1L) <= 0, "still <= unsigned max")
+
+      // Trap paths
+      expectError(inst, "i64_trunc_f32_s", Seq(F32(Float.NaN))) {
+        case WasmError.InvalidModule(m) => m.contains("NaN")
+      }
+      expectError(inst, "i64_trunc_f32_s", Seq(F32(9223372036854775808.0f))) {  // 2^63 — out of range
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i64_trunc_f32_u", Seq(F32(-1.0f))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i64_trunc_f32_u", Seq(F32(1.8447e19f))) {  // > 2^64
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: i64.trunc_f64_s / _u — in-range and traps") {
+      val inst = instantiate(Fixtures.conv_trunc)
+      check(callI64(inst, "i64_trunc_f64_s", F64(1.0e15))  == 1000000000000000L, "1e15 exact")
+      check(callI64(inst, "i64_trunc_f64_s", F64(-1.5))    == -1L,               "-1.5 -> -1 (toward zero)")
+      check(callI64(inst, "i64_trunc_f64_s", F64(Long.MinValue.toDouble)) == Long.MinValue, "-2^63 exact")
+
+      // Unsigned high-bit-set range: 1.8e19 < 2^64; expected = 18000000000000000000 modulo 2^64.
+      val r = callI64(inst, "i64_trunc_f64_u", F64(1.8e19))
+      check(jl.Long.compareUnsigned(r, 0L) > 0, "1.8e19 -> positive unsigned i64")
+      check(jl.Long.compareUnsigned(r, -1L) <= 0, "still <= unsigned max")
+
+      // Traps
+      expectError(inst, "i64_trunc_f64_s", Seq(F64(Double.NaN))) {
+        case WasmError.InvalidModule(m) => m.contains("NaN")
+      }
+      expectError(inst, "i64_trunc_f64_s", Seq(F64(Double.PositiveInfinity))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i64_trunc_f64_s", Seq(F64(9223372036854775808.0))) {  // 2^63
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i64_trunc_f64_u", Seq(F64(-1.0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+      expectError(inst, "i64_trunc_f64_u", Seq(F64(18446744073709551616.0))) {  // 2^64
+        case WasmError.InvalidModule(m) => m.contains("out of range")
+      }
+    }
+
+    test("conv: f32.convert_i32_s / _u — signed and unsigned agree on positives, diverge on negatives") {
+      val inst = instantiate(Fixtures.conv_convert)
+      check(callF32(inst, "f32_convert_i32_s", I32(1))             ==  1.0f, "1 -> 1")
+      check(callF32(inst, "f32_convert_i32_s", I32(-1))            == -1.0f, "-1 -> -1 (signed)")
+      check(callF32(inst, "f32_convert_i32_u", I32(-1))            == 4294967296.0f, "0xffffffff as unsigned -> 2^32 (rounds up)")
+      check(callF32(inst, "f32_convert_i32_s", I32(Int.MinValue))  == -2147483648.0f, "MIN_INT signed")
+      check(callF32(inst, "f32_convert_i32_u", I32(Int.MinValue))  == 2147483648.0f,  "0x80000000 unsigned")
+    }
+
+    test("conv: f32.convert_i64_s / _u — signed and unsigned, with precision loss") {
+      val inst = instantiate(Fixtures.conv_convert)
+      check(callF32(inst, "f32_convert_i64_s", I64(1L))          ==  1.0f, "1 -> 1")
+      check(callF32(inst, "f32_convert_i64_s", I64(-1L))         == -1.0f, "-1 -> -1 (signed)")
+      check(callF32(inst, "f32_convert_i64_u", I64(-1L))         == 18446744073709551616.0f, "all-ones unsigned -> 2^64 (rounds up)")
+      check(callF32(inst, "f32_convert_i64_s", I64(Long.MinValue))== -9223372036854775808.0f, "MIN_LONG signed")
+      check(callF32(inst, "f32_convert_i64_u", I64(Long.MinValue))==  9223372036854775808.0f, "0x80…0 unsigned -> 2^63")
+    }
+
+    test("conv: f64.convert_i32_s / _u — every i32 fits exactly into f64") {
+      val inst = instantiate(Fixtures.conv_convert)
+      check(callF64(inst, "f64_convert_i32_s", I32(123))           == 123.0,           "positive")
+      check(callF64(inst, "f64_convert_i32_s", I32(-123))          == -123.0,          "negative")
+      check(callF64(inst, "f64_convert_i32_s", I32(Int.MinValue))  == Int.MinValue.toDouble, "MIN_INT exact")
+      check(callF64(inst, "f64_convert_i32_u", I32(-1))            == 4294967295.0,   "0xffffffff unsigned -> 2^32 - 1")
+      check(callF64(inst, "f64_convert_i32_u", I32(Int.MinValue))  == 2147483648.0,    "0x80000000 unsigned")
+    }
+
+    test("conv: f64.convert_i64_s / _u — signed and unsigned, with rounding past 2^53") {
+      val inst = instantiate(Fixtures.conv_convert)
+      check(callF64(inst, "f64_convert_i64_s", I64(123L))         == 123.0,            "positive")
+      check(callF64(inst, "f64_convert_i64_s", I64(Long.MinValue))== -9.223372036854776e18, "MIN_LONG signed")
+      check(callF64(inst, "f64_convert_i64_u", I64(-1L))          == 18446744073709551616.0, "all-ones unsigned -> 2^64")
+      check(callF64(inst, "f64_convert_i64_u", I64(Long.MinValue))==  9.223372036854776e18, "0x80…0 unsigned -> 2^63")
+    }
+
+    test("conv: f32.demote_f64 / f64.promote_f32 — sign + Inf + NaN survive") {
+      val inst = instantiate(Fixtures.conv_demote_promote)
+      check(callF32(inst, "demote",  F64(1.5))                          == 1.5f, "1.5 demotes exactly")
+      check(callF32(inst, "demote",  F64(-3.25))                        == -3.25f, "negative demotes exactly")
+      check(callF32(inst, "demote",  F64(Double.PositiveInfinity))      == Float.PositiveInfinity, "+inf survives")
+      check(callF32(inst, "demote",  F64(Double.NegativeInfinity))      == Float.NegativeInfinity, "-inf survives")
+      check(jl.Float.isNaN(callF32(inst, "demote", F64(Double.NaN))),   "NaN demotes to NaN")
+
+      // Demoting -0.0 must preserve the sign bit.
+      val demotedNegZero = callF32(inst, "demote", F64(-0.0))
+      check(demotedNegZero == 0.0f, "demoted -0 equals +0 numerically")
+      check(jl.Float.floatToRawIntBits(demotedNegZero) == jl.Float.floatToRawIntBits(-0.0f), "demoted -0 keeps sign bit")
+
+      // Promotion is exact across the Float range.
+      check(callF64(inst, "promote", F32(1.5f))                         == 1.5,   "1.5 promotes exactly")
+      check(callF64(inst, "promote", F32(Float.MaxValue))               == Float.MaxValue.toDouble, "MAX_FLOAT exact")
+      check(callF64(inst, "promote", F32(Float.PositiveInfinity))       == Double.PositiveInfinity, "+inf survives")
+      check(jl.Double.isNaN(callF64(inst, "promote", F32(Float.NaN))),  "NaN promotes to NaN")
+
+      val promotedNegZero = callF64(inst, "promote", F32(-0.0f))
+      check(jl.Double.doubleToRawLongBits(promotedNegZero) == jl.Double.doubleToRawLongBits(-0.0), "promoted -0 keeps sign bit")
+    }
+
+    test("conv: reinterpret round-trips for every pair (raw bits preserved)") {
+      val inst = instantiate(Fixtures.conv_reinterpret)
+
+      // i32 ↔ f32: bits survive through the reinterpret.
+      val bits32   = 0x40490fdb  // ~ pi as i32 bits
+      val asFloat  = callF32(inst, "f32_reinterpret_i32", I32(bits32))
+      check(jl.Float.floatToRawIntBits(asFloat) == bits32, "i32 -> f32 keeps bits")
+      check(callI32V(inst, "i32_reinterpret_f32", F32(asFloat)) == bits32, "round-trip back to i32")
+
+      // i64 ↔ f64: pi as f64 bits.
+      val bits64    = 0x400921fb54442d18L
+      val asDouble  = callF64(inst, "f64_reinterpret_i64", I64(bits64))
+      check(jl.Double.doubleToRawLongBits(asDouble) == bits64, "i64 -> f64 keeps bits")
+      check(callI64(inst, "i64_reinterpret_f64", F64(asDouble)) == bits64, "round-trip back to i64")
+
+      // NaN with a non-canonical payload survives the reinterpret round-trip.
+      // 0x7fc12345 is a signalling-style NaN payload that floatToRawIntBits
+      // (vs floatToIntBits) preserves end-to-end.
+      val nanBits     = 0x7fc12345
+      val asNaNFloat  = callF32(inst, "f32_reinterpret_i32", I32(nanBits))
+      check(jl.Float.isNaN(asNaNFloat), "reinterpreted bits form a NaN")
+      check(callI32V(inst, "i32_reinterpret_f32", F32(asNaNFloat)) == nanBits, "NaN payload survives")
+
+      // Same for f64: a non-canonical NaN bit pattern round-trips.
+      val nanBits64   = 0x7ff8000000abcdefL
+      val asNaNDouble = callF64(inst, "f64_reinterpret_i64", I64(nanBits64))
+      check(jl.Double.isNaN(asNaNDouble), "reinterpreted bits form a Double NaN")
+      check(callI64(inst, "i64_reinterpret_f64", F64(asNaNDouble)) == nanBits64, "double NaN payload survives")
+
+      // -0 stays distinct from +0 after a round-trip (sign bit preserved).
+      check(callI32V(inst, "i32_reinterpret_f32", F32(-0.0f)) == Int.MinValue,  "f32 -0 -> 0x80000000")
+      check(callI64(inst, "i64_reinterpret_f64", F64(-0.0))   == Long.MinValue, "f64 -0 -> sign bit only")
+    }
+
     // --- ModuleInstance accessors ------------------------------------------
     test("ModuleInstance.exportedFunctionNames: sorted, function-only") {
       val inst = instantiate(Fixtures.memory)
