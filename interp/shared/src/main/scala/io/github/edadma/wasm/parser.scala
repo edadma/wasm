@@ -4,10 +4,10 @@ import scala.collection.mutable.ArrayBuffer
 
 /** Parser for the WebAssembly binary format (MVP subset).
   *
-  * Recognised sections: Type (1), Import (2), Function (3), Memory (5),
-  * Global (6), Export (7), Code (10), Data (11). All other sections are
-  * skipped silently so we can be fed real-world modules that include
-  * Custom, Table, Start, Element, DataCount, etc. without choking.
+  * Recognised sections: Type (1), Import (2), Function (3), Table (4),
+  * Memory (5), Global (6), Export (7), Element (9), Code (10), Data (11).
+  * All other sections are skipped silently so we can be fed real-world
+  * modules that include Custom, Start, DataCount, etc. without choking.
   *
   * Style note: internally the parser uses a private `ParseFail` exception for
   * control flow because the section/instruction stream has many nested reads
@@ -85,9 +85,11 @@ object Parser:
     var types     = Vector.empty[FuncType]
     var imports   = Vector.empty[FuncImport]
     var functions = Vector.empty[Int]
+    var tables    = Vector.empty[Table]
     var memories  = Vector.empty[MemoryLimits]
     var globals   = Vector.empty[Global]
     var exports   = Vector.empty[Export]
+    var elements  = Vector.empty[ElementSegment]
     var codes     = Vector.empty[FuncBody]
     var data      = Vector.empty[DataSegment]
 
@@ -101,19 +103,21 @@ object Parser:
         case 1  => types     = parseTypeSection(c)
         case 2  => imports   = parseImportSection(c)
         case 3  => functions = parseFunctionSection(c)
+        case 4  => tables    = parseTableSection(c)
         case 5  => memories  = parseMemorySection(c)
         case 6  => globals   = parseGlobalSection(c)
         case 7  => exports   = parseExportSection(c)
+        case 9  => elements  = parseElementSection(c)
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
-        case _  => () // ignore Custom (0), Table (4), Start (8), Element (9), DataCount (12)
+        case _  => () // ignore Custom (0), Start (8), DataCount (12)
       c.pos = secEnd
 
     if codes.size != functions.size then
       fail(WasmError.InvalidModule(
         s"function/code section length mismatch: ${functions.size} types vs ${codes.size} bodies"))
 
-    WasmModule(types, imports, functions, memories, globals, exports, codes, data)
+    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data)
 
   // === Type section ===
 
@@ -149,12 +153,19 @@ object Parser:
       c.readByte() match
         case 0x00 =>                                     // func
           out += FuncImport(mod, name, c.readU32())
-        case 0x01 =>                                     // table  — skip
+        case 0x01 =>                                     // table — silently skipped.
+          // NOTE: when imported tables are eventually surfaced (Phase 5),
+          // they will occupy table indices 0..k-1 in the wasm namespace
+          // ahead of any defined tables. Until then, a module that mixes
+          // imported and defined tables would see its `call_indirect`
+          // tableidx immediates misalign against our `tables` array. The
+          // MVP allows at most one table, so single-defined-table modules
+          // remain correct.
           c.readByte()                                   // elem reftype
           skipLimits(c)
         case 0x02 =>                                     // memory — skip
           skipLimits(c)
-        case 0x03 =>                                     // global — skip
+        case 0x03 =>                                     // global — skip (Phase 5)
           c.readByte()                                   // valtype
           c.readByte()                                   // mut
         case other =>
@@ -172,6 +183,22 @@ object Parser:
   private def parseFunctionSection(c: Cursor): Vector[Int] =
     val n = c.readU32()
     Vector.tabulate(n)(_ => c.readU32())
+
+  // === Table section ===
+
+  /** Parse Section 4. Per table: reftype byte (MVP funcref 0x70 only — the
+    * future externref form 0x6F is rejected here with a clear diagnostic
+    * until reference types are supported) followed by limits. */
+  private def parseTableSection(c: Cursor): Vector[Table] =
+    val n = c.readU32()
+    Vector.tabulate(n) { _ =>
+      val refType = c.readByte()
+      if refType != 0x70 then
+        fail(WasmError.InvalidModule(
+          s"unsupported table reftype 0x${refType.toHexString} (MVP supports only funcref 0x70)"))
+      val lim = readLimits(c)
+      Table(refType, lim.min, lim.max)
+    }
 
   // === Memory section ===
 
@@ -218,11 +245,49 @@ object Parser:
       val idx  = c.readU32()
       kind match
         case 0x00 => out += FuncExport(name, idx)
+        case 0x01 => out += TableExport(name, idx)
         case 0x03 => out += GlobalExport(name, idx)
-        case 0x01 | 0x02 => () // table/memory — silently ignored until those sections land
+        case 0x02 => () // memory — silently ignored until Phase 4 surfaces it
         case other => fail(WasmError.InvalidModule(s"unknown export kind 0x${other.toHexString}"))
       i += 1
     out.toVector
+
+  // === Element section ===
+
+  /** Parse Section 9. The encoding has seven historical flag forms; Phase 3
+    * implements the two active ones (flag 0 and flag 2). Flag 0 is the
+    * common case wat2wasm emits for a top-level `(elem ...)`; flag 2
+    * appears once a non-default tableidx is given. The other flags
+    * (passive, declarative, active-with-elem-expr) are rejected explicitly
+    * with a diagnostic naming the flag so a future implementation knows
+    * exactly which form surfaced. */
+  private def parseElementSection(c: Cursor): Vector[ElementSegment] =
+    val n = c.readU32()
+    Vector.tabulate(n) { _ =>
+      val flag = c.readU32()
+      flag match
+        case 0 =>
+          // active, table 0, offset = i32.const expr, vec(funcidx)
+          val offset = readConstI32Expr(c)
+          val cnt    = c.readU32()
+          val idxs   = Vector.tabulate(cnt)(_ => c.readU32())
+          ElementSegment(0, offset, idxs)
+        case 2 =>
+          // active, explicit tableidx, offset = i32.const expr, elemkind byte
+          // (must be 0x00 = funcref), vec(funcidx)
+          val tableIdx = c.readU32()
+          val offset   = readConstI32Expr(c)
+          val ek       = c.readByte()
+          if ek != 0x00 then
+            fail(WasmError.InvalidModule(
+              s"element segment elemkind 0x${ek.toHexString} not supported (MVP funcref only)"))
+          val cnt  = c.readU32()
+          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
+          ElementSegment(tableIdx, offset, idxs)
+        case other =>
+          fail(WasmError.InvalidModule(
+            s"element segment flag $other not supported (MVP: flag 0 / flag 2 — active only)"))
+    }
 
   // === Code section ===
 

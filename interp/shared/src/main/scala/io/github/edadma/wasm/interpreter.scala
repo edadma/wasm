@@ -150,6 +150,11 @@ object Interpreter:
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
            0x23 | 0x24 =>                                  // global.{get,set}
         Leb128.readU32(body, pc + 1).map(_._2)
+      case 0x11 =>                                         // call_indirect — typeidx, tableidx
+        for
+          (_, p1) <- Leb128.readU32(body, pc + 1)
+          (_, p2) <- Leb128.readU32(body, p1)
+        yield p2
       case 0x28 | 0x29 | 0x2a | 0x2b |                     // i32.load, i64.load, f32.load, f64.load
            0x2c | 0x2d |                                   // i32.load8_s/u
            0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 |       // i64.load{8,16,32}_{s,u}
@@ -228,6 +233,12 @@ final class Interpreter private[wasm] (
     /** Parallel to `globals` — true if the corresponding slot is `var`,
       * false if `const`. `global.set` traps if the bit is false. */
     private val globalMutable: Array[Boolean],
+    /** One funcidx-int array per table; `-1` marks a null funcref slot.
+      * Shared across calls (write-once at instantiation in Phase 3). */
+    private val tables: Array[Array[Int]],
+    /** Module function-type vector — `call_indirect`'s dynamic signature
+      * check resolves the static typeidx immediate against this. */
+    private val types: Vector[FuncType],
 ):
   import Interpreter.*
 
@@ -370,6 +381,36 @@ final class Interpreter private[wasm] (
         val (idx, p) = readU32At(f, f.pc + 1)
         f.pc = p
         callFunction(idx)
+
+      case 0x11 =>                                                                        // call_indirect typeidx tableidx
+        // Two LEB u32 immediates: the declared function type and the table
+        // to dispatch through. The stack carries an i32 slot index; the slot
+        // must be in-range, non-null, and the slot's signature must match
+        // `types(typeidx)` exactly. All three trap classes surface here as
+        // InvalidModule until Phase 6 lifts the type check into validation.
+        val (typeIdx, p1)  = readU32At(f, f.pc + 1)
+        val (tableIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        if typeIdx < 0 || typeIdx >= types.length then
+          fail(WasmError.InvalidModule(s"call_indirect: invalid type index $typeIdx"))
+        if tableIdx < 0 || tableIdx >= tables.length then
+          fail(WasmError.InvalidModule(s"call_indirect: invalid table index $tableIdx"))
+        val tab  = tables(tableIdx)
+        val slot = popI32()
+        // Slot index is a wasm i32; signed values < 0 are also out-of-range
+        // (a future negative slot from arithmetic would never have been a
+        // valid funcref index in the first place).
+        if slot < 0 || slot >= tab.length then
+          fail(WasmError.InvalidModule(s"call_indirect: index $slot out of table bounds (size ${tab.length})"))
+        val fi = tab(slot)
+        if fi < 0 then
+          fail(WasmError.InvalidModule(s"call_indirect: null funcref at index $slot"))
+        val expected = types(typeIdx)
+        val actual   = funcs(fi).signature
+        if expected != actual then
+          fail(WasmError.InvalidModule(
+            s"call_indirect: signature mismatch at index $slot (expected $expected, got $actual)"))
+        callFunction(fi)
 
       // === parametric ====================================================
 
@@ -1005,7 +1046,6 @@ final class Interpreter private[wasm] (
 
       // === unsupported ===================================================
 
-      // TODO: 0x11 call_indirect — needs tables.
       // TODO: 0x3F memory.size, 0x40 memory.grow.
       case other => fail(WasmError.UnknownOpcode(other))
 

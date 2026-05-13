@@ -9,23 +9,33 @@ import scala.collection.mutable.ArrayBuffer
   * They persist across `invoke` calls — that persistence is what globals
   * exist to provide. Each fresh `Interpreter` shares the same arrays, so a
   * `global.set` in one call is visible to the next.
+  *
+  * `tables` is one funcidx-int array per declared table; `-1` marks a null
+  * slot. The arrays are mutable in principle (Phase 8+ adds `table.set`),
+  * but Phase 3 leaves them write-once at instantiation. `types` is the
+  * module's function-type vector — kept on the instance so
+  * `call_indirect`'s dynamic signature check can resolve a typeidx against
+  * the original `FuncType` rather than against the called slot's
+  * `ResolvedFunc.signature` directly.
   */
 final class ModuleInstance private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
     val memory: Memory,
     private val globals: Array[Value],
     private val globalMutable: Array[Boolean],
+    private val tables: Array[Array[Int]],
+    private val types: Vector[FuncType],
     private val exportFuncs: Map[String, Int],
     private val exportGlobals: Map[String, Int],
 ):
 
   /** Invoke an exported function. Each call gets a fresh interpreter so
-    * memory and globals persist across calls but the value/call stacks
-    * don't. */
+    * memory, globals, and tables persist across calls but the value/call
+    * stacks don't. */
   def invoke(name: String, args: Seq[Value] = Seq.empty): Either[WasmError, Seq[Value]] =
     exportFuncs.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
-      case Some(idx) => new Interpreter(funcs, memory, globals, globalMutable).invoke(idx, args)
+      case Some(idx) => new Interpreter(funcs, memory, globals, globalMutable, tables, types).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
     * confirm linking worked. */
@@ -143,6 +153,45 @@ object Runtime:
       globalMutable(gi) = g.mutable
       gi += 1
 
+    // === tables =============================================================
+    // One int-array per defined table; `-1` = null funcref. Imported tables
+    // aren't surfaced yet (Phase 5), so tableidx N in the binary maps 1:1
+    // to `tables(N)` here. Each segment's `funcIndices` resolve against the
+    // module's whole `funcs` index space (imports + defined), the same way
+    // `call funcidx` does — so a `(elem (i32.const 0) func 0)` referring to
+    // the first imported function resolves correctly.
+    val tables: Array[Array[Int]] = new Array[Array[Int]](module.tables.size)
+    var ti = 0
+    while ti < module.tables.size do
+      val t = module.tables(ti)
+      if t.min < 0 then fail(WasmError.InvalidModule(s"table $ti: negative min size"))
+      val arr = new Array[Int](t.min)
+      var k = 0
+      while k < arr.length do { arr(k) = -1; k += 1 }
+      tables(ti) = arr
+      ti += 1
+
+    // Apply active element segments. Each must fit entirely within its
+    // declared table's bounds (the spec calls this an instantiation-time
+    // check; failure surfaces as `InvalidModule` here, alongside data
+    // segments' out-of-range trap shape).
+    module.elements.foreach { seg =>
+      if seg.tableIdx < 0 || seg.tableIdx >= tables.length then
+        fail(WasmError.InvalidModule(s"element segment references invalid table ${seg.tableIdx}"))
+      val tab = tables(seg.tableIdx)
+      val end = seg.offset.toLong + seg.funcIndices.length
+      if seg.offset < 0 || end > tab.length then
+        fail(WasmError.InvalidModule(
+          s"element segment overflows table ${seg.tableIdx} (offset=${seg.offset}, len=${seg.funcIndices.length}, size=${tab.length})"))
+      var k = 0
+      while k < seg.funcIndices.length do
+        val fi = seg.funcIndices(k)
+        if fi < 0 || fi >= funcs.size then
+          fail(WasmError.InvalidModule(s"element segment references invalid function $fi"))
+        tab(seg.offset + k) = fi
+        k += 1
+    }
+
     // === exports ============================================================
     val exportFuncs: Map[String, Int] = module.exports.iterator.collect {
       case FuncExport(name, idx) =>
@@ -158,4 +207,24 @@ object Runtime:
         name -> idx
     }.toMap
 
-    new ModuleInstance(funcs.toIndexedSeq, memory, globals, globalMutable, exportFuncs, exportGlobals)
+    // Validate any TableExport indices up front. Phase 3 doesn't ship a
+    // host-side `tableValue` accessor (the surface is internal to
+    // `call_indirect`), but a bogus index in the binary should still
+    // surface here rather than wait for a runtime read.
+    module.exports.foreach {
+      case TableExport(name, idx) =>
+        if idx < 0 || idx >= tables.length then
+          fail(WasmError.InvalidModule(s"export `$name` references invalid table $idx"))
+      case _ => ()
+    }
+
+    new ModuleInstance(
+      funcs.toIndexedSeq,
+      memory,
+      globals,
+      globalMutable,
+      tables,
+      module.types,
+      exportFuncs,
+      exportGlobals,
+    )

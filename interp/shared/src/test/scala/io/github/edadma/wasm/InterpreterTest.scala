@@ -1473,6 +1473,53 @@ object InterpreterTest:
       check(callI32(inst, "get_k") == 99, "value unchanged after failed write")
     }
 
+    // --- Phase 3: tables + call_indirect -----------------------------------
+
+    test("call_indirect: same-signature dispatch by slot index") {
+      val inst = instantiate(Fixtures.call_indirect_basic)
+      // slot 0 = add_one, slot 1 = double
+      check(callI32(inst, "dispatch", 0, 41) == 42, "slot 0 (add_one) wrong")
+      check(callI32(inst, "dispatch", 0,  0) ==  1, "slot 0 of 0")
+      check(callI32(inst, "dispatch", 1,  7) == 14, "slot 1 (double) wrong")
+      check(callI32(inst, "dispatch", 1, -3) == -6, "slot 1 of negative")
+    }
+
+    test("call_indirect: per-signature dispatch (i32→i32, i64→i64, (i32,i32)→i32)") {
+      val inst = instantiate(Fixtures.call_indirect_polymorphic)
+      // each entry dispatches through the slot whose signature matches
+      check(callI32(inst, "call_neg_i32", 7)             == -7, "neg i32 wrong")
+      check(callI32(inst, "call_neg_i32", -2147483648)   == -2147483648, "neg i32 MIN_VALUE wraps")
+      check(callI64(inst, "call_neg_i64", I64(123456L))  == -123456L, "neg i64 wrong")
+      check(callI32(inst, "call_mul", 6, 7)              == 42, "mul wrong")
+    }
+
+    test("call_indirect: signature mismatch traps with InvalidModule(\"signature mismatch\")") {
+      // wrong_sig calls slot 2 ((i32,i32)->i32) with the (i32)->i32 typeidx;
+      // trap fires before the body of `mul` ever runs.
+      val inst = instantiate(Fixtures.call_indirect_polymorphic)
+      expectError(inst, "wrong_sig", Seq(I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("signature mismatch")
+      }
+    }
+
+    test("call_indirect: out-of-table-bounds slot traps") {
+      val inst = instantiate(Fixtures.call_indirect_traps)
+      expectError(inst, "via_oob", Seq(I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("out of table bounds")
+      }
+    }
+
+    test("call_indirect: null funcref slot traps") {
+      // Table is sized 4 but element segment only fills slots 0..1. Slot 2
+      // is null and traps with the distinctive "null funcref" message.
+      val inst = instantiate(Fixtures.call_indirect_traps)
+      expectError(inst, "via_null", Seq(I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("null funcref")
+      }
+      // Populated slots in the same module still work — confirms the trap
+      // path doesn't leave the runtime in a broken state.
+    }
+
     // --- ModuleInstance accessors ------------------------------------------
     test("ModuleInstance.exportedFunctionNames: sorted, function-only") {
       val inst = instantiate(Fixtures.memory)
@@ -1756,6 +1803,27 @@ object InterpreterTest:
         case other => check(false, s"expected InvalidModule, got $other")
     }
 
+    // Phase 3 — table / element section diagnostics ------------------------
+
+    test("parser: section 4 with non-funcref reftype returns InvalidModule") {
+      // 1 table, reftype 0x6F (externref — reference types), flag 0, min 0.
+      val tableSec = b(0x01, 0x6f, 0x00, 0x00)
+      val bad = Header ++ b(0x04, tableSec.length) ++ tableSec
+      Parser.parse(bad) match
+        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("reftype"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(reftype), got $other")
+    }
+
+    test("parser: section 9 with passive flag (1) returns InvalidModule") {
+      // 1 element segment with flag=1 (passive) — Phase 3 only models the
+      // active forms (flag 0 / flag 2).
+      val elemSec = b(0x01, 0x01)
+      val bad = Header ++ b(0x09, elemSec.length) ++ elemSec
+      Parser.parse(bad) match
+        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("element"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(element flag), got $other")
+    }
+
   // ========================================================================
   // 4. Interpreter unsupported-opcode tests
   // ========================================================================
@@ -1771,8 +1839,11 @@ object InterpreterTest:
           check(b == opcode, s"$label: expected opcode 0x${opcode.toHexString}, got 0x${b.toHexString}")
         case other => check(false, s"$label: expected UnknownOpcode(0x${opcode.toHexString}), got $other")
 
-    test("interpreter: 0x11 (call_indirect) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x11), 0x11, "call_indirect")
+    // Retargeted from 0x11 (formerly call_indirect, now supported in Phase 3)
+    // to 0x12 — a reserved byte immediately after call_indirect with no MVP
+    // meaning. Same code path through `skipImmediates`'s default branch.
+    test("interpreter: 0x12 (reserved, post-call_indirect) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x12), 0x12, "0x12 (reserved)")
     }
     // Retargeted from 0x76 (formerly i32.shr_u, now supported in Phase 1.5)
     // to 0xC4 — a reserved byte with no MVP meaning, and not the lead byte

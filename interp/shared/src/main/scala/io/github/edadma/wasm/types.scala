@@ -30,9 +30,27 @@ final case class FuncImport(module: String, name: String, typeIdx: Int)
 sealed trait Export { def name: String }
 final case class FuncExport(name: String, funcIdx: Int)     extends Export
 final case class GlobalExport(name: String, globalIdx: Int) extends Export
-// TODO: MemoryExport, TableExport — not surfaced yet
+final case class TableExport(name: String, tableIdx: Int)   extends Export
+// TODO: MemoryExport — not surfaced yet
 
 final case class MemoryLimits(min: Int, max: Option[Int])
+
+/** A module-defined table. MVP allows funcref (`0x70`) only; the `refType`
+  * byte is stored verbatim so a future externref pass can recognise the
+  * historical 0x6f without re-parsing. `min` is the initial slot count;
+  * any slot the element segments don't cover starts as a null funcref
+  * (encoded at the runtime as the int `-1`).
+  *
+  * Imported tables are not represented yet (Phase 5 alongside imported
+  * globals).
+  */
+final case class Table(refType: Int, min: Int, max: Option[Int])
+
+/** An active element segment: at instantiation, copy `funcIndices` into
+  * `tables(tableIdx)` starting at `offset`. MVP only models the active form
+  * (flag 0 and flag 2 in the binary). Passive / declarative segments are
+  * deferred. */
+final case class ElementSegment(tableIdx: Int, offset: Int, funcIndices: Vector[Int])
 
 /** A module-defined global. The init expression is evaluated at parse time
   * for the MVP-style `*.const` form and stored directly here as `initialValue`;
@@ -62,9 +80,11 @@ final case class WasmModule(
     types: Vector[FuncType],
     imports: Vector[FuncImport],
     functions: Vector[Int],          // type indices, one per defined function (matches `codes` 1:1)
+    tables: Vector[Table],           // module-defined tables (imports not surfaced yet)
     memories: Vector[MemoryLimits],
     globals: Vector[Global],         // module-defined globals (imports not surfaced yet)
     exports: Vector[Export],
+    elements: Vector[ElementSegment],// active element segments — applied to `tables` at instantiation
     codes: Vector[FuncBody],
     data: Vector[DataSegment],
 )
