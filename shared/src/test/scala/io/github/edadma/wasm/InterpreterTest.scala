@@ -263,13 +263,48 @@ object InterpreterTest:
       check(callI32(inst, "shr_s_mod32", -8, 33) == -4,                   "shr_s -8 by 33 == by 1")
     }
 
+    test("arith: i32.add / sub / mul wrap mod 2^32") {
+      val inst = instantiate(Fixtures.arith_wrap)
+      check(callI32(inst, "add_wrap") == Int.MinValue,
+        s"MAX_INT + 1 should wrap to MIN_INT, got ${callI32(inst, "add_wrap")}")
+      check(callI32(inst, "sub_wrap") == Int.MaxValue, "MIN_INT - 1 should wrap to MAX_INT")
+      check(callI32(inst, "mul_wrap") == 0,            "65536 * 65536 should wrap to 0")
+    }
+
+    test("if: bare `if` with cond=false skips body, cond=true runs it") {
+      val inst = instantiate(Fixtures.if_no_else)
+      check(callI32(inst, "maybe_inc", 0,  10) == 10, "cond=0 keeps $n unchanged")
+      check(callI32(inst, "maybe_inc", 1,  10) == 11, "cond=1 increments via stored local")
+      check(callI32(inst, "maybe_inc", 1, -1) ==   0, "increment works for negative input")
+    }
+
+    test("loop: br back to loop top (iteration via `br $top`)") {
+      val inst = instantiate(Fixtures.loop_continue)
+      check(callI32(inst, "countdown",  0) ==  0, "0 iterations for n=0")
+      check(callI32(inst, "countdown",  1) ==  1, "1 iteration for n=1")
+      check(callI32(inst, "countdown", 25) == 25, "25 iterations for n=25")
+    }
+
     test("trap: memory load out of bounds") {
       val inst = instantiate(Fixtures.memory_oob)
       expectError(inst, "load_oob", Seq(I32(65535))):
         case WasmError.MemoryOutOfBounds => true
         case _                           => false
-      // A fully in-bounds load should succeed.
+      // A fully in-bounds load should succeed and read the zero-initialized byte.
       check(callI32(inst, "load_oob", 0) == 0, "in-bounds load returns 0 from zeroed memory")
+      // The last fully aligned valid 4-byte slot lives at offset (size - 4).
+      check(callI32(inst, "load_oob", 65536 - 4) == 0, "load at last valid 4-byte boundary")
+    }
+
+    test("trap: memory store out of bounds") {
+      val inst = instantiate(Fixtures.store_oob)
+      expectError(inst, "store_oob", Seq(I32(65534), I32(0xdead))):
+        case WasmError.MemoryOutOfBounds => true
+        case _                           => false
+      // A fully in-bounds store must succeed and return no result.
+      inst.invoke("store_oob", Seq(I32(0), I32(0))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"in-bounds store should succeed, got $other")
     }
 
     // === error paths in linking + parsing ==================================
@@ -290,6 +325,23 @@ object InterpreterTest:
       Parser.parse(bad) match
         case Left(WasmError.InvalidMagic) => ()
         case other                        => check(false, s"expected InvalidMagic, got $other")
+    }
+
+    test("error: an opcode not in the MVP subset returns UnknownOpcode") {
+      // Build the smallest possible module that runs a single unsupported
+      // opcode. The shortest path is to take an existing fixture and patch
+      // its body — `arith` returns immediately with i32.const, so we replace
+      // the final `i32.const 10` (0x41 0x0a) with 0x42 (i64.const) followed
+      // by a dummy operand. Pre-scan flags the unknown opcode before the
+      // interpreter ever runs it.
+      val source = Fixtures.arith
+      val patched = source.clone()
+      // Replace the first 0x41 (i32.const) in the code section with 0x42 (i64.const).
+      val idx = patched.indexOf(0x41.toByte)
+      patched(idx) = 0x42.toByte
+      Runtime.instantiate(patched, Seq(EnvModule.default)) match
+        case Left(WasmError.UnknownOpcode(0x42)) => ()
+        case other => check(false, s"expected UnknownOpcode(0x42), got $other")
     }
 
     // === report ============================================================
