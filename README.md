@@ -8,7 +8,7 @@ A WebAssembly MVP interpreter for Scala 3, plus a small CLI built on top. Both a
 
 The repo splits into two sub-projects so the published library stays dependency-free:
 
-- **`interp/`** — the interpreter itself. **Zero external dependencies** (Scala stdlib only). This is the artifact published to Maven Central as `wasm-interp`.
+- **`interp/`** — the interpreter itself. **Zero external dependencies** (Scala stdlib only). This is the artifact published to Maven Central as `wasm`. (Source lives in `interp/` to keep the directory layout self-describing; the published artifact name is just `wasm`.)
 - **`cli/`** — a small command-line runner using [scopt](https://github.com/scopt/scopt) for argument parsing. Depends on `interp`; not published.
 
 ## What the interpreter implements

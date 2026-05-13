@@ -93,10 +93,13 @@ def generateFixtures(outFile: File, fixturesDir: File, log: Logger): Seq[File] =
 //   sbt 'interpNative/Test/run'
 // ============================================================================
 
+// The sub-project lives in `interp/`, but the published artifact name is
+// just `wasm` — the directory name is a code-organization detail, the
+// `name` setting is what ends up in the pom.
 lazy val interp = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("interp"))
   .settings(
-    name := "wasm-interp",
+    name := "wasm",
     scalacOptions ++= commonScalacOptions,
     publishMavenStyle      := true,
     Test / publishArtifact := false,
