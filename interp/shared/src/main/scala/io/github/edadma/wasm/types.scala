@@ -7,14 +7,16 @@ package io.github.edadma.wasm
   */
 
 sealed trait Value
-final case class I32(value: Int)  extends Value
-final case class I64(value: Long) extends Value
-// TODO: F32(value: Float), F64(value: Double)
+final case class I32(value: Int)   extends Value
+final case class I64(value: Long)  extends Value
+final case class F32(value: Float) extends Value
+// TODO: F64(value: Double)
 
 enum ValueType:
   case I32Type
   case I64Type
-  // TODO: F32Type, F64Type
+  case F32Type
+  // TODO: F64Type
 
 /** A function signature — vector of param types in, vector of result types out.
   * MVP allows at most one result type. */

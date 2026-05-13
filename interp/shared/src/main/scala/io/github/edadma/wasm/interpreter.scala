@@ -122,15 +122,16 @@ object Interpreter:
       case _: ArrayIndexOutOfBoundsException =>
         Left(WasmError.InvalidModule("unexpected end of function body"))
 
-  /** Decode a blocktype byte (i32 / i64 result; empty for no result).
+  /** Decode a blocktype byte (i32 / i64 / f32 result; empty for no result).
     * Returns `Right((resultArity, posAfter))`, or `Left(InvalidModule)` for
-    * the f32/f64/multi-value forms the current subset doesn't model. */
+    * the f64/multi-value forms the current subset doesn't model yet. */
   private def readBlocktype(body: Array[Byte], pos: Int): Either[WasmError, (Int, Int)] =
     (body(pos) & 0xff) match
       case 0x40 => Right((0, pos + 1))            // empty
       case 0x7f => Right((1, pos + 1))            // i32 result
       case 0x7e => Right((1, pos + 1))            // i64 result
-      // TODO: f32 (0x7D), f64 (0x7C), multi-value (s33 type index).
+      case 0x7d => Right((1, pos + 1))            // f32 result
+      // TODO: f64 (0x7C), multi-value (s33 type index).
       case b    => Left(WasmError.InvalidModule(s"unsupported blocktype 0x${b.toHexString}"))
 
   /** Advance past one full instruction (opcode + immediates). Used by the
@@ -145,10 +146,10 @@ object Interpreter:
         Right(pc + 1)
       case 0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 =>      // br, br_if, call, local.{get,set,tee}
         Leb128.readU32(body, pc + 1).map(_._2)
-      case 0x28 | 0x29 |                                   // i32.load, i64.load
+      case 0x28 | 0x29 | 0x2a |                            // i32.load, i64.load, f32.load
            0x2c | 0x2d |                                   // i32.load8_s/u
            0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 |       // i64.load{8,16,32}_{s,u}
-           0x36 | 0x37 |                                   // i32.store, i64.store
+           0x36 | 0x37 | 0x38 |                            // i32.store, i64.store, f32.store
            0x3a | 0x3c | 0x3d | 0x3e =>                    // i32.store8 / i64.store{8,16,32}
         for
           (_, p1) <- Leb128.readU32(body, pc + 1)          // align
@@ -158,15 +159,18 @@ object Interpreter:
         Leb128.readS32(body, pc + 1).map(_._2)
       case 0x42 =>                                         // i64.const (SLEB64 immediate)
         Leb128.readS64(body, pc + 1).map(_._2)
+      case 0x43 =>                                         // f32.const (4 raw little-endian bytes — NOT LEB)
+        if pc + 5 > body.length then Left(WasmError.InvalidModule("truncated f32.const immediate"))
+        else Right(pc + 5)
       // 0x45–0x75 covers every i32 unary/binary/compare/shift AND the i64
       // comparisons (0x50–0x5A); none take immediates. f32/f64 comparisons
-      // (0x5B–0x66) also live in here — harmless to skip-past since they
-      // likewise take no immediates, and the dispatch in `step` is what
-      // ultimately rejects them as UnknownOpcode.
+      // (0x5B–0x66) also live in here, harmless to skip-past since they
+      // likewise take no immediates — `step` is the gate on what's executable.
       case b if b >= 0x45 && b <= 0x75 =>
         Right(pc + 1)
-      // 0x79–0x8A: i64 unary (clz/ctz/popcnt) + i64 numeric/bitwise/shift/rotate.
-      case b if b >= 0x79 && b <= 0x8a =>
+      // 0x79–0x98: i64 unary + i64 numeric/bitwise/shift/rotate (0x79–0x8A) and
+      // f32 unary + f32 numeric/min/max/copysign (0x8B–0x98). All single-byte.
+      case b if b >= 0x79 && b <= 0x98 =>
         Right(pc + 1)
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -238,8 +242,9 @@ final class Interpreter private[wasm] (
 
   private inline def frame: Frame = frames.last
 
-  private inline def pushI32(v: Int): Unit  = valueStack += I32(v)
-  private inline def pushI64(v: Long): Unit = valueStack += I64(v)
+  private inline def pushI32(v: Int): Unit   = valueStack += I32(v)
+  private inline def pushI64(v: Long): Unit  = valueStack += I64(v)
+  private inline def pushF32(v: Float): Unit = valueStack += F32(v)
 
   private inline def popI32(): Int =
     if valueStack.isEmpty then fail(WasmError.TypeMismatch)
@@ -251,6 +256,12 @@ final class Interpreter private[wasm] (
     if valueStack.isEmpty then fail(WasmError.TypeMismatch)
     valueStack.remove(valueStack.size - 1) match
       case I64(v) => v
+      case _      => fail(WasmError.TypeMismatch)
+
+  private inline def popF32(): Float =
+    if valueStack.isEmpty then fail(WasmError.TypeMismatch)
+    valueStack.remove(valueStack.size - 1) match
+      case F32(v) => v
       case _      => fail(WasmError.TypeMismatch)
 
   private inline def popValue(): Value =
@@ -590,9 +601,80 @@ final class Interpreter private[wasm] (
       case 0x89 => binop64((a, b) => jl.Long.rotateLeft (a, (b & 63L).toInt)); f.pc += 1  // i64.rotl
       case 0x8a => binop64((a, b) => jl.Long.rotateRight(a, (b & 63L).toInt)); f.pc += 1  // i64.rotr
 
+      // === f32 memory ====================================================
+
+      case 0x2a =>                                                                        // f32.load (4 bytes IEEE-754)
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushF32(loadF32(addr + offset))
+
+      case 0x38 =>                                                                        // f32.store
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popF32()
+        val addr = popI32().toLong & 0xffffffffL
+        storeF32(addr + offset, v)
+
+      // === f32 numeric ===================================================
+
+      case 0x43 =>                                                                        // f32.const — 4 raw LE bytes (NOT LEB)
+        if f.pc + 5 > body.length then fail(WasmError.InvalidModule("truncated f32.const immediate"))
+        val bits = (body(f.pc + 1) & 0xff)          |
+                   ((body(f.pc + 2) & 0xff) <<  8)  |
+                   ((body(f.pc + 3) & 0xff) << 16)  |
+                   ((body(f.pc + 4) & 0xff) << 24)
+        pushF32(jl.Float.intBitsToFloat(bits))
+        f.pc += 5
+
+      // f32 ordered comparisons (0x5B–0x60). Scala's float operators already
+      // return `false` for any NaN-involving compare except `!=`, which is
+      // exactly what WASM specifies — no special-casing needed here.
+
+      case 0x5b => binopF32Test(_ == _); f.pc += 1                                        // f32.eq
+      case 0x5c => binopF32Test(_ != _); f.pc += 1                                        // f32.ne
+      case 0x5d => binopF32Test(_ <  _); f.pc += 1                                        // f32.lt
+      case 0x5e => binopF32Test(_ >  _); f.pc += 1                                        // f32.gt
+      case 0x5f => binopF32Test(_ <= _); f.pc += 1                                        // f32.le
+      case 0x60 => binopF32Test(_ >= _); f.pc += 1                                        // f32.ge
+
+      // f32 unary (0x8B–0x91). Java's `Math.{abs, floor, ceil, rint, sqrt}` all
+      // follow IEEE-754. `nearest` is round-half-to-even — `Math.rint` is the
+      // double-precision version; widening via `toDouble` and narrowing back
+      // is safe for all finite f32 values. `trunc` (round-toward-zero) isn't
+      // in `Math`, so we synthesise it from floor/ceil; this preserves the
+      // sign of zeros and the NaN/Inf behaviour both branches inherit.
+
+      case 0x8b => unopF32(v => jl.Math.abs(v));        f.pc += 1                         // f32.abs
+      case 0x8c => unopF32(v => -v);                    f.pc += 1                         // f32.neg
+      case 0x8d => unopF32(v => jl.Math.ceil (v.toDouble).toFloat); f.pc += 1             // f32.ceil
+      case 0x8e => unopF32(v => jl.Math.floor(v.toDouble).toFloat); f.pc += 1             // f32.floor
+      case 0x8f => unopF32(v =>                                                            // f32.trunc — round toward zero
+        if jl.Float.isNaN(v) || jl.Float.isInfinite(v) then v
+        else if v < 0.0f then jl.Math.ceil(v.toDouble).toFloat
+        else jl.Math.floor(v.toDouble).toFloat); f.pc += 1
+      case 0x90 => unopF32(v => jl.Math.rint(v.toDouble).toFloat);  f.pc += 1             // f32.nearest (round half to even)
+      case 0x91 => unopF32(v => jl.Math.sqrt(v.toDouble).toFloat);  f.pc += 1             // f32.sqrt
+
+      // f32 binary (0x92–0x98). `+/-/*` and `/` are Scala primitives — already
+      // IEEE-754. `min`/`max` go through `jl.Math.min`/`max`, which handle
+      // NaN (returns NaN) and signed zeros (min(-0,+0) == -0) per IEEE-754,
+      // matching WASM. `copysign` uses `Math.copySign`.
+
+      case 0x92 => binopF32(_ + _);                                f.pc += 1              // f32.add
+      case 0x93 => binopF32(_ - _);                                f.pc += 1              // f32.sub
+      case 0x94 => binopF32(_ * _);                                f.pc += 1              // f32.mul
+      case 0x95 => binopF32(_ / _);                                f.pc += 1              // f32.div (no trap — returns Inf/NaN)
+      case 0x96 => binopF32((a, b) => jl.Math.min     (a, b));     f.pc += 1              // f32.min
+      case 0x97 => binopF32((a, b) => jl.Math.max     (a, b));     f.pc += 1              // f32.max
+      case 0x98 => binopF32((a, b) => jl.Math.copySign(a, b));     f.pc += 1              // f32.copysign
+
       // === unsupported ===================================================
 
-      // TODO: f32/f64 — different push/pop discipline.
+      // TODO: f64 — same shape as f32 (0x44 const, 0x61–0x66 compares, 0x99–0xA6 numeric, 0x2B/0x39 load/store).
+      // TODO: conversions (0xA7–0xC4) — Phase 1.4.
       // TODO: 0x11 call_indirect — needs tables.
       // TODO: 0x3F memory.size, 0x40 memory.grow.
       case other => fail(WasmError.UnknownOpcode(other))
@@ -668,12 +750,14 @@ final class Interpreter private[wasm] (
         var k = paramCount - 1
         while k >= 0 do { locals(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
         // Declared locals zero-initialize. Pick the right `Value` variant for each
-        // slot — `I32(0)` for i32, `I64(0L)` for i64.
+        // slot — `I32(0)` for i32, `I64(0L)` for i64, `F32(0.0f)` for f32.
+        // (WASM mandates positive zero for f32; Java's `0.0f` default matches.)
         var j = paramCount
         while j < localCount do
           locals(j) = localTypes(j) match
             case ValueType.I32Type => I32(0)
             case ValueType.I64Type => I64(0L)
+            case ValueType.F32Type => F32(0.0f)
           j += 1
         frames += new Frame(wf, locals, stackBase = valueStack.size)
 
@@ -749,6 +833,14 @@ final class Interpreter private[wasm] (
     d(a + 6) = ((v >>> 48) & 0xffL).toByte
     d(a + 7) = ((v >>> 56) & 0xffL).toByte
 
+  /** Little-endian 32-bit IEEE-754 load. Uses the *raw* conversion so NaN
+    * payloads survive a round-trip through memory. */
+  private def loadF32(addr: Long): Float =
+    jl.Float.intBitsToFloat(loadI32(addr))
+
+  private def storeF32(addr: Long, v: Float): Unit =
+    storeI32(addr, jl.Float.floatToRawIntBits(v))
+
   // === misc helpers =======================================================
 
   private inline def readU32At(f: Frame, pos: Int): (Int, Int) =
@@ -775,3 +867,15 @@ final class Interpreter private[wasm] (
   /** i64.eqz — pops one i64, pushes i32 1/0 by predicate. */
   private inline def unop64Test(op: Long => Boolean): Unit =
     val a = popI64(); pushI32(if op(a) then 1 else 0)
+
+  private inline def binopF32(op: (Float, Float) => Float): Unit =
+    val b = popF32(); val a = popF32(); pushF32(op(a, b))
+
+  private inline def unopF32(op: Float => Float): Unit =
+    val a = popF32(); pushF32(op(a))
+
+  /** f32 comparison — pops two f32s, pushes i32 1/0. Scala's `<`, `<=`, `>`,
+    * `>=`, `==` already return `false` against NaN (and `!=` returns `true`),
+    * which matches WASM's ordered-compare semantics exactly. */
+  private inline def binopF32Test(op: (Float, Float) => Boolean): Unit =
+    val b = popF32(); val a = popF32(); pushI32(if op(a, b) then 1 else 0)

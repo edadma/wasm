@@ -74,6 +74,24 @@ object InterpreterTest:
       case I64(v) => v
       case other  => throw new AssertionError(s"$name returned $other, expected I64")
 
+  /** Same shape but for f32-returning functions. */
+  private def callF32(inst: ModuleInstance, name: String, args: Value*): Float =
+    val results = runRight(inst.invoke(name, args))
+    check(results.size == 1, s"$name returned ${results.size} values, expected 1")
+    results.head match
+      case F32(v) => v
+      case other  => throw new AssertionError(s"$name returned $other, expected F32")
+
+  /** Convenience: invoke a function and pull out an `I32` result without
+    * boxing the args into a sequence at the call site (used by the f32
+    * compare tests, whose return type is i32). */
+  private def callI32V(inst: ModuleInstance, name: String, args: Value*): Int =
+    val results = runRight(inst.invoke(name, args))
+    check(results.size == 1, s"$name returned ${results.size} values, expected 1")
+    results.head match
+      case I32(v) => v
+      case other  => throw new AssertionError(s"$name returned $other, expected I32")
+
   private def expectError(
       inst: ModuleInstance,
       name: String,
@@ -576,6 +594,226 @@ object InterpreterTest:
       expectError(inst, "i64_roundtrip", Seq(I32(65529), I64(0L))) { case WasmError.MemoryOutOfBounds => true }
     }
 
+    // --- f32 support (Phase 1.2) -------------------------------------------
+    //
+    // The interpreter handles f32.const as 4 raw LE bytes (no LEB), runs the
+    // ordered compares per IEEE-754 (NaN makes <, <=, >, >=, == false; only
+    // != stays true), and delegates min/max/sqrt/floor/ceil/rint/copySign to
+    // java.lang.Math which already follows the spec. These tests pin the
+    // wiring end-to-end on every backend so platform-specific NaN handling
+    // gets caught early.
+    //
+    // Helper: identity-by-bits — Float.NaN == Float.NaN is false, so we
+    // compare bit patterns instead when asserting NaN flow.
+
+    def bitsEq(a: Float, b: Float): Boolean =
+      jl.Float.floatToRawIntBits(a) == jl.Float.floatToRawIntBits(b)
+
+    test("f32.const: SLEB-free 4-byte immediate decodes pi / e / -pi") {
+      val inst = instantiate(Fixtures.f32_const_specials)
+      check(callF32(inst, "f32_pi")     == 3.14159265f,  "pi")
+      check(callF32(inst, "f32_e")      == 2.71828183f,  "e")
+      check(callF32(inst, "f32_neg_pi") == -3.14159265f, "-pi")
+    }
+
+    test("f32.const: smallest positive normal and denormal") {
+      val inst = instantiate(Fixtures.f32_const_specials)
+      check(callF32(inst, "f32_min_normal")   == jl.Float.MIN_NORMAL, "min normal == 2^-126")
+      check(callF32(inst, "f32_min_denormal") == jl.Float.MIN_VALUE,  "min denormal == 2^-149")
+    }
+
+    test("f32.const: +inf / -inf / signed zeros / canonical NaN") {
+      val inst = instantiate(Fixtures.f32_const_specials)
+      check(callF32(inst, "f32_pos_inf")  == jl.Float.POSITIVE_INFINITY, "+inf")
+      check(callF32(inst, "f32_neg_inf")  == jl.Float.NEGATIVE_INFINITY, "-inf")
+      // Signed zero: equal under ==, but distinguishable by bit pattern.
+      val posZero = callF32(inst, "f32_pos_zero")
+      val negZero = callF32(inst, "f32_neg_zero")
+      check(posZero == 0.0f && negZero == 0.0f, "both compare == 0.0f")
+      check(jl.Float.floatToRawIntBits(posZero) == 0x00000000, "+0.0 has zero bit pattern")
+      check(jl.Float.floatToRawIntBits(negZero) == 0x80000000, "-0.0 has sign-bit set")
+      val nan = callF32(inst, "f32_nan")
+      check(jl.Float.isNaN(nan), "NaN is detected as NaN")
+    }
+
+    test("f32 arithmetic: add / sub / mul / div (exact on representable inputs)") {
+      val inst = instantiate(Fixtures.f32_arith)
+      check(callF32(inst, "f32_add", F32(1.5f), F32(2.25f)) == 3.75f, "add")
+      check(callF32(inst, "f32_sub", F32(5.0f), F32(1.5f))  == 3.5f,  "sub")
+      check(callF32(inst, "f32_mul", F32(2.5f), F32(4.0f))  == 10.0f, "mul")
+      check(callF32(inst, "f32_div", F32(7.0f), F32(2.0f))  == 3.5f,  "div")
+    }
+
+    test("f32.div: divide by zero produces Inf (does NOT trap)") {
+      val inst = instantiate(Fixtures.f32_arith)
+      check(callF32(inst, "f32_div", F32(1.0f),  F32(0.0f)) == jl.Float.POSITIVE_INFINITY, " 1/+0 == +inf")
+      check(callF32(inst, "f32_div", F32(-1.0f), F32(0.0f)) == jl.Float.NEGATIVE_INFINITY, "-1/+0 == -inf")
+      check(jl.Float.isNaN(callF32(inst, "f32_div", F32(0.0f), F32(0.0f))),                "0/0 == NaN")
+    }
+
+    test("f32.min / f32.max: NaN propagates, signed zeros distinguished") {
+      val inst = instantiate(Fixtures.f32_arith)
+      // Plain values: min picks smaller, max picks larger.
+      check(callF32(inst, "f32_min", F32(2.0f), F32(3.0f)) == 2.0f, "min plain")
+      check(callF32(inst, "f32_max", F32(2.0f), F32(3.0f)) == 3.0f, "max plain")
+      // NaN propagation — any NaN operand yields NaN.
+      check(jl.Float.isNaN(callF32(inst, "f32_min", F32(Float.NaN), F32(1.0f))), "min NaN, 1 -> NaN")
+      check(jl.Float.isNaN(callF32(inst, "f32_max", F32(1.0f), F32(Float.NaN))), "max 1, NaN -> NaN")
+      // Signed zeros: f32.min(-0, +0) -> -0; f32.max(-0, +0) -> +0.
+      val minZ = callF32(inst, "f32_min", F32(-0.0f), F32(0.0f))
+      val maxZ = callF32(inst, "f32_max", F32(-0.0f), F32(0.0f))
+      check(jl.Float.floatToRawIntBits(minZ) == 0x80000000, s"min(-0,+0) bits should be 0x80000000, got 0x${jl.Float.floatToRawIntBits(minZ).toHexString}")
+      check(jl.Float.floatToRawIntBits(maxZ) == 0x00000000, s"max(-0,+0) bits should be 0x00000000, got 0x${jl.Float.floatToRawIntBits(maxZ).toHexString}")
+    }
+
+    test("f32.copysign: magnitude of a, sign of b") {
+      val inst = instantiate(Fixtures.f32_arith)
+      check(callF32(inst, "f32_copysign", F32(3.0f),  F32(-1.0f)) == -3.0f, "(+3,-1) -> -3")
+      check(callF32(inst, "f32_copysign", F32(-3.0f), F32(1.0f))  ==  3.0f, "(-3,+1) -> +3")
+      // Signed zero source — copysign preserves nonzero magnitude with new sign.
+      val r = callF32(inst, "f32_copysign", F32(2.0f), F32(-0.0f))
+      check(r == -2.0f && jl.Float.floatToRawIntBits(r) == jl.Float.floatToRawIntBits(-2.0f),
+        s"copysign(2,-0) -> -2; bits: 0x${jl.Float.floatToRawIntBits(r).toHexString}")
+    }
+
+    test("f32 compares: eq / ne / lt / gt / le / ge on ordered values") {
+      val inst = instantiate(Fixtures.f32_compare)
+      check(callI32V(inst, "f32_eq", F32(1.5f), F32(1.5f)) == 1, "eq true")
+      check(callI32V(inst, "f32_eq", F32(1.5f), F32(2.5f)) == 0, "eq false")
+      check(callI32V(inst, "f32_ne", F32(1.5f), F32(2.5f)) == 1, "ne true")
+      check(callI32V(inst, "f32_lt", F32(1.0f), F32(2.0f)) == 1, "1 < 2")
+      check(callI32V(inst, "f32_gt", F32(2.0f), F32(1.0f)) == 1, "2 > 1")
+      check(callI32V(inst, "f32_le", F32(1.0f), F32(1.0f)) == 1, "1 <= 1")
+      check(callI32V(inst, "f32_ge", F32(1.0f), F32(1.0f)) == 1, "1 >= 1")
+    }
+
+    test("f32 compares: every ordered compare against NaN returns 0; only `ne` is 1") {
+      val inst = instantiate(Fixtures.f32_compare)
+      val nan = Float.NaN
+      check(callI32V(inst, "f32_eq", F32(nan), F32(1.0f)) == 0, "NaN == 1 -> false")
+      check(callI32V(inst, "f32_eq", F32(nan), F32(nan))  == 0, "NaN == NaN -> false")
+      check(callI32V(inst, "f32_ne", F32(nan), F32(1.0f)) == 1, "NaN != 1 -> true")
+      check(callI32V(inst, "f32_ne", F32(nan), F32(nan))  == 1, "NaN != NaN -> true")
+      check(callI32V(inst, "f32_lt", F32(nan), F32(1.0f)) == 0, "NaN < 1 -> false")
+      check(callI32V(inst, "f32_le", F32(nan), F32(nan))  == 0, "NaN <= NaN -> false")
+      check(callI32V(inst, "f32_gt", F32(1.0f), F32(nan)) == 0, "1 > NaN -> false")
+      check(callI32V(inst, "f32_ge", F32(1.0f), F32(nan)) == 0, "1 >= NaN -> false")
+    }
+
+    test("f32 compares: signed-zero equality (-0 == +0)") {
+      val inst = instantiate(Fixtures.f32_compare)
+      check(callI32V(inst, "f32_eq", F32(-0.0f), F32(0.0f)) == 1, "-0 == +0 per IEEE-754")
+      check(callI32V(inst, "f32_le", F32(-0.0f), F32(0.0f)) == 1, "-0 <= +0")
+      check(callI32V(inst, "f32_ge", F32(-0.0f), F32(0.0f)) == 1, "-0 >= +0")
+    }
+
+    test("f32 unary: abs / neg (incl. NaN: abs clears sign bit, neg flips it)") {
+      val inst = instantiate(Fixtures.f32_unary)
+      check(callF32(inst, "f32_abs", F32(-3.0f)) ==  3.0f, "abs negative")
+      check(callF32(inst, "f32_abs", F32( 3.0f)) ==  3.0f, "abs positive")
+      check(callF32(inst, "f32_neg", F32(-3.0f)) ==  3.0f, "neg negative")
+      check(callF32(inst, "f32_neg", F32( 3.0f)) == -3.0f, "neg positive")
+      // abs of -0 -> +0; neg of -0 -> +0.
+      val abs0 = callF32(inst, "f32_abs", F32(-0.0f))
+      check(jl.Float.floatToRawIntBits(abs0) == 0x00000000, "abs(-0) -> +0")
+      val negPos0 = callF32(inst, "f32_neg", F32(0.0f))
+      check(jl.Float.floatToRawIntBits(negPos0) == 0x80000000, "neg(+0) -> -0")
+    }
+
+    test("f32 unary: ceil / floor / trunc / nearest (incl. negatives + halves)") {
+      val inst = instantiate(Fixtures.f32_unary)
+      check(callF32(inst, "f32_ceil",    F32(1.2f))  ==  2.0f, "ceil 1.2 -> 2")
+      check(callF32(inst, "f32_ceil",    F32(-1.2f)) == -1.0f, "ceil -1.2 -> -1")
+      check(callF32(inst, "f32_floor",   F32(1.8f))  ==  1.0f, "floor 1.8 -> 1")
+      check(callF32(inst, "f32_floor",   F32(-1.8f)) == -2.0f, "floor -1.8 -> -2")
+      check(callF32(inst, "f32_trunc",   F32(1.8f))  ==  1.0f, "trunc 1.8 -> 1")
+      check(callF32(inst, "f32_trunc",   F32(-1.8f)) == -1.0f, "trunc -1.8 -> -1 (toward zero)")
+      // nearest = round-half-to-even.
+      check(callF32(inst, "f32_nearest", F32(0.5f))  == 0.0f,  "0.5 -> 0 (even)")
+      check(callF32(inst, "f32_nearest", F32(1.5f))  == 2.0f,  "1.5 -> 2 (even)")
+      check(callF32(inst, "f32_nearest", F32(2.5f))  == 2.0f,  "2.5 -> 2 (even)")
+      check(callF32(inst, "f32_nearest", F32(-0.5f)) == 0.0f,  "-0.5 -> 0 (even, but sign may differ)")
+    }
+
+    test("f32.sqrt: well-defined positives, sqrt(-1) is NaN (no trap)") {
+      val inst = instantiate(Fixtures.f32_unary)
+      check(callF32(inst, "f32_sqrt", F32( 4.0f)) == 2.0f, "sqrt 4")
+      check(callF32(inst, "f32_sqrt", F32( 0.0f)) == 0.0f, "sqrt 0")
+      check(jl.Float.isNaN(callF32(inst, "f32_sqrt", F32(-1.0f))), "sqrt -1 -> NaN")
+      // sqrt(-0) = -0 per IEEE-754.
+      val sqrtNegZero = callF32(inst, "f32_sqrt", F32(-0.0f))
+      check(jl.Float.floatToRawIntBits(sqrtNegZero) == 0x80000000,
+        s"sqrt(-0) bits should be -0 (0x80000000), got 0x${jl.Float.floatToRawIntBits(sqrtNegZero).toHexString}")
+    }
+
+    test("f32 memory: f32.load / f32.store round-trip preserves NaN bit pattern") {
+      val inst = instantiate(Fixtures.f32_memory)
+      check(callF32(inst, "f32_roundtrip", I32(0),  F32(3.14159f)) == 3.14159f, "addr 0 plain")
+      // -0.0 round-trip: bit pattern must come back exactly (not normalised to +0).
+      val negZero = callF32(inst, "f32_roundtrip", I32(8), F32(-0.0f))
+      check(jl.Float.floatToRawIntBits(negZero) == 0x80000000, "-0.0 round-trip preserves sign bit")
+      // NaN round-trip: still a NaN.
+      check(jl.Float.isNaN(callF32(inst, "f32_roundtrip", I32(16), F32(Float.NaN))), "NaN round-trip is NaN")
+    }
+
+    test("f32 local: declared local zero-initialises to F32(0.0f)") {
+      val inst = instantiate(Fixtures.f32_memory)
+      val z = callF32(inst, "f32_local_zero")
+      check(z == 0.0f, "f32 local should equal +0.0")
+      check(jl.Float.floatToRawIntBits(z) == 0x00000000, "f32 local should be positive zero (not -0)")
+    }
+
+    test("f32 memory: load out of bounds traps with MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.f32_memory)
+      // page = 65536, f32 is 4 bytes; last valid addr is 65532.
+      check(callF32(inst, "f32_roundtrip", I32(65532), F32(1.0f)) == 1.0f, "last valid 4-byte slot")
+      expectError(inst, "f32_roundtrip", Seq(I32(65533), F32(0.0f))) { case WasmError.MemoryOutOfBounds => true }
+    }
+
+    test("f32 block result: blocktype 0x7D carries an f32 across the matching end") {
+      val inst = instantiate(Fixtures.f32_block_result)
+      check(callF32(inst, "f32_block_result") == 1.5f, "block returns its f32 result")
+    }
+
+    test("f32 IEEE edges: inf + (-inf) = NaN, inf * 0 = NaN, divide-by-zero never traps") {
+      val inst = instantiate(Fixtures.f32_edge)
+      check(jl.Float.isNaN(callF32(inst, "inf_plus_neg_inf")), "inf + -inf -> NaN")
+      check(jl.Float.isNaN(callF32(inst, "inf_times_zero")),   "inf *  0   -> NaN")
+      // 1/+0 = +inf, 1/-0 = -inf, 0/0 = NaN.
+      check(callF32(inst, "div_pos_zero", F32( 1.0f)) == jl.Float.POSITIVE_INFINITY, " 1/+0 -> +inf")
+      check(callF32(inst, "div_neg_zero", F32( 1.0f)) == jl.Float.NEGATIVE_INFINITY, " 1/-0 -> -inf")
+      check(callF32(inst, "div_pos_zero", F32(-1.0f)) == jl.Float.NEGATIVE_INFINITY, "-1/+0 -> -inf")
+      check(jl.Float.isNaN(callF32(inst, "div_pos_zero", F32(0.0f))),                "0/0  -> NaN")
+      // sqrt(-1) is NaN, not a trap.
+      check(jl.Float.isNaN(callF32(inst, "sqrt_neg_one")), "sqrt(-1) -> NaN")
+    }
+
+    test("f32 select (polymorphic): select with f32 operands picks the right one") {
+      // The `select` opcode (0x1B) is polymorphic in MVP; this verifies it
+      // works at f32 width too, not just i32. We don't need a dedicated
+      // fixture — the existing stack_ops fixture only tests i32 select, so
+      // we synthesise a tiny inline-bytes module here.
+      val typeSec = b(0x02) ++                                          // 2 functype entries
+        b(0x60, 0x00, 0x01, 0x7d) ++                                    //  () -> (f32)
+        b(0x60, 0x03, 0x7d, 0x7d, 0x7f, 0x01, 0x7d)                     //  (f32, f32, i32) -> (f32)
+      val funcSec = b(0x01, 0x01)                                       // 1 func, type idx 1
+      val expSec  = b(0x01) ++                                          // 1 export
+        b(0x06, 's'.toInt, 'e'.toInt, 'l'.toInt, 'e'.toInt, 'c'.toInt, 't'.toInt) ++
+        b(0x00, 0x00)                                                   // kind=func, idx 0
+      // body: locals=0; local.get 0; local.get 1; local.get 2; select; end
+      val body    = b(0x00,                                              // 0 local groups
+                       0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x1b, 0x0b)
+      val codeSec = b(0x01, body.length.toByte) ++ body
+      val bytes   = Header ++
+        b(0x01, typeSec.length) ++ typeSec ++
+        b(0x03, funcSec.length) ++ funcSec ++
+        b(0x07, expSec.length)  ++ expSec  ++
+        b(0x0a, codeSec.length) ++ codeSec
+      val inst = instantiate(bytes)
+      check(callF32(inst, "select", F32(1.5f), F32(2.5f), I32(1)) == 1.5f, "cond=1 picks a")
+      check(callF32(inst, "select", F32(1.5f), F32(2.5f), I32(0)) == 2.5f, "cond=0 picks b")
+    }
+
     // --- ModuleInstance accessors ------------------------------------------
     test("ModuleInstance.exportedFunctionNames: sorted, function-only") {
       val inst = instantiate(Fixtures.memory)
@@ -790,12 +1028,6 @@ object InterpreterTest:
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("functype"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(functype), got $other")
     }
-    test("parser: f32 valtype (0x7D) returns InvalidModule with 'f32'") {
-      val bad = patchFirst(Fixtures.arith, 0x7f, 0x7d)
-      Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("f32"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(f32), got $other")
-    }
     test("parser: f64 valtype (0x7C) returns InvalidModule with 'f64'") {
       val bad = patchFirst(Fixtures.arith, 0x7f, 0x7c)
       Parser.parse(bad) match
@@ -1002,16 +1234,17 @@ object InterpreterTest:
 
   private def section7_bugFixRegressions(): Unit =
 
-    test("regression: unsupported blocktype (0x7D f32) returns InvalidModule, not RuntimeException") {
+    test("regression: unsupported blocktype (0x7C f64) returns InvalidModule, not RuntimeException") {
       // Bug: `Interpreter.readBlocktype` threw `RuntimeException` for any
       // blocktype other than 0x40 / 0x7F, bypassing the WasmError discipline.
       // Fixed to `Left(InvalidModule(...))` so the pre-scan reports it cleanly.
       //
       // The fixture's block declares an i32 result (`0x02 0x7F`); we patch the
-      // blocktype byte to 0x7D (f32) which `readBlocktype` still rejects in
-      // the current subset. The original repro byte 0x7E (i64) is now a valid
-      // blocktype, so the regression test was retargeted to a still-unsupported
-      // form. Same code path; same expected typed error.
+      // blocktype byte to 0x7C (f64) which `readBlocktype` still rejects in
+      // the current subset. The original repro bytes 0x7E (i64) and 0x7D
+      // (f32) are both valid blocktypes now, so the regression test has been
+      // retargeted to the still-unsupported f64 form. Same code path; same
+      // expected typed error.
       val src = Fixtures.block_result
       val pat = b(0x02, 0x7f)
       var idx = -1
@@ -1020,7 +1253,7 @@ object InterpreterTest:
         if src(i) == pat(0) && src(i + 1) == pat(1) then idx = i
         i += 1
       check(idx >= 0, "block + i32-blocktype pattern not found")
-      val bad = patchByte(src, idx + 1, 0x7d)            // blocktype byte → f32 (unsupported)
+      val bad = patchByte(src, idx + 1, 0x7c)            // blocktype byte → f64 (unsupported)
       Runtime.instantiate(bad, Seq(EnvModule.default)) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("blocktype"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(blocktype), got $other")
