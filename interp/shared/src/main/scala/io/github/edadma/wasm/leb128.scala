@@ -11,8 +11,9 @@ package io.github.edadma.wasm
   */
 object Leb128:
 
-  private inline val MaxBytesU32 = 5  // ceil(32 / 7)
+  private inline val MaxBytesU32 = 5   // ceil(32 / 7)
   private inline val MaxBytesS32 = 5
+  private inline val MaxBytesS64 = 10  // ceil(64 / 7)
 
   /** Read an unsigned LEB128 32-bit integer.
     * Returns `Right((value, newPos))` or `Left(InvalidModule(...))` on malformed/truncated input.
@@ -50,3 +51,23 @@ object Leb128:
           result |= -(1 << shift)
         return Right((result, p))
     Left(WasmError.InvalidModule(s"truncated or oversized SLEB128 at byte $startPos"))
+
+  /** Read a signed LEB128 64-bit integer (used for `i64.const` immediates).
+    * Mirrors `readS32` but accumulates into a `Long` and caps at ten bytes.
+    */
+  def readS64(bytes: Array[Byte], startPos: Int): Either[WasmError, (Long, Int)] =
+    var result: Long = 0L
+    var shift        = 0
+    var p            = startPos
+    var n            = 0
+    while p < bytes.length && n < MaxBytesS64 do
+      val b = bytes(p) & 0xff
+      p += 1
+      n += 1
+      result |= (b.toLong & 0x7fL) << shift
+      shift += 7
+      if (b & 0x80) == 0 then
+        if shift < 64 && (b & 0x40) != 0 then
+          result |= -(1L << shift)
+        return Right((result, p))
+    Left(WasmError.InvalidModule(s"truncated or oversized SLEB128(64) at byte $startPos"))

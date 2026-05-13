@@ -1,6 +1,7 @@
 package io.github.edadma.wasm
 
 import scala.collection.mutable.ArrayBuffer
+import java.lang as jl  // for Long.divideUnsigned / remainderUnsigned reference values
 
 /** Comprehensive tests for the WebAssembly MVP interpreter.
   *
@@ -61,6 +62,17 @@ object InterpreterTest:
     check(results.size == 1, s"$name returned ${results.size} values, expected 1")
     results.head match
       case I32(v) => v
+      case other  => throw new AssertionError(s"$name returned $other, expected I32")
+
+  /** Same shape as callI32 but for functions returning an i64; arguments
+    * are pre-wrapped `Value`s so the caller can mix I32 + I64 freely
+    * (memory tests, mixed-type helpers, etc.). */
+  private def callI64(inst: ModuleInstance, name: String, args: Value*): Long =
+    val results = runRight(inst.invoke(name, args))
+    check(results.size == 1, s"$name returned ${results.size} values, expected 1")
+    results.head match
+      case I64(v) => v
+      case other  => throw new AssertionError(s"$name returned $other, expected I64")
 
   private def expectError(
       inst: ModuleInstance,
@@ -391,6 +403,179 @@ object InterpreterTest:
       check(callI32(inst, "fancy", 3, 4) == 7, "function after a custom section still works")
     }
 
+    // --- i64 support (Phase 1.1) -------------------------------------------
+
+    test("i64.const: SLEB64 immediate decodes a multi-byte value (0x100000001 + 0x200000002)") {
+      val inst = instantiate(Fixtures.i64_arith)
+      check(callI64(inst, "i64_const_pair") == 0x300000003L, "wrong sum")
+    }
+
+    test("i64 arith: add / sub / mul on values larger than 2^32") {
+      val inst = instantiate(Fixtures.i64_arith)
+      check(callI64(inst, "i64_add", I64(0x100000000L), I64(0x200000000L)) == 0x300000000L, "add")
+      check(callI64(inst, "i64_sub", I64(0x100000000L), I64(0x000000001L)) == 0x0FFFFFFFFL, "sub")
+      check(callI64(inst, "i64_mul", I64(0x100000000L), I64(0x000000002L)) == 0x200000000L, "mul")
+    }
+
+    test("i64 arith: div_s / div_u / rem_s / rem_u (signed vs unsigned divergence)") {
+      val inst = instantiate(Fixtures.i64_arith)
+      check(callI64(inst, "i64_div_s", I64(-10L), I64(3L)) == -3L, "div_s of negative")
+      check(callI64(inst, "i64_div_u", I64(-10L), I64(3L)) == jl.Long.divideUnsigned(-10L, 3L),
+        "div_u treats -10 as huge positive")
+      check(callI64(inst, "i64_rem_s", I64(-7L),  I64(3L)) == -1L, "rem_s sign of dividend")
+      check(callI64(inst, "i64_rem_u", I64(-7L),  I64(3L)) == jl.Long.remainderUnsigned(-7L, 3L),
+        "rem_u of -7 treated as huge positive")
+    }
+
+    test("i64.eqz returns i32 (1 for zero, 0 otherwise)") {
+      val inst = instantiate(Fixtures.i64_compare)
+      def asI32(name: String, a: Long): Int =
+        runRight(inst.invoke(name, Seq(I64(a)))).head match
+          case I32(v) => v
+          case other  => throw new AssertionError(s"$name returned $other")
+      check(asI32("i64_eqz",  0L) == 1, "eqz 0")
+      check(asI32("i64_eqz",  1L) == 0, "eqz 1")
+      check(asI32("i64_eqz", -1L) == 0, "eqz -1")
+    }
+
+    test("i64 compares (signed) return i32: eq / ne / lt_s / gt_s / le_s / ge_s") {
+      val inst = instantiate(Fixtures.i64_compare)
+      def asI32(name: String, a: Long, b: Long): Int =
+        val res = runRight(inst.invoke(name, Seq(I64(a), I64(b))))
+        check(res.size == 1, s"$name returned ${res.size} values")
+        res.head match
+          case I32(v) => v
+          case other  => throw new AssertionError(s"$name returned $other")
+
+      check(asI32("i64_eq",   5L,  5L) == 1, "eq true")
+      check(asI32("i64_eq",   5L, -5L) == 0, "eq false")
+      check(asI32("i64_ne",   5L,  5L) == 0, "ne false")
+      check(asI32("i64_lt_s", 3L,  5L) == 1, "3 < 5")
+      check(asI32("i64_lt_s", -1L, 0L) == 1, "-1 < 0 signed")
+      check(asI32("i64_gt_s", 0L, -1L) == 1, "0 > -1 signed")
+      check(asI32("i64_le_s", 5L,  5L) == 1, "5 <= 5")
+      check(asI32("i64_ge_s", 5L,  5L) == 1, "5 >= 5")
+    }
+
+    test("i64 compares (unsigned) return i32: lt_u / gt_u / le_u / ge_u (negative treated as huge)") {
+      val inst = instantiate(Fixtures.i64_compare)
+      def asI32(name: String, a: Long, b: Long): Int =
+        val res = runRight(inst.invoke(name, Seq(I64(a), I64(b))))
+        res.head match
+          case I32(v) => v
+          case other  => throw new AssertionError(s"$name returned $other")
+
+      // -1L unsigned is the maximum, so -1 > 0, -1 >= 0, etc.
+      check(asI32("i64_lt_u", -1L, 0L)  == 0, "-1 < 0 unsigned should be false (since -1 is max)")
+      check(asI32("i64_gt_u", -1L, 0L)  == 1, "-1 > 0 unsigned true")
+      check(asI32("i64_le_u",  0L, -1L) == 1, "0 <= -1 unsigned true")
+      check(asI32("i64_ge_u", -1L, -1L) == 1, "-1 >= -1 unsigned true (equal)")
+    }
+
+    test("i64 bitwise: and / or / xor / shl / shr_s / shr_u") {
+      val inst = instantiate(Fixtures.i64_bitwise)
+      check(callI64(inst, "i64_and",   I64(0xf0f0L), I64(0x0ff0L)) == 0x00f0L, "and")
+      check(callI64(inst, "i64_or",    I64(0xf000L), I64(0x000fL)) == 0xf00fL, "or")
+      check(callI64(inst, "i64_xor",   I64(0xff00L), I64(0x0ff0L)) == 0xf0f0L, "xor")
+      check(callI64(inst, "i64_shl",   I64(1L), I64(33L))  == (1L << 33), "shl 1 by 33 produces bit 33")
+      check(callI64(inst, "i64_shr_s", I64(-8L), I64(1L))  == -4L, "shr_s -8 stays negative")
+      check(callI64(inst, "i64_shr_u", I64(-1L), I64(1L))  == Long.MaxValue, "shr_u -1 zero-fills high bit")
+    }
+
+    test("i64 rotates: rotl / rotr (round-trip and known result)") {
+      val inst = instantiate(Fixtures.i64_bitwise)
+      // Rotating MSB-set value left by 1 should bring the top bit back to bit 0.
+      check(callI64(inst, "i64_rotl", I64(0x8000000000000000L), I64(1L)) == 1L, "rotl: top bit -> bit 0")
+      check(callI64(inst, "i64_rotr", I64(1L), I64(1L)) == 0x8000000000000000L, "rotr: bit 0 -> top bit")
+    }
+
+    test("i64 bit-counting: clz / ctz / popcnt (result type is i64)") {
+      val inst = instantiate(Fixtures.i64_bitwise)
+      check(callI64(inst, "i64_clz",    I64(1L))   == 63L, "clz of 1 = 63")
+      check(callI64(inst, "i64_clz",    I64(0L))   == 64L, "clz of 0 = 64")
+      check(callI64(inst, "i64_ctz",    I64(8L))   == 3L,  "ctz of 8 = 3")
+      check(callI64(inst, "i64_ctz",    I64(0L))   == 64L, "ctz of 0 = 64")
+      check(callI64(inst, "i64_popcnt", I64(-1L))  == 64L, "popcnt of -1 = 64 ones")
+      check(callI64(inst, "i64_popcnt", I64(0x55L)) == 4L, "popcnt of 0x55 = 4 ones")
+    }
+
+    test("i64 memory: i64.load / i64.store round-trip preserves full 64 bits") {
+      val inst = instantiate(Fixtures.i64_memory)
+      // Pick a value that exercises all 8 bytes (every byte distinct).
+      val pattern = 0x0123456789abcdefL
+      check(callI64(inst, "i64_roundtrip", I32(0),  I64(pattern)) == pattern, "addr 0")
+      check(callI64(inst, "i64_roundtrip", I32(64), I64(-1L))     == -1L,    "addr 64 negative")
+    }
+
+    test("i64 local: declared local zero-initialises to I64(0)") {
+      val inst = instantiate(Fixtures.i64_memory)
+      check(callI64(inst, "i64_local_zero") == 0L, "i64 local should zero-init")
+    }
+
+    test("i64 load variants: load8_s vs load8_u sign-handling") {
+      val inst = instantiate(Fixtures.i64_load_store_variants)
+      // 0xFF as a single byte: signed = -1, unsigned = 255.
+      check(callI64(inst, "store8_load8_s", I64(0xffL)) == -1L,  "load8_s sign-extends")
+      check(callI64(inst, "store8_load8_u", I64(0xffL)) == 255L, "load8_u zero-extends")
+    }
+
+    test("i64 load variants: load16_s vs load16_u sign-handling") {
+      val inst = instantiate(Fixtures.i64_load_store_variants)
+      // 0x8000 (low 16 bits set high): signed = -32768, unsigned = 32768.
+      check(callI64(inst, "store16_load16_s", I64(0x8000L)) == -32768L, "load16_s sign-extends")
+      check(callI64(inst, "store16_load16_u", I64(0x8000L)) == 32768L,  "load16_u zero-extends")
+    }
+
+    test("i64 load variants: load32_s vs load32_u sign-handling") {
+      val inst = instantiate(Fixtures.i64_load_store_variants)
+      // 0x80000000 (low 32 bits set high): signed = -2^31, unsigned = 2^31.
+      check(callI64(inst, "store32_load32_s", I64(0x80000000L)) == -2147483648L, "load32_s sign-extends")
+      check(callI64(inst, "store32_load32_u", I64(0x80000000L)) == 2147483648L,  "load32_u zero-extends")
+    }
+
+    test("i64 store narrowing: store8 only writes one byte (high bits discarded)") {
+      val inst = instantiate(Fixtures.i64_load_store_variants)
+      // Store a value with high bits set; the unsigned 8-bit load should only see the low byte.
+      check(callI64(inst, "store8_load8_u", I64(0x1FFL))  == 0xFFL,  "low byte preserved")
+      check(callI64(inst, "store8_load8_u", I64(0xABCDL)) == 0xCDL,  "high bytes dropped")
+    }
+
+    test("i64.const: Long.MaxValue / Long.MinValue / -1 round-trip through SLEB64") {
+      val inst = instantiate(Fixtures.i64_const_extremes)
+      check(callI64(inst, "i64_max")       == Long.MaxValue, "MaxValue")
+      check(callI64(inst, "i64_min")       == Long.MinValue, "MinValue")
+      check(callI64(inst, "i64_minus_one") == -1L,           "-1")
+    }
+
+    test("i64 block result: blocktype 0x7E carries an i64 across the matching end") {
+      val inst = instantiate(Fixtures.i64_block_result)
+      check(callI64(inst, "i64_block_result") == 9876543210L, "block returns its i64 result")
+    }
+
+    test("i64 traps: div_s / rem_s by zero, MIN_LONG/-1 overflow, rem_s MIN_LONG/-1 == 0") {
+      val inst = instantiate(Fixtures.i64_edge)
+      expectError(inst, "div_s_zero",     Seq.empty) { case WasmError.InvalidModule(m) => m.contains("divide by zero") }
+      expectError(inst, "div_s_overflow", Seq.empty) { case WasmError.InvalidModule(m) => m.contains("overflow") }
+      expectError(inst, "rem_s_zero",     Seq.empty) { case WasmError.InvalidModule(m) => m.contains("divide by zero") }
+      expectError(inst, "rem_u_zero",     Seq.empty) { case WasmError.InvalidModule(m) => m.contains("divide by zero") }
+      check(callI64(inst, "rem_s_min_neg1") == 0L, "rem_s MIN_LONG / -1 == 0 (no trap)")
+    }
+
+    test("i64 shift count masked mod 64; add wraps mod 2^64") {
+      val inst = instantiate(Fixtures.i64_edge)
+      check(callI64(inst, "shl_mod64",  I64(1L), I64(65L)) == 2L,                 "shl by 65 == shl by 1")
+      check(callI64(inst, "shl_mod64",  I64(1L), I64(64L)) == 1L,                 "shl by 64 == shl by 0")
+      check(callI64(inst, "rotl_mod64", I64(1L), I64(65L)) == 2L,                 "rotl by 65 == rotl by 1")
+      check(callI64(inst, "add_wrap")                     == Long.MinValue,      "MAX_LONG + 1 wraps")
+    }
+
+    test("i64 memory: load out of bounds traps with MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.i64_memory)
+      // page size 65536 — i64.load at the last 8-byte boundary works, one byte past traps.
+      check(callI64(inst, "i64_roundtrip", I32(65528), I64(0L)) == 0L, "last valid 8-byte aligned slot")
+      expectError(inst, "i64_roundtrip", Seq(I32(65529), I64(0L))) { case WasmError.MemoryOutOfBounds => true }
+    }
+
     // --- ModuleInstance accessors ------------------------------------------
     test("ModuleInstance.exportedFunctionNames: sorted, function-only") {
       val inst = instantiate(Fixtures.memory)
@@ -514,6 +699,53 @@ object InterpreterTest:
         case Left(e) => check(false, s"expected Right, got Left($e)")
     }
 
+    // --- readS64 ------------------------------------------------------------
+
+    def assertS64(bs: Array[Byte], v: Long, p: Int): Unit =
+      Leb128.readS64(bs, 0) match
+        case Right((vv, pp)) =>
+          check(vv == v, s"value: expected $v, got $vv")
+          check(pp == p, s"newPos: expected $p, got $pp")
+        case Left(e) => check(false, s"expected Right, got Left($e)")
+
+    def assertS64Fails(bs: Array[Byte]): Unit =
+      Leb128.readS64(bs, 0) match
+        case Right(v) => check(false, s"expected Left, got Right($v)")
+        case Left(_)  => ()
+
+    test("Leb128.readS64: 0 from a single 0x00 byte") {
+      assertS64(b(0x00), 0L, 1)
+    }
+    test("Leb128.readS64: -1 (single 0x7F byte, sign bit set)") {
+      assertS64(b(0x7f), -1L, 1)
+    }
+    test("Leb128.readS64: positive 64 (two-byte canonical encoding)") {
+      assertS64(b(0xc0, 0x00), 64L, 2)
+    }
+    test("Leb128.readS64: -123456 (multi-byte negative)") {
+      assertS64(b(0xc0, 0xbb, 0x78), -123456L, 3)
+    }
+    test("Leb128.readS64: 4294967295 (out of i32 range — five-byte encoding)") {
+      // Same byte string would read as -1 under readS32 (no room to widen),
+      // but as +0xFFFFFFFF in S64 since the sign bit isn't set.
+      assertS64(b(0xff, 0xff, 0xff, 0xff, 0x0f), 4294967295L, 5)
+    }
+    test("Leb128.readS64: Long.MaxValue (full ten-byte encoding)") {
+      assertS64(b(0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00), Long.MaxValue, 10)
+    }
+    test("Leb128.readS64: Long.MinValue (full ten-byte encoding, sign bit in final byte)") {
+      assertS64(b(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f), Long.MinValue, 10)
+    }
+    test("Leb128.readS64: empty input fails with InvalidModule") {
+      assertS64Fails(b())
+    }
+    test("Leb128.readS64: continuation bit set but no follow-on byte fails") {
+      assertS64Fails(b(0x80))
+    }
+    test("Leb128.readS64: eleven-byte (oversized) input fails") {
+      assertS64Fails(b(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80))
+    }
+
   // ========================================================================
   // 3. Parser malformed-binary tests (handcrafted bytes)
   // ========================================================================
@@ -557,12 +789,6 @@ object InterpreterTest:
       Parser.parse(bad) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("functype"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(functype), got $other")
-    }
-    test("parser: i64 valtype (0x7E) returns InvalidModule with 'i64'") {
-      val bad = patchFirst(Fixtures.arith, 0x7f, 0x7e)
-      Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("i64"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(i64), got $other")
     }
     test("parser: f32 valtype (0x7D) returns InvalidModule with 'f32'") {
       val bad = patchFirst(Fixtures.arith, 0x7f, 0x7d)
@@ -662,9 +888,6 @@ object InterpreterTest:
 
     test("interpreter: 0x11 (call_indirect) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x11), 0x11, "call_indirect")
-    }
-    test("interpreter: 0x42 (i64.const) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x42), 0x42, "i64.const")
     }
     test("interpreter: 0x76 (i32.shr_u) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x76), 0x76, "i32.shr_u")
@@ -779,15 +1002,16 @@ object InterpreterTest:
 
   private def section7_bugFixRegressions(): Unit =
 
-    test("regression: unsupported blocktype (0x7E i64) returns InvalidModule, not RuntimeException") {
+    test("regression: unsupported blocktype (0x7D f32) returns InvalidModule, not RuntimeException") {
       // Bug: `Interpreter.readBlocktype` threw `RuntimeException` for any
       // blocktype other than 0x40 / 0x7F, bypassing the WasmError discipline.
       // Fixed to `Left(InvalidModule(...))` so the pre-scan reports it cleanly.
       //
-      // We can't just `indexOf(0x02)` to find the `block` opcode — 0x02 also
-      // appears as section sizes / counts elsewhere in the binary. Search for
-      // the two-byte pattern `0x02 0x7F` (block + i32-blocktype) which only
-      // occurs at the block opcode itself.
+      // The fixture's block declares an i32 result (`0x02 0x7F`); we patch the
+      // blocktype byte to 0x7D (f32) which `readBlocktype` still rejects in
+      // the current subset. The original repro byte 0x7E (i64) is now a valid
+      // blocktype, so the regression test was retargeted to a still-unsupported
+      // form. Same code path; same expected typed error.
       val src = Fixtures.block_result
       val pat = b(0x02, 0x7f)
       var idx = -1
@@ -796,7 +1020,7 @@ object InterpreterTest:
         if src(i) == pat(0) && src(i + 1) == pat(1) then idx = i
         i += 1
       check(idx >= 0, "block + i32-blocktype pattern not found")
-      val bad = patchByte(src, idx + 1, 0x7e)            // blocktype byte → i64 (unsupported)
+      val bad = patchByte(src, idx + 1, 0x7d)            // blocktype byte → f32 (unsupported)
       Runtime.instantiate(bad, Seq(EnvModule.default)) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("blocktype"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(blocktype), got $other")

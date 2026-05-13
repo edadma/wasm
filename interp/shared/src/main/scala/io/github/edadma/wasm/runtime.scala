@@ -75,11 +75,14 @@ object Runtime:
         case Right(m) => m
         case Left(e)  => fail(e)
       funcs += Interpreter.WasmFunc(
-        signature = sig,
+        signature  = sig,
         paramCount = sig.params.size,
         localCount = sig.params.size + body.locals.size,
-        body = body.body,
-        meta = meta,
+        // Per-local types — params first (from sig), then declared locals.
+        // Used by the interpreter to pick the right zero-init value (I32(0) vs I64(0L)).
+        localTypes = sig.params ++ body.locals,
+        body       = body.body,
+        meta       = meta,
       )
     }
 

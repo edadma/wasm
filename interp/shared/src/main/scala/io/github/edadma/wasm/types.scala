@@ -2,17 +2,19 @@ package io.github.edadma.wasm
 
 /** WebAssembly value types and the runtime values that inhabit them.
   *
-  * MVP keeps `Value` and `ValueType` as sealed hierarchies so future variants
-  * (`I64`, `F32`, `F64`) can be added without breaking the binary API.
+  * `Value` and `ValueType` stay sealed hierarchies so future variants
+  * (`F32`, `F64`) can be added without breaking the binary API.
   */
 
 sealed trait Value
-final case class I32(value: Int) extends Value
-// TODO: I64(value: Long), F32(value: Float), F64(value: Double)
+final case class I32(value: Int)  extends Value
+final case class I64(value: Long) extends Value
+// TODO: F32(value: Float), F64(value: Double)
 
 enum ValueType:
   case I32Type
-  // TODO: I64Type, F32Type, F64Type
+  case I64Type
+  // TODO: F32Type, F64Type
 
 /** A function signature — vector of param types in, vector of result types out.
   * MVP allows at most one result type. */

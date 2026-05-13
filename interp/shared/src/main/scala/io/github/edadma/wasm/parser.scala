@@ -130,7 +130,7 @@ object Parser:
   private def readValType(c: Cursor): ValueType =
     c.readByte() match
       case 0x7f => ValueType.I32Type
-      case 0x7e => fail(WasmError.InvalidModule("i64 valtype not supported in MVP"))
+      case 0x7e => ValueType.I64Type
       case 0x7d => fail(WasmError.InvalidModule("f32 valtype not supported in MVP"))
       case 0x7c => fail(WasmError.InvalidModule("f64 valtype not supported in MVP"))
       case b    => fail(WasmError.InvalidModule(s"unknown valtype 0x${b.toHexString}"))

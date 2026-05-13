@@ -1,6 +1,7 @@
 package io.github.edadma.wasm
 
 import scala.collection.mutable.ArrayBuffer
+import java.lang as jl  // for Long.divideUnsigned / rotateLeft / numberOfLeadingZeros etc.
 
 /** Linear memory — a flat byte array sized in 64KiB pages.
   *
@@ -56,6 +57,9 @@ object Interpreter:
       /** Total locals including parameters — params come first, declared locals follow. */
       paramCount: Int,
       localCount: Int,
+      /** Type of each local slot, indexed 0..localCount-1. Used at call time to
+        * zero-initialize declared locals with the right `Value` variant. */
+      localTypes: Vector[ValueType],
       body: Array[Byte],
       meta: BodyMeta,
   ) extends ResolvedFunc
@@ -118,14 +122,15 @@ object Interpreter:
       case _: ArrayIndexOutOfBoundsException =>
         Left(WasmError.InvalidModule("unexpected end of function body"))
 
-  /** Decode a blocktype byte (MVP supports 0x40 empty and 0x7F i32 only).
+  /** Decode a blocktype byte (i32 / i64 result; empty for no result).
     * Returns `Right((resultArity, posAfter))`, or `Left(InvalidModule)` for
-    * any of the i64/f32/f64/multi-value forms the MVP subset doesn't model. */
+    * the f32/f64/multi-value forms the current subset doesn't model. */
   private def readBlocktype(body: Array[Byte], pos: Int): Either[WasmError, (Int, Int)] =
     (body(pos) & 0xff) match
       case 0x40 => Right((0, pos + 1))            // empty
       case 0x7f => Right((1, pos + 1))            // i32 result
-      // TODO: i64 (0x7E), f32 (0x7D), f64 (0x7C), multi-value (s33 type index).
+      case 0x7e => Right((1, pos + 1))            // i64 result
+      // TODO: f32 (0x7D), f64 (0x7C), multi-value (s33 type index).
       case b    => Left(WasmError.InvalidModule(s"unsupported blocktype 0x${b.toHexString}"))
 
   /** Advance past one full instruction (opcode + immediates). Used by the
@@ -140,14 +145,28 @@ object Interpreter:
         Right(pc + 1)
       case 0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 =>      // br, br_if, call, local.{get,set,tee}
         Leb128.readU32(body, pc + 1).map(_._2)
-      case 0x28 | 0x2c | 0x2d | 0x36 | 0x3a =>             // memory ops with align+offset
+      case 0x28 | 0x29 |                                   // i32.load, i64.load
+           0x2c | 0x2d |                                   // i32.load8_s/u
+           0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 |       // i64.load{8,16,32}_{s,u}
+           0x36 | 0x37 |                                   // i32.store, i64.store
+           0x3a | 0x3c | 0x3d | 0x3e =>                    // i32.store8 / i64.store{8,16,32}
         for
-          (_, p1) <- Leb128.readU32(body, pc + 1)
-          (_, p2) <- Leb128.readU32(body, p1)
+          (_, p1) <- Leb128.readU32(body, pc + 1)          // align
+          (_, p2) <- Leb128.readU32(body, p1)              // offset
         yield p2
       case 0x41 =>                                         // i32.const
         Leb128.readS32(body, pc + 1).map(_._2)
-      case b if b >= 0x45 && b <= 0x75 =>                  // i32 unary/binary/compare/shift
+      case 0x42 =>                                         // i64.const (SLEB64 immediate)
+        Leb128.readS64(body, pc + 1).map(_._2)
+      // 0x45–0x75 covers every i32 unary/binary/compare/shift AND the i64
+      // comparisons (0x50–0x5A); none take immediates. f32/f64 comparisons
+      // (0x5B–0x66) also live in here — harmless to skip-past since they
+      // likewise take no immediates, and the dispatch in `step` is what
+      // ultimately rejects them as UnknownOpcode.
+      case b if b >= 0x45 && b <= 0x75 =>
+        Right(pc + 1)
+      // 0x79–0x8A: i64 unary (clz/ctz/popcnt) + i64 numeric/bitwise/shift/rotate.
+      case b if b >= 0x79 && b <= 0x8a =>
         Right(pc + 1)
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -219,12 +238,20 @@ final class Interpreter private[wasm] (
 
   private inline def frame: Frame = frames.last
 
-  private inline def pushI32(v: Int): Unit = valueStack += I32(v)
+  private inline def pushI32(v: Int): Unit  = valueStack += I32(v)
+  private inline def pushI64(v: Long): Unit = valueStack += I64(v)
+
   private inline def popI32(): Int =
     if valueStack.isEmpty then fail(WasmError.TypeMismatch)
     valueStack.remove(valueStack.size - 1) match
       case I32(v) => v
-      // case _      => fail(WasmError.TypeMismatch)  // unreachable in MVP — only i32 values exist
+      case _      => fail(WasmError.TypeMismatch)
+
+  private inline def popI64(): Long =
+    if valueStack.isEmpty then fail(WasmError.TypeMismatch)
+    valueStack.remove(valueStack.size - 1) match
+      case I64(v) => v
+      case _      => fail(WasmError.TypeMismatch)
 
   private inline def popValue(): Value =
     if valueStack.isEmpty then fail(WasmError.TypeMismatch)
@@ -417,9 +444,154 @@ final class Interpreter private[wasm] (
       case 0x75 => binop((a, b) => a >> (b & 31)); f.pc += 1                              // i32.shr_s
       // TODO: i32.shr_u (0x76), i32.rotl/rotr, i32.clz/ctz/popcnt — leave space for the rest of the i32 op set.
 
+      // === i64 memory ====================================================
+      //
+      // All i64 memory accesses follow the same align+offset immediate
+      // pattern as i32 — only the access width and sign-extension differ.
+
+      case 0x29 =>                                                                        // i64.load (8 bytes)
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64(loadI64(addr + offset))
+
+      case 0x30 =>                                                                        // i64.load8_s
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64(loadByte(addr + offset).toByte.toLong)                                    // sign-extend
+
+      case 0x31 =>                                                                        // i64.load8_u
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64((loadByte(addr + offset) & 0xff).toLong)
+
+      case 0x32 =>                                                                        // i64.load16_s
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64(loadI16(addr + offset).toLong)                                            // already sign-extended
+
+      case 0x33 =>                                                                        // i64.load16_u
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64((loadI16(addr + offset) & 0xffff).toLong)
+
+      case 0x34 =>                                                                        // i64.load32_s
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64(loadI32(addr + offset).toLong)                                            // sign-extend
+
+      case 0x35 =>                                                                        // i64.load32_u
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI64(loadI32(addr + offset).toLong & 0xffffffffL)
+
+      case 0x37 =>                                                                        // i64.store (8 bytes)
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popI64()
+        val addr = popI32().toLong & 0xffffffffL
+        storeI64(addr + offset, v)
+
+      case 0x3c =>                                                                        // i64.store8 — low 8 bits
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popI64()
+        val addr = popI32().toLong & 0xffffffffL
+        storeByte(addr + offset, (v & 0xffL).toInt)
+
+      case 0x3d =>                                                                        // i64.store16 — low 16 bits
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popI64()
+        val addr = popI32().toLong & 0xffffffffL
+        storeI16(addr + offset, (v & 0xffffL).toInt)
+
+      case 0x3e =>                                                                        // i64.store32 — low 32 bits
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popI64()
+        val addr = popI32().toLong & 0xffffffffL
+        storeI32(addr + offset, v.toInt)
+
+      // === i64 numeric ===================================================
+
+      case 0x42 =>                                                                        // i64.const
+        val (v, p) = Leb128.readS64(body, f.pc + 1) match
+          case Right(t) => t
+          case Left(e)  => fail(e)
+        f.pc = p
+        pushI64(v)
+
+      case 0x50 => unop64Test(_ == 0L); f.pc += 1                                         // i64.eqz
+      case 0x51 => binop64Test(_ == _);                       f.pc += 1                   // i64.eq
+      case 0x52 => binop64Test(_ != _);                       f.pc += 1                   // i64.ne
+      case 0x53 => binop64Test(_ <  _);                       f.pc += 1                   // i64.lt_s
+      case 0x54 => binop64Test((a, b) => jl.Long.compareUnsigned(a, b) <  0); f.pc += 1   // i64.lt_u
+      case 0x55 => binop64Test(_ >  _);                       f.pc += 1                   // i64.gt_s
+      case 0x56 => binop64Test((a, b) => jl.Long.compareUnsigned(a, b) >  0); f.pc += 1   // i64.gt_u
+      case 0x57 => binop64Test(_ <= _);                       f.pc += 1                   // i64.le_s
+      case 0x58 => binop64Test((a, b) => jl.Long.compareUnsigned(a, b) <= 0); f.pc += 1   // i64.le_u
+      case 0x59 => binop64Test(_ >= _);                       f.pc += 1                   // i64.ge_s
+      case 0x5a => binop64Test((a, b) => jl.Long.compareUnsigned(a, b) >= 0); f.pc += 1   // i64.ge_u
+
+      case 0x79 => unop64(v => jl.Long.numberOfLeadingZeros(v).toLong);  f.pc += 1        // i64.clz
+      case 0x7a => unop64(v => jl.Long.numberOfTrailingZeros(v).toLong); f.pc += 1        // i64.ctz
+      case 0x7b => unop64(v => jl.Long.bitCount(v).toLong);             f.pc += 1         // i64.popcnt
+
+      case 0x7c => binop64(_ + _); f.pc += 1                                              // i64.add
+      case 0x7d => binop64(_ - _); f.pc += 1                                              // i64.sub
+      case 0x7e => binop64(_ * _); f.pc += 1                                              // i64.mul
+
+      case 0x7f =>                                                                        // i64.div_s
+        val b = popI64(); val a = popI64()
+        if b == 0L then fail(WasmError.InvalidModule("integer divide by zero"))
+        if a == Long.MinValue && b == -1L then fail(WasmError.InvalidModule("integer overflow in div_s"))
+        pushI64(a / b); f.pc += 1
+
+      case 0x80 =>                                                                        // i64.div_u
+        val b = popI64(); val a = popI64()
+        if b == 0L then fail(WasmError.InvalidModule("integer divide by zero"))
+        pushI64(jl.Long.divideUnsigned(a, b)); f.pc += 1
+
+      case 0x81 =>                                                                        // i64.rem_s
+        val b = popI64(); val a = popI64()
+        if b == 0L then fail(WasmError.InvalidModule("integer divide by zero"))
+        // WASM rem_s for MIN_LONG % -1 is 0 (does NOT trap, unlike Java).
+        pushI64(if a == Long.MinValue && b == -1L then 0L else a % b); f.pc += 1
+
+      case 0x82 =>                                                                        // i64.rem_u
+        val b = popI64(); val a = popI64()
+        if b == 0L then fail(WasmError.InvalidModule("integer divide by zero"))
+        pushI64(jl.Long.remainderUnsigned(a, b)); f.pc += 1
+
+      case 0x83 => binop64(_ & _); f.pc += 1                                              // i64.and
+      case 0x84 => binop64(_ | _); f.pc += 1                                              // i64.or
+      case 0x85 => binop64(_ ^ _); f.pc += 1                                              // i64.xor
+      case 0x86 => binop64((a, b) => a << (b & 63L).toInt); f.pc += 1                     // i64.shl
+      case 0x87 => binop64((a, b) => a >> (b & 63L).toInt); f.pc += 1                     // i64.shr_s
+      case 0x88 => binop64((a, b) => a >>> (b & 63L).toInt); f.pc += 1                    // i64.shr_u
+      case 0x89 => binop64((a, b) => jl.Long.rotateLeft (a, (b & 63L).toInt)); f.pc += 1  // i64.rotl
+      case 0x8a => binop64((a, b) => jl.Long.rotateRight(a, (b & 63L).toInt)); f.pc += 1  // i64.rotr
+
       // === unsupported ===================================================
 
-      // TODO: i64.* (0x42, 0x50–0x6E shifted forms, 0x7C–0xA6) — extend popValue and add I64 variant.
       // TODO: f32/f64 — different push/pop discipline.
       // TODO: 0x11 call_indirect — needs tables.
       // TODO: 0x3F memory.size, 0x40 memory.grow.
@@ -489,15 +661,20 @@ final class Interpreter private[wasm] (
         if results.size != sig.results.size then fail(WasmError.TypeMismatch)
         results.foreach(valueStack += _)
 
-      case wf @ WasmFunc(sig, paramCount, localCount, _, _) =>
+      case wf @ WasmFunc(_, paramCount, localCount, localTypes, _, _) =>
         if valueStack.size < paramCount then fail(WasmError.TypeMismatch)
         val locals = new Array[Value](localCount)
         // Pop params right-to-left so locals[0..paramCount-1] hold them in declared order.
         var k = paramCount - 1
         while k >= 0 do { locals(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
-        // Declared locals zero-initialize. For MVP everything is i32 → all I32(0).
+        // Declared locals zero-initialize. Pick the right `Value` variant for each
+        // slot — `I32(0)` for i32, `I64(0L)` for i64.
         var j = paramCount
-        while j < localCount do { locals(j) = I32(0); j += 1 }
+        while j < localCount do
+          locals(j) = localTypes(j) match
+            case ValueType.I32Type => I32(0)
+            case ValueType.I64Type => I64(0L)
+          j += 1
         frames += new Frame(wf, locals, stackBase = valueStack.size)
 
   // === memory access ======================================================
@@ -512,6 +689,22 @@ final class Interpreter private[wasm] (
   private def storeByte(addr: Long, v: Int): Unit =
     boundsCheck(addr, 1)
     memory.data(addr.toInt) = v.toByte
+
+  /** Little-endian 16-bit load — returns a sign-extended Int. Callers that
+    * want the zero-extended form mask with `0xffff` themselves. */
+  private def loadI16(addr: Long): Int =
+    boundsCheck(addr, 2)
+    val a = addr.toInt
+    val d = memory.data
+    val raw = (d(a) & 0xff) | ((d(a + 1) & 0xff) << 8)
+    (raw << 16) >> 16 // sign-extend the 16-bit value into an Int
+
+  private def storeI16(addr: Long, v: Int): Unit =
+    boundsCheck(addr, 2)
+    val a = addr.toInt
+    val d = memory.data
+    d(a)     = (v         & 0xff).toByte
+    d(a + 1) = ((v >>> 8) & 0xff).toByte
 
   /** Little-endian 32-bit load. */
   private def loadI32(addr: Long): Int =
@@ -529,6 +722,33 @@ final class Interpreter private[wasm] (
     d(a + 2) = ((v >>> 16) & 0xff).toByte
     d(a + 3) = ((v >>> 24) & 0xff).toByte
 
+  /** Little-endian 64-bit load. */
+  private def loadI64(addr: Long): Long =
+    boundsCheck(addr, 8)
+    val a = addr.toInt
+    val d = memory.data
+    (d(a)     & 0xffL)        |
+    ((d(a + 1) & 0xffL) <<  8) |
+    ((d(a + 2) & 0xffL) << 16) |
+    ((d(a + 3) & 0xffL) << 24) |
+    ((d(a + 4) & 0xffL) << 32) |
+    ((d(a + 5) & 0xffL) << 40) |
+    ((d(a + 6) & 0xffL) << 48) |
+    ((d(a + 7) & 0xffL) << 56)
+
+  private def storeI64(addr: Long, v: Long): Unit =
+    boundsCheck(addr, 8)
+    val a = addr.toInt
+    val d = memory.data
+    d(a)     = ( v         & 0xffL).toByte
+    d(a + 1) = ((v >>>  8) & 0xffL).toByte
+    d(a + 2) = ((v >>> 16) & 0xffL).toByte
+    d(a + 3) = ((v >>> 24) & 0xffL).toByte
+    d(a + 4) = ((v >>> 32) & 0xffL).toByte
+    d(a + 5) = ((v >>> 40) & 0xffL).toByte
+    d(a + 6) = ((v >>> 48) & 0xffL).toByte
+    d(a + 7) = ((v >>> 56) & 0xffL).toByte
+
   // === misc helpers =======================================================
 
   private inline def readU32At(f: Frame, pos: Int): (Int, Int) =
@@ -541,3 +761,17 @@ final class Interpreter private[wasm] (
 
   private inline def unop(op: Int => Int): Unit =
     val a = popI32(); pushI32(op(a))
+
+  private inline def binop64(op: (Long, Long) => Long): Unit =
+    val b = popI64(); val a = popI64(); pushI64(op(a, b))
+
+  private inline def unop64(op: Long => Long): Unit =
+    val a = popI64(); pushI64(op(a))
+
+  /** i64 comparison — pops two i64 values, pushes an i32 (1 if true, 0 otherwise). */
+  private inline def binop64Test(op: (Long, Long) => Boolean): Unit =
+    val b = popI64(); val a = popI64(); pushI32(if op(a, b) then 1 else 0)
+
+  /** i64.eqz — pops one i64, pushes i32 1/0 by predicate. */
+  private inline def unop64Test(op: Long => Boolean): Unit =
+    val a = popI64(); pushI32(if op(a) then 1 else 0)
