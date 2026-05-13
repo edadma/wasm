@@ -53,20 +53,20 @@ val commonScalacOptions = Seq(
 // `interp` cross-project's Test source generators so it re-runs every compile.
 // ============================================================================
 
-def generateFixtures(outFile: File, fixturesDir: File, log: Logger): Seq[File] = {
+def generateFixtures(outFile: File, fixturesDir: File, log: Logger, pkg: String, obj: String, srcLabel: String): Seq[File] = {
   val wasmFiles = Option(fixturesDir.listFiles()).getOrElse(Array.empty[File])
     .filter(_.getName.endsWith(".wasm"))
     .sortBy(_.getName)
   val sb = new StringBuilder
-  sb.append("package io.github.edadma.wasm\n\n")
+  sb.append(s"package $pkg\n\n")
   // Note: Scala supports nested block comments, so we have to avoid producing
   // a `/*` substring inside the generated docstring (e.g. `fixtures/*.wasm`).
-  sb.append("/** Generated from the .wasm files in interp/shared/src/test/resources/fixtures.\n")
+  sb.append(s"/** Generated from the .wasm files in $srcLabel.\n")
   sb.append("  *\n")
   sb.append("  * Do not edit by hand — change a `.wat`, run `wat2wasm` to refresh the `.wasm`,\n")
   sb.append("  * and this file rebuilds on the next `sbt compile`.\n")
   sb.append("  */\n")
-  sb.append("object Fixtures:\n\n")
+  sb.append(s"object $obj:\n\n")
   wasmFiles.foreach { f =>
     val name  = f.getName.stripSuffix(".wasm")
     val bytes = IO.readBytes(f)
@@ -108,7 +108,12 @@ lazy val interp = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       val rootDir = (LocalRootProject / baseDirectory).value
       val fxDir   = rootDir / "interp" / "shared" / "src" / "test" / "resources" / "fixtures"
       val outFile = (Test / sourceManaged).value / "io" / "github" / "edadma" / "wasm" / "Fixtures.scala"
-      generateFixtures(outFile, fxDir, streams.value.log)
+      generateFixtures(
+        outFile, fxDir, streams.value.log,
+        pkg      = "io.github.edadma.wasm",
+        obj      = "Fixtures",
+        srcLabel = "interp/shared/src/test/resources/fixtures",
+      )
     }.taskValue,
   )
   .jsSettings(
@@ -165,6 +170,48 @@ lazy val cli = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   )
 
 // ============================================================================
+// `wasi` — WASI Preview 1 host shim. Implements the `wasi_snapshot_preview1`
+// import module so real wasi-compiled programs (Rust, Zig, C with wasi-sdk,
+// AssemblyScript) can run end-to-end on top of `interp`. Depends on `interp`;
+// stays zero-external-dep (the test runner is the same hand-rolled one).
+//
+//   sbt 'wasiJVM/Test/run'
+//   sbt 'wasiJS/Test/run'
+//   sbt 'wasiNative/Test/run'
+// ============================================================================
+
+lazy val wasi = crossProject(JSPlatform, JVMPlatform, NativePlatform)
+  .in(file("wasi"))
+  .dependsOn(interp)
+  .settings(
+    name := "wasm-wasi",
+    scalacOptions ++= commonScalacOptions,
+    publishMavenStyle      := true,
+    Test / publishArtifact := false,
+    Test / sourceGenerators += Def.task {
+      val rootDir = (LocalRootProject / baseDirectory).value
+      val fxDir   = rootDir / "wasi" / "shared" / "src" / "test" / "resources" / "fixtures"
+      val outFile = (Test / sourceManaged).value / "io" / "github" / "edadma" / "wasm" / "wasi" / "WasiFixtures.scala"
+      generateFixtures(
+        outFile, fxDir, streams.value.log,
+        pkg      = "io.github.edadma.wasm.wasi",
+        obj      = "WasiFixtures",
+        srcLabel = "wasi/shared/src/test/resources/fixtures",
+      )
+    }.taskValue,
+  )
+  .jsSettings(
+    scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) },
+    scalaJSLinkerConfig ~= { _.withSourceMap(false) },
+    Test / scalaJSUseMainModuleInitializer := true,
+    Test / scalaJSUseTestModuleInitializer := false,
+    jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv(),
+  )
+  .nativeSettings(
+    Test / mainClass := Some("io.github.edadma.wasm.wasi.WasiTest"),
+  )
+
+// ============================================================================
 // Aggregator — `sbt compile` / `sbt test` operate on everything.
 // ============================================================================
 
@@ -172,6 +219,7 @@ lazy val root = project
   .in(file("."))
   .aggregate(
     interp.js, interp.jvm, interp.native,
+    wasi.js,   wasi.jvm,   wasi.native,
     cli.js,    cli.jvm,    cli.native,
   )
   .settings(
