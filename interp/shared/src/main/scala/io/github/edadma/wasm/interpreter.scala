@@ -87,9 +87,11 @@ object Interpreter:
               case 0x03 => BlockKind.Loop
               case _    => BlockKind.If
             val startPC = pc
-            val (arity, afterBT) = readBlocktype(body, pc + 1)
-            stack += ((startPC, kind, afterBT, arity, -1))
-            pc = afterBT
+            readBlocktype(body, pc + 1) match
+              case Left(e) => return Left(e)
+              case Right((arity, afterBT)) =>
+                stack += ((startPC, kind, afterBT, arity, -1))
+                pc = afterBT
           case 0x05 =>
             // `else` belongs to the topmost open If
             if stack.isEmpty then return Left(WasmError.InvalidModule("`else` outside any block"))
@@ -117,12 +119,14 @@ object Interpreter:
         Left(WasmError.InvalidModule("unexpected end of function body"))
 
   /** Decode a blocktype byte (MVP supports 0x40 empty and 0x7F i32 only).
-    * Returns `(resultArity, posAfter)`. */
-  private def readBlocktype(body: Array[Byte], pos: Int): (Int, Int) =
+    * Returns `Right((resultArity, posAfter))`, or `Left(InvalidModule)` for
+    * any of the i64/f32/f64/multi-value forms the MVP subset doesn't model. */
+  private def readBlocktype(body: Array[Byte], pos: Int): Either[WasmError, (Int, Int)] =
     (body(pos) & 0xff) match
-      case 0x40 => (0, pos + 1)            // empty
-      case 0x7f => (1, pos + 1)            // i32 result
-      case b    => throw new RuntimeException(s"unsupported blocktype 0x${b.toHexString}") // TODO: i64/f32/f64/multi-value
+      case 0x40 => Right((0, pos + 1))            // empty
+      case 0x7f => Right((1, pos + 1))            // i32 result
+      // TODO: i64 (0x7E), f32 (0x7D), f64 (0x7C), multi-value (s33 type index).
+      case b    => Left(WasmError.InvalidModule(s"unsupported blocktype 0x${b.toHexString}"))
 
   /** Advance past one full instruction (opcode + immediates). Used by the
     * pre-scanner to skip non-structural opcodes when looking for matching ends.
