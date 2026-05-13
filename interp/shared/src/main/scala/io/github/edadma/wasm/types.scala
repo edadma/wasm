@@ -28,10 +28,23 @@ final case class FuncType(params: Vector[ValueType], results: Vector[ValueType])
 final case class FuncImport(module: String, name: String, typeIdx: Int)
 
 sealed trait Export { def name: String }
-final case class FuncExport(name: String, funcIdx: Int) extends Export
-// TODO: MemoryExport, TableExport, GlobalExport — not surfaced in MVP
+final case class FuncExport(name: String, funcIdx: Int)     extends Export
+final case class GlobalExport(name: String, globalIdx: Int) extends Export
+// TODO: MemoryExport, TableExport — not surfaced yet
 
 final case class MemoryLimits(min: Int, max: Option[Int])
+
+/** A module-defined global. The init expression is evaluated at parse time
+  * for the MVP-style `*.const` form and stored directly here as `initialValue`;
+  * `Runtime.instantiate` copies that into the live globals array. `mutable` is
+  * the section-6 mutability byte (0x00 = const, 0x01 = var) — `global.set` on
+  * an immutable global traps at run time (and once Phase 6 ships, at
+  * validation time).
+  *
+  * Imported globals are not represented yet (Phase 5 — keeps the surface
+  * small while Phase 2 lands).
+  */
+final case class Global(valueType: ValueType, mutable: Boolean, initialValue: Value)
 
 /** Active data segment: `bytes` are copied into memory 0 at `offset` during instantiation. */
 final case class DataSegment(offset: Int, bytes: Array[Byte])
@@ -50,6 +63,7 @@ final case class WasmModule(
     imports: Vector[FuncImport],
     functions: Vector[Int],          // type indices, one per defined function (matches `codes` 1:1)
     memories: Vector[MemoryLimits],
+    globals: Vector[Global],         // module-defined globals (imports not surfaced yet)
     exports: Vector[Export],
     codes: Vector[FuncBody],
     data: Vector[DataSegment],

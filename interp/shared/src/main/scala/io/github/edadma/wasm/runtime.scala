@@ -4,19 +4,28 @@ import scala.collection.mutable.ArrayBuffer
 
 /** An instantiated module — imports resolved, memory allocated and primed,
   * exports indexed by name. Ready to `invoke`.
+  *
+  * `globals` and `globalMutable` are parallel arrays indexed by globalIdx.
+  * They persist across `invoke` calls — that persistence is what globals
+  * exist to provide. Each fresh `Interpreter` shares the same arrays, so a
+  * `global.set` in one call is visible to the next.
   */
 final class ModuleInstance private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
     val memory: Memory,
+    private val globals: Array[Value],
+    private val globalMutable: Array[Boolean],
     private val exportFuncs: Map[String, Int],
+    private val exportGlobals: Map[String, Int],
 ):
 
   /** Invoke an exported function. Each call gets a fresh interpreter so
-    * memory persists across calls but the value/call stacks don't. */
+    * memory and globals persist across calls but the value/call stacks
+    * don't. */
   def invoke(name: String, args: Seq[Value] = Seq.empty): Either[WasmError, Seq[Value]] =
     exportFuncs.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
-      case Some(idx) => new Interpreter(funcs, memory).invoke(idx, args)
+      case Some(idx) => new Interpreter(funcs, memory, globals, globalMutable).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
     * confirm linking worked. */
@@ -26,6 +35,15 @@ final class ModuleInstance private[wasm] (
     * CLI's `--list-exports` and by tests verifying the export table after
     * instantiation. */
   def exportedFunctionNames: Seq[String] = exportFuncs.keys.toSeq.sorted
+
+  /** Read the current value of an exported global. Used by tests to
+    * confirm `global.set` mutations from inside the module without having
+    * to ship a getter function — and by future host-driven introspection.
+    */
+  def globalValue(name: String): Either[WasmError, Value] =
+    exportGlobals.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(globals(idx))
 
 /** Linker / loader. `instantiate` does the four jobs the WASM spec assigns to
   * instantiation: resolve imports, allocate memory, initialize data segments,
@@ -99,6 +117,32 @@ object Runtime:
       System.arraycopy(seg.bytes, 0, memory.data, seg.offset, seg.bytes.length)
     }
 
+    // === globals ============================================================
+    // Module-defined globals only; imported globals will join the head of
+    // these arrays once Phase 5 surfaces them. Init values were folded at
+    // parse time (no `global.get` over imports yet), so we just shuttle them
+    // into the live arrays. The mutability bit is stored next to the value
+    // so the interpreter's `global.set` guard is an O(1) lookup.
+    val gN            = module.globals.size
+    val globals       = new Array[Value](gN)
+    val globalMutable = new Array[Boolean](gN)
+    var gi = 0
+    while gi < gN do
+      val g = module.globals(gi)
+      // Defensive: a wrong-type init slipped past the parser would be a bug,
+      // but a misclassified `Value` here would otherwise show up as a runtime
+      // TypeMismatch much later. Check up front.
+      val ok = (g.valueType, g.initialValue) match
+        case (ValueType.I32Type, _: I32) => true
+        case (ValueType.I64Type, _: I64) => true
+        case (ValueType.F32Type, _: F32) => true
+        case (ValueType.F64Type, _: F64) => true
+        case _                           => false
+      if !ok then fail(WasmError.InvalidModule(s"global $gi: init value doesn't match declared type"))
+      globals(gi)       = g.initialValue
+      globalMutable(gi) = g.mutable
+      gi += 1
+
     // === exports ============================================================
     val exportFuncs: Map[String, Int] = module.exports.iterator.collect {
       case FuncExport(name, idx) =>
@@ -107,4 +151,11 @@ object Runtime:
         name -> idx
     }.toMap
 
-    new ModuleInstance(funcs.toIndexedSeq, memory, exportFuncs)
+    val exportGlobals: Map[String, Int] = module.exports.iterator.collect {
+      case GlobalExport(name, idx) =>
+        if idx < 0 || idx >= gN then
+          fail(WasmError.InvalidModule(s"export `$name` references invalid global $idx"))
+        name -> idx
+    }.toMap
+
+    new ModuleInstance(funcs.toIndexedSeq, memory, globals, globalMutable, exportFuncs, exportGlobals)

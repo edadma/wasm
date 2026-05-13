@@ -5,9 +5,9 @@ import scala.collection.mutable.ArrayBuffer
 /** Parser for the WebAssembly binary format (MVP subset).
   *
   * Recognised sections: Type (1), Import (2), Function (3), Memory (5),
-  * Export (7), Code (10), Data (11). All other sections are skipped silently
-  * so we can be fed real-world modules that include Custom, Table, Global,
-  * etc. without choking.
+  * Global (6), Export (7), Code (10), Data (11). All other sections are
+  * skipped silently so we can be fed real-world modules that include
+  * Custom, Table, Start, Element, DataCount, etc. without choking.
   *
   * Style note: internally the parser uses a private `ParseFail` exception for
   * control flow because the section/instruction stream has many nested reads
@@ -86,6 +86,7 @@ object Parser:
     var imports   = Vector.empty[FuncImport]
     var functions = Vector.empty[Int]
     var memories  = Vector.empty[MemoryLimits]
+    var globals   = Vector.empty[Global]
     var exports   = Vector.empty[Export]
     var codes     = Vector.empty[FuncBody]
     var data      = Vector.empty[DataSegment]
@@ -101,17 +102,18 @@ object Parser:
         case 2  => imports   = parseImportSection(c)
         case 3  => functions = parseFunctionSection(c)
         case 5  => memories  = parseMemorySection(c)
+        case 6  => globals   = parseGlobalSection(c)
         case 7  => exports   = parseExportSection(c)
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
-        case _  => () // ignore Custom (0), Table (4), Global (6), Start (8), Element (9), DataCount (12)
+        case _  => () // ignore Custom (0), Table (4), Start (8), Element (9), DataCount (12)
       c.pos = secEnd
 
     if codes.size != functions.size then
       fail(WasmError.InvalidModule(
         s"function/code section length mismatch: ${functions.size} types vs ${codes.size} bodies"))
 
-    WasmModule(types, imports, functions, memories, exports, codes, data)
+    WasmModule(types, imports, functions, memories, globals, exports, codes, data)
 
   // === Type section ===
 
@@ -183,6 +185,27 @@ object Parser:
     val max  = if (flag & 0x01) != 0 then Some(c.readU32()) else None
     MemoryLimits(min, max)
 
+  // === Global section ===
+
+  /** Parse Section 6. Per global: valtype byte, mutability byte, init-expr.
+    *
+    * In MVP the init-expr is a single `*.const` instruction followed by the
+    * `end` byte. `global.get` against an imported global is also legal here
+    * per the spec, but we don't surface global imports yet (Phase 5), so the
+    * `global.get` form is rejected with a clear diagnostic rather than
+    * silently accepted with no live binding.
+    */
+  private def parseGlobalSection(c: Cursor): Vector[Global] =
+    val n = c.readU32()
+    Vector.tabulate(n) { _ =>
+      val vt  = readValType(c)
+      val mut = c.readByte() match
+        case 0x00 => false
+        case 0x01 => true
+        case b    => fail(WasmError.InvalidModule(s"unknown global mutability byte 0x${b.toHexString}"))
+      Global(vt, mut, readConstExpr(c, vt))
+    }
+
   // === Export section ===
 
   private def parseExportSection(c: Cursor): Vector[Export] =
@@ -195,7 +218,8 @@ object Parser:
       val idx  = c.readU32()
       kind match
         case 0x00 => out += FuncExport(name, idx)
-        case 0x01 | 0x02 | 0x03 => () // table/memory/global — silently ignored in MVP
+        case 0x03 => out += GlobalExport(name, idx)
+        case 0x01 | 0x02 => () // table/memory — silently ignored until those sections land
         case other => fail(WasmError.InvalidModule(s"unknown export kind 0x${other.toHexString}"))
       i += 1
     out.toVector
@@ -247,13 +271,63 @@ object Parser:
           fail(WasmError.InvalidModule(s"unknown data segment flag $other"))
     }
 
-  /** A constant expression in MVP is exactly one instruction (`i32.const N`)
-    * followed by `end`. We don't support `global.get` here because globals
-    * aren't in the MVP subset. */
+  /** Data-segment offsets are constrained to be i32 const exprs. Phase 1's
+    * narrow reader stays as a thin wrapper around the type-checked
+    * `readConstExpr` so the active-data parse keeps its old signature.
+    */
   private def readConstI32Expr(c: Cursor): Int =
-    val op = c.readByte()
-    if op != 0x41 then fail(WasmError.InvalidModule(s"expected i32.const in const expr, got 0x${op.toHexString}"))
-    val v   = c.readS32()
+    readConstExpr(c, ValueType.I32Type) match
+      case I32(v) => v
+      case other  => fail(WasmError.InvalidModule(s"expected i32 const expr, got $other"))
+
+  /** Read a constant initializer expression: a single `*.const` of the
+    * expected value type, followed by `end`. The `global.get`-on-imported-
+    * global form is also valid per spec, but until imports surface globals
+    * (Phase 5) we reject it explicitly. f32/f64 immediates are 4 / 8 raw
+    * little-endian IEEE-754 bytes (NOT LEB), the same encoding the
+    * interpreter uses for `0x43` / `0x44` in-body.
+    */
+  private def readConstExpr(c: Cursor, expected: ValueType): Value =
+    val op  = c.readByte()
+    val v   = (op, expected) match
+      case (0x41, ValueType.I32Type) => I32(c.readS32())
+      case (0x42, ValueType.I64Type) =>
+        Leb128.readS64(c.bytes, c.pos) match
+          case Right((x, p)) => c.pos = p; I64(x)
+          case Left(e)       => fail(e)
+      case (0x43, ValueType.F32Type) =>
+        val b   = c.readBytes(4)
+        val bits = (b(0) & 0xff)        |
+                   ((b(1) & 0xff) <<  8) |
+                   ((b(2) & 0xff) << 16) |
+                   ((b(3) & 0xff) << 24)
+        F32(java.lang.Float.intBitsToFloat(bits))
+      case (0x44, ValueType.F64Type) =>
+        val b   = c.readBytes(8)
+        val bits =
+          (b(0) & 0xffL)        |
+          ((b(1) & 0xffL) <<  8) |
+          ((b(2) & 0xffL) << 16) |
+          ((b(3) & 0xffL) << 24) |
+          ((b(4) & 0xffL) << 32) |
+          ((b(5) & 0xffL) << 40) |
+          ((b(6) & 0xffL) << 48) |
+          ((b(7) & 0xffL) << 56)
+        F64(java.lang.Double.longBitsToDouble(bits))
+      case (0x23, _) =>
+        fail(WasmError.InvalidModule(
+          "global.get in const expr requires an imported global, which isn't supported yet"))
+      case (other, _) =>
+        // Phrase the diagnostic in terms of the *.const mnemonic that the
+        // declared type would have required, so it reads the same way the
+        // wat source does.
+        val mnemonic = expected match
+          case ValueType.I32Type => "i32.const"
+          case ValueType.I64Type => "i64.const"
+          case ValueType.F32Type => "f32.const"
+          case ValueType.F64Type => "f64.const"
+        fail(WasmError.InvalidModule(
+          s"expected $mnemonic in const expr, got 0x${other.toHexString}"))
     val end = c.readByte()
-    if end != 0x0b then fail(WasmError.InvalidModule("expected end after i32.const in const expr"))
+    if end != 0x0b then fail(WasmError.InvalidModule(s"expected end after const expr, got 0x${end.toHexString}"))
     v

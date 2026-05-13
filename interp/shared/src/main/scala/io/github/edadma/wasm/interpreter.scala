@@ -146,7 +146,9 @@ object Interpreter:
     op match
       case 0x00 | 0x01 | 0x0f | 0x1a | 0x1b =>             // unreachable, nop, return, drop, select
         Right(pc + 1)
-      case 0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 =>      // br, br_if, call, local.{get,set,tee}
+      case 0x0c | 0x0d | 0x10 |                            // br, br_if, call
+           0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
+           0x23 | 0x24 =>                                  // global.{get,set}
         Leb128.readU32(body, pc + 1).map(_._2)
       case 0x28 | 0x29 | 0x2a | 0x2b |                     // i32.load, i64.load, f32.load, f64.load
            0x2c | 0x2d |                                   // i32.load8_s/u
@@ -219,6 +221,13 @@ end Interpreter
 final class Interpreter private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
     val memory: Memory,
+    /** Module-instance globals (shared across calls — that persistence is
+      * the whole point of globals). The interpreter mutates entries in
+      * place on `global.set`. */
+    private val globals: Array[Value],
+    /** Parallel to `globals` — true if the corresponding slot is `var`,
+      * false if `const`. `global.set` traps if the bit is false. */
+    private val globalMutable: Array[Boolean],
 ):
   import Interpreter.*
 
@@ -392,6 +401,24 @@ final class Interpreter private[wasm] (
         if i < 0 || i >= f.locals.length then fail(WasmError.InvalidModule(s"local.tee $i out of range"))
         if valueStack.isEmpty then fail(WasmError.TypeMismatch)
         f.locals(i) = valueStack.last
+
+      case 0x23 =>                                                                        // global.get
+        val (i, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        if i < 0 || i >= globals.length then fail(WasmError.InvalidModule(s"global.get $i out of range"))
+        valueStack += globals(i)
+
+      case 0x24 =>                                                                        // global.set
+        val (i, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        if i < 0 || i >= globals.length then fail(WasmError.InvalidModule(s"global.set $i out of range"))
+        if !globalMutable(i) then fail(WasmError.InvalidModule(s"global.set on immutable global $i"))
+        if valueStack.isEmpty then fail(WasmError.TypeMismatch)
+        // Spec validates types statically (Phase 6). Here we accept whatever's
+        // on the stack — a mistyped store would be caught by the operator
+        // that reads the global next, and Phase 6's validator will lift this
+        // into a structural error.
+        globals(i) = valueStack.remove(valueStack.size - 1)
 
       // === memory ========================================================
 

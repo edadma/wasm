@@ -413,10 +413,14 @@ object InterpreterTest:
       val inst = instantiate(Fixtures.global_import)
       check(callI32(inst, "f") == 3, "function after a skipped global import still works")
     }
-    test("parser: memory and global exports silently ignored") {
+    test("parser: memory export silently ignored; global export surfaced") {
       val inst = instantiate(Fixtures.mem_export)
-      check(inst.exportedFunctionNames == Seq("f"), s"non-function exports leaked: ${inst.exportedFunctionNames}")
+      check(inst.exportedFunctionNames == Seq("f"), s"function-export list should be just `f`: ${inst.exportedFunctionNames}")
       check(callI32(inst, "f") == 4, "function export still callable")
+      // Phase 2: global exports are surfaced through `globalValue`.
+      inst.globalValue("g") match
+        case Right(I32(7)) => ()
+        case other         => check(false, s"global export `g` should read I32(7): $other")
     }
     test("function: empty body returns immediately with no result") {
       val inst = instantiate(Fixtures.empty_func)
@@ -1361,6 +1365,114 @@ object InterpreterTest:
       check(callI64(inst, "i64_reinterpret_f64", F64(-0.0))   == Long.MinValue, "f64 -0 -> sign bit only")
     }
 
+    // --- Phase 2: globals ---------------------------------------------------
+
+    test("globals: counter persists across calls; tee replacement via get-after-set") {
+      val inst = instantiate(Fixtures.globals_basic)
+      // Counter starts at zero per the const init.
+      check(callI32(inst, "get_count") == 0, "fresh instance starts at 0")
+      // Two consecutive bumps must observe the running total — this is the
+      // signature behaviour globals add over locals (state across calls).
+      check(callI32(inst, "bump") == 1, "first bump → 1")
+      check(callI32(inst, "bump") == 2, "second bump → 2")
+      check(callI32(inst, "bump") == 3, "third bump → 3")
+      check(callI32(inst, "get_count") == 3, "counter visible from a separate getter")
+      // set_count returns the prior value and stores the new one.
+      check(callI32(inst, "set_count", 100) == 3,   "set_count returns previous value")
+      check(callI32(inst, "get_count")     == 100, "new value stuck")
+      // Each fresh instantiation gets its own globals — instances don't share.
+      val inst2 = instantiate(Fixtures.globals_basic)
+      check(callI32(inst2, "get_count") == 0, "second instance starts at 0 (no cross-instance bleed)")
+    }
+
+    test("globals: immutable seed readable; module-instance exposes both globals via globalValue") {
+      val inst = instantiate(Fixtures.globals_basic)
+      check(callI32(inst, "get_seed") == 42, "seed reads back as 42")
+      inst.globalValue("seed") match
+        case Right(I32(42)) => ()
+        case other          => check(false, s"`seed` global export should read 42: $other")
+      // Direct read of `counter` mirrors the function-getter reading.
+      inst.globalValue("counter") match
+        case Right(I32(0)) => ()
+        case other         => check(false, s"`counter` should start at 0: $other")
+      runRight(inst.invoke("bump"))
+      inst.globalValue("counter") match
+        case Right(I32(1)) => ()
+        case other         => check(false, s"`counter` should now be 1: $other")
+    }
+
+    test("globals: per-type round-trip — i32 / i64 / f32 / f64 init values decode correctly") {
+      val inst = instantiate(Fixtures.globals_types)
+      // Init values from the section-6 init-expr decode (each *.const form).
+      check(callI32(inst, "get_i32") == 0x0bad0dad,            "i32 init")
+      check(callI64(inst, "get_i64") == 0x1122334455667788L,   "i64 init")
+      check(callF32(inst, "get_f32") == 1.5f,                  "f32 init")
+      check(callF64(inst, "get_f64") == -2.5,                  "f64 init")
+
+      // set, then read back — confirms `global.set` is type-stable for each type.
+      runRight(inst.invoke("set_i32", Seq(I32(-7))))
+      runRight(inst.invoke("set_i64", Seq(I64(Long.MinValue))))
+      runRight(inst.invoke("set_f32", Seq(F32(Float.NaN))))
+      runRight(inst.invoke("set_f64", Seq(F64(Double.PositiveInfinity))))
+
+      check(callI32(inst, "get_i32") == -7,                            "i32 round-trip")
+      check(callI64(inst, "get_i64") == Long.MinValue,                 "i64 round-trip")
+      check(jl.Float.isNaN(callF32(inst, "get_f32")),                  "f32 NaN survives")
+      check(callF64(inst, "get_f64") == Double.PositiveInfinity,       "f64 +Inf survives")
+
+      // The globalValue accessor sees the same live state.
+      inst.globalValue("gi") match
+        case Right(I32(-7))                            => ()
+        case other                                     => check(false, s"gi: $other")
+      inst.globalValue("gj") match
+        case Right(I64(v)) if v == Long.MinValue       => ()
+        case other                                     => check(false, s"gj: $other")
+      inst.globalValue("gf") match
+        case Right(F32(v)) if jl.Float.isNaN(v)        => ()
+        case other                                     => check(false, s"gf: $other")
+      inst.globalValue("gd") match
+        case Right(F64(v)) if v == Double.PositiveInfinity => ()
+        case other                                     => check(false, s"gd: $other")
+    }
+
+    test("globals: ±Inf and signed-zero survive a set/get round-trip for f32 and f64") {
+      // NaN-payload preservation across a global slot isn't reliable on
+      // Scala.js (Float-boxing through JS `number` lets the engine canonicalise
+      // the bit pattern); the per-type test above already pins NaN-as-NaN via
+      // isNaN. What we additionally want pinned here is that *non-NaN* IEEE
+      // specials — signed zeros, infinities — survive bit-exact, which they
+      // must to keep arithmetic semantics intact.
+      val inst = instantiate(Fixtures.globals_types)
+
+      runRight(inst.invoke("set_f32", Seq(F32(-0.0f))))
+      check(jl.Float.floatToRawIntBits(callF32(inst, "get_f32"))
+              == jl.Float.floatToRawIntBits(-0.0f),
+            "f32 -0 sign bit preserved across set/get")
+
+      runRight(inst.invoke("set_f32", Seq(F32(Float.NegativeInfinity))))
+      check(callF32(inst, "get_f32") == Float.NegativeInfinity, "f32 -Inf survives")
+
+      runRight(inst.invoke("set_f64", Seq(F64(-0.0))))
+      check(jl.Double.doubleToRawLongBits(callF64(inst, "get_f64"))
+              == jl.Double.doubleToRawLongBits(-0.0),
+            "f64 -0 sign bit preserved across set/get")
+
+      runRight(inst.invoke("set_f64", Seq(F64(Double.NegativeInfinity))))
+      check(callF64(inst, "get_f64") == Double.NegativeInfinity, "f64 -Inf survives")
+    }
+
+    test("globals: set on immutable global traps with InvalidModule(\"immutable\")") {
+      val inst = instantiate(Fixtures.globals_immutable_trap)
+      // Reading the const still works.
+      check(callI32(inst, "get_k") == 99, "immutable global readable")
+      // Writing traps with a recognisable message.
+      expectError(inst, "try_overwrite", Seq(I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("immutable")
+      }
+      // And the value should still be 99 — the trap fires before mutation.
+      check(callI32(inst, "get_k") == 99, "value unchanged after failed write")
+    }
+
     // --- ModuleInstance accessors ------------------------------------------
     test("ModuleInstance.exportedFunctionNames: sorted, function-only") {
       val inst = instantiate(Fixtures.memory)
@@ -1740,6 +1852,65 @@ object InterpreterTest:
       expectError(inst, "test_locals", Seq(I32(1), I32(2))) {
         case WasmError.InvalidModule(msg) => msg.contains("local.get")
       }
+    }
+
+    test("runtime: global.get with out-of-range index returns InvalidModule") {
+      // globals_basic.wasm has two globals (counter at 0, seed at 1). Find the
+      // first `global.get` opcode and patch its index byte to a high value.
+      val src        = Fixtures.globals_basic
+      val globalGet  = src.indexOf(0x23.toByte)
+      check(globalGet > 0, "global.get opcode not found")
+      val bad  = patchByte(src, globalGet + 1, 0x09)
+      val inst = instantiate(bad)
+      // The patched function may be any of the getters — every entry point
+      // either reads the patched op directly or traps the same way through it.
+      inst.invoke("get_count", Seq.empty) match
+        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("global.get"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(global.get …), got $other")
+    }
+
+    test("runtime: global.set with out-of-range index returns InvalidModule") {
+      val src        = Fixtures.globals_basic
+      val globalSet  = src.indexOf(0x24.toByte)
+      check(globalSet > 0, "global.set opcode not found")
+      val bad  = patchByte(src, globalSet + 1, 0x09)
+      val inst = instantiate(bad)
+      inst.invoke("bump", Seq.empty) match
+        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("global.set"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(global.set …), got $other")
+    }
+
+    test("parser: section 6 with init-expr not matching declared type returns InvalidModule") {
+      // globals_types.wasm starts its first global as (mut i32) (i32.const ...).
+      // Flip the declared valtype to i64 while leaving the init expr as
+      // i32.const — readConstExpr should reject the mismatched opcode/type pair.
+      val src = Fixtures.globals_types
+      // Find section id 6: scan for byte 0x06 immediately followed by a u32
+      // (the section size). We can rely on it being the first 0x06 after the
+      // magic+version + type section header. Be conservative: walk by section.
+      // Simpler approach: locate the section by searching for the unique
+      // section-6 prefix "0x06 size 0x04 0x7f 0x01 0x41" (count=4, valtype=i32,
+      // mut=mut, op=i32.const) which is specific to this fixture.
+      // We just need to find the valtype byte (0x7f) of the first global
+      // entry; that lives at offset section-6-start + 2 (skip count byte).
+      // Probe for the marker subsequence "0x7f 0x01 0x41" (i32, mut, i32.const).
+      var i      = 0
+      var marker = -1
+      while marker < 0 && i + 2 < src.length do
+        if (src(i) & 0xff) == 0x7f && (src(i + 1) & 0xff) == 0x01 && (src(i + 2) & 0xff) == 0x41 then
+          marker = i
+        i += 1
+      check(marker > 0, "section-6 first-global marker not found")
+      // Swap the valtype byte from 0x7f (i32) to 0x7e (i64). The init-expr
+      // op is still 0x41 (i32.const), so readConstExpr should reject the
+      // mismatch with a clear diagnostic.
+      val bad = patchByte(src, marker, 0x7e)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          // Declared type was bumped to i64, init op left as 0x41 (i32.const) —
+          // the message should name the expected mnemonic (i64.const).
+          check(msg.contains("i64.const"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(i64.const …), got $other")
     }
 
     test("ModuleInstance.invoke with valid args returns Seq() for an empty function") {
