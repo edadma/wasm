@@ -115,10 +115,17 @@ object Runtime:
     }
 
     // === memory =============================================================
-    val pages = if module.memories.nonEmpty then module.memories.head.min else 0
+    // The MVP allows at most one memory; we still keep the conditional so an
+    // empty `memories` vector instantiates as a zero-page memory (some tools
+    // emit modules that never declare one when no `i32.load`/`i32.store` is
+    // present). The declared max — when supplied — is threaded into the
+    // `Memory` so `memory.grow` returns -1 verbatim on overflow rather than
+    // resizing past the host's intent.
+    val pages    = if module.memories.nonEmpty then module.memories.head.min else 0
+    val maxPages = if module.memories.nonEmpty then module.memories.head.max else None
     if pages < 0 || pages.toLong * Memory.PageSize > Int.MaxValue then
       fail(WasmError.InvalidModule(s"unsupported memory size: $pages pages"))
-    val memory = new Memory(pages)
+    val memory = new Memory(pages, maxPages)
 
     // === active data segments ==============================================
     module.data.foreach { seg =>

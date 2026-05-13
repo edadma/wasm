@@ -5,12 +5,50 @@ import java.lang as jl  // for Long.divideUnsigned / rotateLeft / numberOfLeadin
 
 /** Linear memory — a flat byte array sized in 64KiB pages.
   *
-  * The MVP doesn't surface `memory.grow`, so the byte array is allocated
-  * once at instantiation and never resized.
+  * Resizable via `memory.grow`: `data` is replaced with a fresh, larger
+  * array on every successful grow, with the old contents copied over. All
+  * memory access in the interpreter chases through `memory.data` per call
+  * (never caching the array reference past a helper), so grow is safe
+  * mid-execution. `currentPages` is the live page count; tracking it
+  * separately makes `memory.size` O(1) and keeps the page accounting
+  * independent of `data.length` (which is also exact, but expressed in
+  * bytes — keeping the names parallel to the spec opcodes wins).
+  *
+  * `maxPages` is the module-declared upper bound (None when omitted in the
+  * binary). `grow` honours it on top of the JVM/spec implicit cap at
+  * `Int.MaxValue` bytes (≈ 32767 pages). On failure it returns `-1`
+  * verbatim — that's the spec's signal for "grow failed", *not* a trap.
   */
-final class Memory(initialPages: Int):
-  val data: Array[Byte] = new Array[Byte](initialPages * Memory.PageSize)
+final class Memory(initialPages: Int, val maxPages: Option[Int] = None):
+  var data: Array[Byte] = new Array[Byte](initialPages * Memory.PageSize)
+  var currentPages: Int = initialPages
   def size: Int = data.length
+
+  /** Grow the memory by `delta` 64KiB pages. Returns the previous page
+    * count on success (the spec's contract), or -1 if the grow would
+    * exceed the declared `maxPages` or the implicit `Int.MaxValue`-bytes
+    * platform cap.
+    *
+    * `delta == 0` is permitted and is a no-op that still returns the
+    * current page count — modules use it as a probe for "how big is
+    * memory right now" relative to a known prior anchor.
+    */
+  def grow(delta: Int): Int =
+    if delta < 0 then return -1
+    val prev = currentPages
+    val newPages = prev + delta
+    // Overflow guard: arithmetic above can wrap negative on huge `delta`.
+    if newPages < prev then return -1
+    if maxPages.exists(newPages > _) then return -1
+    val newBytesL = newPages.toLong * Memory.PageSize
+    if newBytesL > Int.MaxValue then return -1
+    // delta == 0 is a no-op, but the spec still requires returning prev.
+    if delta != 0 then
+      val newData = new Array[Byte](newBytesL.toInt)
+      System.arraycopy(data, 0, newData, 0, data.length)
+      data = newData
+      currentPages = newPages
+    prev
 
 object Memory:
   val PageSize: Int = 65536
@@ -156,14 +194,24 @@ object Interpreter:
           (_, p2) <- Leb128.readU32(body, p1)
         yield p2
       case 0x28 | 0x29 | 0x2a | 0x2b |                     // i32.load, i64.load, f32.load, f64.load
-           0x2c | 0x2d |                                   // i32.load8_s/u
+           0x2c | 0x2d | 0x2e | 0x2f |                     // i32.load8_s/u, i32.load16_s/u
            0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 |       // i64.load{8,16,32}_{s,u}
            0x36 | 0x37 | 0x38 | 0x39 |                     // i32.store, i64.store, f32.store, f64.store
-           0x3a | 0x3c | 0x3d | 0x3e =>                    // i32.store8 / i64.store{8,16,32}
+           0x3a | 0x3b | 0x3c | 0x3d | 0x3e =>             // i32.store8/16, i64.store{8,16,32}
         for
           (_, p1) <- Leb128.readU32(body, pc + 1)          // align
           (_, p2) <- Leb128.readU32(body, p1)              // offset
         yield p2
+      case 0x3f | 0x40 =>                                  // memory.size / memory.grow
+        // Each takes a single 0x00 reserved byte (the MVP memidx). The
+        // step() dispatch verifies it's actually zero; here we only need
+        // to advance past it so the pre-scan tracks block-end positions
+        // correctly. Hand-folding a `readU32` would also work (a single
+        // 0x00 byte reads as the u32 value 0), but the explicit two-byte
+        // advance is clearer and immune to future multi-memory overloads.
+        if pc + 2 > body.length then
+          Left(WasmError.InvalidModule(s"truncated memory.size/grow reserved byte at $pc"))
+        else Right(pc + 2)
       case 0x41 =>                                         // i32.const
         Leb128.readS32(body, pc + 1).map(_._2)
       case 0x42 =>                                         // i64.const (SLEB64 immediate)
@@ -499,6 +547,47 @@ final class Interpreter private[wasm] (
         val v    = popI32()
         val addr = popI32().toLong & 0xffffffffL
         storeByte(addr + offset, v & 0xff)
+
+      case 0x2e =>                                                                        // i32.load16_s
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI32(loadI16(addr + offset))                                                   // already sign-extended by loadI16
+
+      case 0x2f =>                                                                        // i32.load16_u
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val addr = popI32().toLong & 0xffffffffL
+        pushI32(loadI16(addr + offset) & 0xffff)                                          // mask off the sign-extension
+
+      case 0x3b =>                                                                        // i32.store16 — low 16 bits
+        val (_, p1)      = readU32At(f, f.pc + 1)
+        val (offset, p2) = readU32At(f, p1)
+        f.pc = p2
+        val v    = popI32()
+        val addr = popI32().toLong & 0xffffffffL
+        storeI16(addr + offset, v & 0xffff)
+
+      case 0x3f =>                                                                        // memory.size
+        // Spec encodes a single 0x00 reserved byte after the opcode (the
+        // MVP memidx). A non-zero byte here would mean the binary is
+        // targeting multi-memory, which the MVP doesn't model — surface it
+        // as an `InvalidModule` rather than silently misreading.
+        val reserved = body(f.pc + 1) & 0xff
+        if reserved != 0 then
+          fail(WasmError.InvalidModule(s"memory.size: non-zero reserved byte 0x${reserved.toHexString}"))
+        f.pc += 2
+        pushI32(memory.currentPages)
+
+      case 0x40 =>                                                                        // memory.grow
+        val reserved = body(f.pc + 1) & 0xff
+        if reserved != 0 then
+          fail(WasmError.InvalidModule(s"memory.grow: non-zero reserved byte 0x${reserved.toHexString}"))
+        f.pc += 2
+        val delta = popI32()
+        pushI32(memory.grow(delta))                                                       // -1 on failure (NOT a trap)
 
       // === i32 numeric ===================================================
 
