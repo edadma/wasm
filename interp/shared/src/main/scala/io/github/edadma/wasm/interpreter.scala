@@ -167,11 +167,13 @@ object Interpreter:
       case 0x44 =>                                         // f64.const (8 raw little-endian bytes — NOT LEB)
         if pc + 9 > body.length then Left(WasmError.InvalidModule("truncated f64.const immediate"))
         else Right(pc + 9)
-      // 0x45–0x75 covers every i32 unary/binary/compare/shift AND the i64
-      // comparisons (0x50–0x5A); none take immediates. f32/f64 comparisons
-      // (0x5B–0x66) also live in here, harmless to skip-past since they
-      // likewise take no immediates — `step` is the gate on what's executable.
-      case b if b >= 0x45 && b <= 0x75 =>
+      // 0x45–0x78 covers every i32 unary/binary/compare/shift/rotate AND
+      // the i64 comparisons (0x50–0x5A); none take immediates. f32/f64
+      // comparisons (0x5B–0x66) also live in here, harmless to skip-past
+      // since they likewise take no immediates — `step` is the gate on
+      // what's executable. Upper bound bumped from 0x75 → 0x78 in Phase
+      // 1.5 (shr_u / rotl / rotr).
+      case b if b >= 0x45 && b <= 0x78 =>
         Right(pc + 1)
       // 0x79–0xBF: i64 unary + i64 numeric/bitwise/shift/rotate (0x79–0x8A),
       // f32 unary + f32 numeric/min/max/copysign (0x8B–0x98), f64 unary
@@ -443,9 +445,20 @@ final class Interpreter private[wasm] (
       case 0x46 => binop((a, b) => if a == b then 1 else 0); f.pc += 1                    // i32.eq
       case 0x47 => binop((a, b) => if a != b then 1 else 0); f.pc += 1                    // i32.ne
       case 0x48 => binop((a, b) => if a <  b then 1 else 0); f.pc += 1                    // i32.lt_s
+      case 0x49 => binop((a, b) => if jl.Integer.compareUnsigned(a, b) <  0 then 1 else 0); f.pc += 1 // i32.lt_u
       case 0x4a => binop((a, b) => if a >  b then 1 else 0); f.pc += 1                    // i32.gt_s
+      case 0x4b => binop((a, b) => if jl.Integer.compareUnsigned(a, b) >  0 then 1 else 0); f.pc += 1 // i32.gt_u
       case 0x4c => binop((a, b) => if a <= b then 1 else 0); f.pc += 1                    // i32.le_s
+      case 0x4d => binop((a, b) => if jl.Integer.compareUnsigned(a, b) <= 0 then 1 else 0); f.pc += 1 // i32.le_u
       case 0x4e => binop((a, b) => if a >= b then 1 else 0); f.pc += 1                    // i32.ge_s
+      case 0x4f => binop((a, b) => if jl.Integer.compareUnsigned(a, b) >= 0 then 1 else 0); f.pc += 1 // i32.ge_u
+
+      // i32 bit counting (mirrors the i64 forms at 0x79–0x7B). Result is
+      // i32, not i64, so we go through `unop` rather than `unop64`-style
+      // helpers. Spec defines clz/ctz of 0 as the operand width (32 here).
+      case 0x67 => unop(a => jl.Integer.numberOfLeadingZeros(a));  f.pc += 1              // i32.clz
+      case 0x68 => unop(a => jl.Integer.numberOfTrailingZeros(a)); f.pc += 1              // i32.ctz
+      case 0x69 => unop(a => jl.Integer.bitCount(a));              f.pc += 1              // i32.popcnt
 
       case 0x6a => binop(_ + _);  f.pc += 1                                               // i32.add
       case 0x6b => binop(_ - _);  f.pc += 1                                               // i32.sub
@@ -457,18 +470,30 @@ final class Interpreter private[wasm] (
         if a == Int.MinValue && b == -1 then fail(WasmError.InvalidModule("integer overflow in div_s"))
         pushI32(a / b); f.pc += 1
 
+      case 0x6e =>                                                                        // i32.div_u
+        val b = popI32(); val a = popI32()
+        if b == 0 then fail(WasmError.InvalidModule("integer divide by zero"))
+        pushI32(jl.Integer.divideUnsigned(a, b)); f.pc += 1
+
       case 0x6f =>                                                                        // i32.rem_s
         val b = popI32(); val a = popI32()
         if b == 0 then fail(WasmError.InvalidModule("integer divide by zero"))
         // WASM: rem_s for MIN_INT % -1 is defined as 0 (no trap, despite Java's behaviour).
         pushI32(if a == Int.MinValue && b == -1 then 0 else a % b); f.pc += 1
 
+      case 0x70 =>                                                                        // i32.rem_u
+        val b = popI32(); val a = popI32()
+        if b == 0 then fail(WasmError.InvalidModule("integer divide by zero"))
+        pushI32(jl.Integer.remainderUnsigned(a, b)); f.pc += 1
+
       case 0x71 => binop(_ & _); f.pc += 1                                                // i32.and
       case 0x72 => binop(_ | _); f.pc += 1                                                // i32.or
       case 0x73 => binop(_ ^ _); f.pc += 1                                                // i32.xor
       case 0x74 => binop((a, b) => a << (b & 31)); f.pc += 1                              // i32.shl
       case 0x75 => binop((a, b) => a >> (b & 31)); f.pc += 1                              // i32.shr_s
-      // TODO: i32.shr_u (0x76), i32.rotl/rotr, i32.clz/ctz/popcnt — leave space for the rest of the i32 op set.
+      case 0x76 => binop((a, b) => a >>> (b & 31)); f.pc += 1                             // i32.shr_u
+      case 0x77 => binop((a, b) => jl.Integer.rotateLeft (a, b & 31)); f.pc += 1          // i32.rotl
+      case 0x78 => binop((a, b) => jl.Integer.rotateRight(a, b & 31)); f.pc += 1          // i32.rotr
 
       // === i64 memory ====================================================
       //

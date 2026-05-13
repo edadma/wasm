@@ -1037,6 +1037,78 @@ object InterpreterTest:
       check(callF64(inst, "select", F64(1.5), F64(2.5), I32(0)) == 2.5, "cond=0 picks b")
     }
 
+    // --- Phase 1.5: remaining i32 ops --------------------------------------
+
+    test("i32 unsigned compares: lt_u / gt_u / le_u / ge_u (negative as huge)") {
+      val inst = instantiate(Fixtures.i32_unsigned)
+      // Positive vs positive — signed and unsigned agree.
+      check(callI32(inst, "i32_lt_u", 3,  5) == 1, "3 <u 5")
+      check(callI32(inst, "i32_gt_u", 5,  3) == 1, "5 >u 3")
+      check(callI32(inst, "i32_le_u", 5,  5) == 1, "5 <=u 5")
+      check(callI32(inst, "i32_ge_u", 5,  4) == 1, "5 >=u 4")
+      // Negative bit-pattern means "very large" under unsigned interpretation,
+      // so all of these flip relative to the signed counterparts.
+      check(callI32(inst, "i32_lt_u", -1, 0) == 0, "0xffffffff <u 0 -> false")
+      check(callI32(inst, "i32_gt_u", -1, 0) == 1, "0xffffffff >u 0 -> true")
+      check(callI32(inst, "i32_le_u", -1, 0) == 0, "0xffffffff <=u 0 -> false")
+      check(callI32(inst, "i32_ge_u", -1, 0) == 1, "0xffffffff >=u 0 -> true")
+      // Boundary equal: Int.MinValue == Int.MinValue under unsigned too.
+      check(callI32(inst, "i32_le_u", Int.MinValue, Int.MinValue) == 1, "MIN_INT <=u MIN_INT")
+      check(callI32(inst, "i32_ge_u", Int.MinValue, Int.MinValue) == 1, "MIN_INT >=u MIN_INT")
+    }
+
+    test("i32 bit counting: clz / ctz / popcnt (incl. zero and all-ones)") {
+      val inst = instantiate(Fixtures.i32_unsigned)
+      check(callI32(inst, "i32_clz",    1)            == 31, "clz of 1 = 31")
+      check(callI32(inst, "i32_clz",    0)            == 32, "clz of 0 = 32 (width)")
+      check(callI32(inst, "i32_clz",    Int.MinValue) == 0,  "clz of high-bit-set = 0")
+      check(callI32(inst, "i32_ctz",    8)            == 3,  "ctz of 8 = 3")
+      check(callI32(inst, "i32_ctz",    0)            == 32, "ctz of 0 = 32 (width)")
+      check(callI32(inst, "i32_ctz",    Int.MinValue) == 31, "ctz of 0x80000000 = 31")
+      check(callI32(inst, "i32_popcnt", -1)           == 32, "popcnt of all-ones = 32")
+      check(callI32(inst, "i32_popcnt", 0)            == 0,  "popcnt of 0 = 0")
+      check(callI32(inst, "i32_popcnt", 0x55)         == 4,  "popcnt of 0x55 = 4 ones")
+    }
+
+    test("i32.div_u / rem_u: unsigned semantics; trap on divisor zero") {
+      val inst = instantiate(Fixtures.i32_unsigned)
+      // Within the positive Int range div_u agrees with div_s.
+      check(callI32(inst, "i32_div_u", 100, 7) == 14, "100 /u 7")
+      check(callI32(inst, "i32_rem_u", 100, 7) ==  2, "100 %u 7")
+      // Negative bit-pattern as "very large unsigned" diverges from signed.
+      check(callI32(inst, "i32_div_u", -1,  3) == jl.Integer.divideUnsigned(-1, 3),    "0xffffffff /u 3")
+      check(callI32(inst, "i32_rem_u", -1,  3) == jl.Integer.remainderUnsigned(-1, 3), "0xffffffff %u 3")
+      // No overflow trap exists for div_u: MIN_INT/-1 reads as a small
+      // unsigned quotient, not an overflow case.
+      check(callI32(inst, "i32_div_u", Int.MinValue, -1) == 0, "MIN_INT /u 0xffffffff < 1")
+      // Trap paths.
+      expectError(inst, "i32_div_u", Seq(I32(1), I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("divide by zero")
+      }
+      expectError(inst, "i32_rem_u", Seq(I32(1), I32(0))) {
+        case WasmError.InvalidModule(m) => m.contains("divide by zero")
+      }
+    }
+
+    test("i32 shifts / rotates: shr_u zero-fills; rotl/rotr round-trip the high bit") {
+      val inst = instantiate(Fixtures.i32_unsigned)
+      // shr_u of -1 by 1 is Int.MaxValue (the high bit becomes 0, not 1).
+      check(callI32(inst, "i32_shr_u", -1, 1)  == Int.MaxValue, "shr_u -1 by 1 = Int.MaxValue")
+      check(callI32(inst, "i32_shr_u",  8, 2)  == 2,            "shr_u 8 by 2 = 2")
+      // Shift count masked mod 32: shr_u by 32 is identity, by 33 is shr_u by 1.
+      check(callI32(inst, "i32_shr_u", -1, 32) == -1,            "shr_u -1 by 32 == by 0")
+      check(callI32(inst, "i32_shr_u", -1, 33) == Int.MaxValue,  "shr_u -1 by 33 == by 1")
+      // rotl 1 by 31 lands the bit at position 31 → Int.MinValue.
+      check(callI32(inst, "i32_rotl", 1, 31) == Int.MinValue, "rotl 1 by 31 → high bit")
+      // rotl top bit by 1 carries it back to bit 0.
+      check(callI32(inst, "i32_rotl", Int.MinValue, 1) == 1, "rotl high bit by 1 → 1")
+      // rotr is the inverse.
+      check(callI32(inst, "i32_rotr", 1, 1) == Int.MinValue, "rotr 1 by 1 → high bit")
+      // Rotates also mask mod 32.
+      check(callI32(inst, "i32_rotl", 1, 32) == 1, "rotl by 32 is identity")
+      check(callI32(inst, "i32_rotr", 1, 33) == callI32(inst, "i32_rotr", 1, 1), "rotr mod 32")
+    }
+
     // --- Phase 1.4: conversions --------------------------------------------
 
     test("conv: i32.wrap_i64 drops the high 32 bits") {
@@ -1590,8 +1662,12 @@ object InterpreterTest:
     test("interpreter: 0x11 (call_indirect) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x11), 0x11, "call_indirect")
     }
-    test("interpreter: 0x76 (i32.shr_u) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x76), 0x76, "i32.shr_u")
+    // Retargeted from 0x76 (formerly i32.shr_u, now supported in Phase 1.5)
+    // to 0xC4 — a reserved byte with no MVP meaning, and not the lead byte
+    // of any prefixed instruction set we currently parse. Same code path,
+    // same expected typed error.
+    test("interpreter: 0xC4 (unassigned in MVP) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc4), 0xc4, "0xC4 (reserved)")
     }
     test("interpreter: 0x3F (memory.size) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x3f), 0x3f, "memory.size")
