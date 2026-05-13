@@ -22,6 +22,11 @@ final class ModuleInstance private[wasm] (
     * confirm linking worked. */
   def functionCount: Int = funcs.length
 
+  /** Names of all exported functions, sorted for stable output. Used by the
+    * CLI's `--list-exports` and by tests verifying the export table after
+    * instantiation. */
+  def exportedFunctionNames: Seq[String] = exportFuncs.keys.toSeq.sorted
+
 /** Linker / loader. `instantiate` does the four jobs the WASM spec assigns to
   * instantiation: resolve imports, allocate memory, initialize data segments,
   * and produce the export table. Errors map onto the public `WasmError`
