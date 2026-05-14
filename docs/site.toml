@@ -25,7 +25,8 @@ headingShift    = 0
 htmlDir         = ""
 
 [juicerdocs]
-version         = "v0.4.4"
+# `version` (the hero pill) intentionally omitted — wasm has no release
+# tag yet. Add it back when the first Maven Central publish lands.
 
 # Brand palette — violet, evoking the WebAssembly logo lineage without
 # copying it outright. Distinct from juicer's plum, squiggly's cyan, and
