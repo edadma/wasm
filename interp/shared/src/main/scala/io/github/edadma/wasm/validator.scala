@@ -1002,6 +1002,22 @@ object Validator:
                0xB6 | 0xB7 | 0xB8 | 0xB9 =>                                       // i32x4 min/max _s/_u
             binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
 
+          // Chunk F — float arithmetic. Unary `v128 → v128` for rounding /
+          // abs / neg / sqrt; binary `v128 v128 → v128` for add/sub/mul/div
+          // and min/max/pmin/pmax.
+
+          case 0x67 | 0x68 | 0x69 | 0x6A |                                        // f32x4 ceil/floor/trunc/nearest
+               0x74 | 0x75 | 0x7A | 0x94 |                                        // f64x2 ceil/floor/trunc/nearest
+               0xE0 | 0xE1 | 0xE3 |                                                // f32x4 abs/neg/sqrt
+               0xEC | 0xED | 0xEF =>                                               // f64x2 abs/neg/sqrt
+            unop(ValueType.V128Type, ValueType.V128Type)
+
+          case 0xE4 | 0xE5 | 0xE6 | 0xE7 |                                        // f32x4 add/sub/mul/div
+               0xE8 | 0xE9 | 0xEA | 0xEB |                                        // f32x4 min/max/pmin/pmax
+               0xF0 | 0xF1 | 0xF2 | 0xF3 |                                        // f64x2 add/sub/mul/div
+               0xF4 | 0xF5 | 0xF6 | 0xF7 =>                                       // f64x2 min/max/pmin/pmax
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 

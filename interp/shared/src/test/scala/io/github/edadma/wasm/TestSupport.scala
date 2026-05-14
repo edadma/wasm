@@ -110,6 +110,105 @@ object TestSupport:
         if matcher.isDefinedAt(err) then check(matcher(err), s"unexpected error: $err")
         else check(false, s"unexpected error: $err")
 
+  // === SIMD helpers =======================================================
+  //
+  // Shared by every `Simd*Tests` suite. `bytesEq` + `callV128` were copy-
+  // pasted into all 5 chunk-A..E suites; chunk F would have made it 6, and
+  // the dedupe-trigger heuristic in CLAUDE.md is 3 — so they live here now.
+  // `fromI{8,16,32,64}` + `fromF{32,64}` are the LE byte-array builders for
+  // each lane shape; they're inlined per-suite where used, all little-
+  // endian, all checking the lane-count up front.
+
+  object simd:
+
+    def bytesEq(actual: Array[Byte], expected: Array[Byte]): Boolean =
+      if actual.length != expected.length then false
+      else
+        var i  = 0
+        var ok = true
+        while ok && i < actual.length do
+          if actual(i) != expected(i) then ok = false
+          i += 1
+        ok
+
+    def callV128(inst: ModuleInstance, name: String, args: Value*): Array[Byte] =
+      val results = runRight(inst.invoke(name, args))
+      check(results.size == 1, s"$name returned ${results.size} values, expected 1")
+      results.head match
+        case V128(bs) => bs
+        case other    => throw new AssertionError(s"$name returned $other, expected V128")
+
+    def fromI8(values: Int*): Array[Byte] =
+      require(values.length == 16, s"fromI8 needs 16 values, got ${values.length}")
+      values.iterator.map(_.toByte).toArray
+
+    def fromI16(values: Int*): Array[Byte] =
+      require(values.length == 8, s"fromI16 needs 8 values, got ${values.length}")
+      val r = new Array[Byte](16)
+      var i = 0
+      while i < 8 do
+        r(i * 2)     = (values(i) & 0xff).toByte
+        r(i * 2 + 1) = ((values(i) >>> 8) & 0xff).toByte
+        i += 1
+      r
+
+    def fromI32(values: Int*): Array[Byte] =
+      require(values.length == 4, s"fromI32 needs 4 values, got ${values.length}")
+      val r = new Array[Byte](16)
+      var i = 0
+      while i < 4 do
+        val v = values(i)
+        r(i * 4)     = (v & 0xff).toByte
+        r(i * 4 + 1) = ((v >>> 8)  & 0xff).toByte
+        r(i * 4 + 2) = ((v >>> 16) & 0xff).toByte
+        r(i * 4 + 3) = ((v >>> 24) & 0xff).toByte
+        i += 1
+      r
+
+    def fromI64(values: Long*): Array[Byte] =
+      require(values.length == 2, s"fromI64 needs 2 values, got ${values.length}")
+      val r = new Array[Byte](16)
+      var i = 0
+      while i < 2 do
+        val v = values(i)
+        var k = 0
+        while k < 8 do
+          r(i * 8 + k) = ((v >>> (k * 8)) & 0xffL).toByte
+          k += 1
+        i += 1
+      r
+
+    /** Build a 16-byte v128 with four f32 lanes (little-endian). Uses the
+      * raw bit conversion so NaN payloads round-trip unchanged — chunk F
+      * float tests rely on this. */
+    def fromF32(values: Float*): Array[Byte] =
+      require(values.length == 4, s"fromF32 needs 4 values, got ${values.length}")
+      val r = new Array[Byte](16)
+      var i = 0
+      while i < 4 do
+        val bits = java.lang.Float.floatToRawIntBits(values(i))
+        r(i * 4)     = (bits & 0xff).toByte
+        r(i * 4 + 1) = ((bits >>> 8)  & 0xff).toByte
+        r(i * 4 + 2) = ((bits >>> 16) & 0xff).toByte
+        r(i * 4 + 3) = ((bits >>> 24) & 0xff).toByte
+        i += 1
+      r
+
+    /** Build a 16-byte v128 with two f64 lanes (little-endian). Uses the
+      * raw bit conversion so NaN payloads round-trip unchanged. */
+    def fromF64(values: Double*): Array[Byte] =
+      require(values.length == 2, s"fromF64 needs 2 values, got ${values.length}")
+      val r = new Array[Byte](16)
+      var i = 0
+      while i < 2 do
+        val bits = java.lang.Double.doubleToRawLongBits(values(i))
+        var k    = 0
+        while k < 8 do
+          r(i * 8 + k) = ((bits >>> (k * 8)) & 0xffL).toByte
+          k += 1
+        i += 1
+      r
+
   // === Binary-patching helpers ============================================
 
   /** Replace one byte of a fixture copy. */

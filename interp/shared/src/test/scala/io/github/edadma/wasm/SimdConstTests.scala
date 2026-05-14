@@ -1,6 +1,7 @@
 package io.github.edadma.wasm
 
 import TestSupport.*
+import TestSupport.simd.{bytesEq, callV128}
 
 /** Phase 8.E.A — SIMD foundations + `v128.const` tests.
   *
@@ -17,29 +18,11 @@ import TestSupport.*
   */
 object SimdConstTests:
 
-  /** Helper: compare a V128's bits against an expected byte array. */
-  private def bytesEq(actual: Array[Byte], expected: Array[Byte]): Boolean =
-    if actual.length != expected.length then false
-    else
-      var i = 0
-      var ok = true
-      while ok && i < actual.length do
-        if actual(i) != expected(i) then ok = false
-        i += 1
-      ok
-
-  /** Convenience for building 16-byte literals. */
+  /** Convenience for building 16-byte literals (this suite uses 16 mixed-
+    * type bytes more often than per-lane shape readers). */
   private def b16(values: Int*): Array[Byte] =
     require(values.length == 16, s"b16 needs 16 values, got ${values.length}")
     values.iterator.map(_.toByte).toArray
-
-  /** Invoke a no-arg function returning v128; pull the bits out. */
-  private def callV128(inst: ModuleInstance, name: String, args: Value*): Array[Byte] =
-    val results = runRight(inst.invoke(name, args))
-    check(results.size == 1, s"$name returned ${results.size} values, expected 1")
-    results.head match
-      case V128(bs) => bs
-      case other    => throw new AssertionError(s"$name returned $other, expected V128")
 
   def run(): Unit =
 

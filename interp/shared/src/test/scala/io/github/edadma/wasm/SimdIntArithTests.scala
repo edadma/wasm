@@ -1,6 +1,7 @@
 package io.github.edadma.wasm
 
 import TestSupport.*
+import TestSupport.simd.{bytesEq, callV128, fromI8, fromI16, fromI32, fromI64}
 
 /** Phase 8.E.D — SIMD integer arithmetic.
   *
@@ -23,71 +24,6 @@ import TestSupport.*
   *     200 / 201 rounds *up* to 201, not 200.
   */
 object SimdIntArithTests:
-
-  private def bytesEq(actual: Array[Byte], expected: Array[Byte]): Boolean =
-    if actual.length != expected.length then false
-    else
-      var i  = 0
-      var ok = true
-      while ok && i < actual.length do
-        if actual(i) != expected(i) then ok = false
-        i += 1
-      ok
-
-  /** Invoke a function returning v128 and pull its raw 16 bytes. */
-  private def callV128(inst: ModuleInstance, name: String, args: Value*): Array[Byte] =
-    val results = runRight(inst.invoke(name, args))
-    check(results.size == 1, s"$name returned ${results.size} values, expected 1")
-    results.head match
-      case V128(bs) => bs
-      case other    => throw new AssertionError(s"$name returned $other, expected V128")
-
-  // === LE byte-array builders for each lane shape =========================
-  //
-  // Each takes lane-count values (16 / 8 / 4 / 2) and emits the 16-byte
-  // V128 payload in little-endian order. `i8` truncates each value to a
-  // byte; `i16` writes two bytes per lane; etc. These mirror the
-  // interpreter's lane-write semantics so test setup reads naturally.
-
-  private def fromI8(values: Int*): Array[Byte] =
-    require(values.length == 16, s"fromI8 needs 16 values, got ${values.length}")
-    values.iterator.map(_.toByte).toArray
-
-  private def fromI16(values: Int*): Array[Byte] =
-    require(values.length == 8, s"fromI16 needs 8 values, got ${values.length}")
-    val r = new Array[Byte](16)
-    var i = 0
-    while i < 8 do
-      r(i * 2)     = (values(i) & 0xff).toByte
-      r(i * 2 + 1) = ((values(i) >>> 8) & 0xff).toByte
-      i += 1
-    r
-
-  private def fromI32(values: Int*): Array[Byte] =
-    require(values.length == 4, s"fromI32 needs 4 values, got ${values.length}")
-    val r = new Array[Byte](16)
-    var i = 0
-    while i < 4 do
-      val v = values(i)
-      r(i * 4)     = (v & 0xff).toByte
-      r(i * 4 + 1) = ((v >>> 8)  & 0xff).toByte
-      r(i * 4 + 2) = ((v >>> 16) & 0xff).toByte
-      r(i * 4 + 3) = ((v >>> 24) & 0xff).toByte
-      i += 1
-    r
-
-  private def fromI64(values: Long*): Array[Byte] =
-    require(values.length == 2, s"fromI64 needs 2 values, got ${values.length}")
-    val r = new Array[Byte](16)
-    var i = 0
-    while i < 2 do
-      val v = values(i)
-      var k = 0
-      while k < 8 do
-        r(i * 8 + k) = ((v >>> (k * 8)) & 0xffL).toByte
-        k += 1
-      i += 1
-    r
 
   def run(): Unit =
 

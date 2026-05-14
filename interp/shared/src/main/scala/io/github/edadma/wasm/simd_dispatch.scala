@@ -30,10 +30,13 @@ import java.lang as jl
   *     integer shapes; min/max _s/_u on i8x16, i16x8, i32x4 — subs
   *     0x6B..0x6D / 0x76..0x79, 0x8B..0x8D / 0x96..0x99, 0xAB..0xAD /
   *     0xB6..0xB9, 0xCB..0xCD).
+  *   - F: 30 float arithmetic ops (rounding ceil/floor/trunc/nearest +
+  *     abs/neg/sqrt + add/sub/mul/div + min/max/pmin/pmax — subs
+  *     0x67..0x6A, 0x74 / 0x75 / 0x7A / 0x94, 0xE0..0xEB, 0xEC..0xF7).
   *
-  * Chunks remaining: F (float arithmetic), G (bitwise + comparisons +
-  * reductions), H (narrow/widen + float conversions), I (special —
-  * dot product + load_lane / store_lane).
+  * Chunks remaining: G (bitwise + comparisons + reductions), H
+  * (narrow/widen + float conversions), I (special — dot product +
+  * load_lane / store_lane).
   * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
@@ -629,6 +632,181 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(i64x2UnOp(a, x => x >>> cnt))
 
+      // === Chunk F — float arithmetic =========================================
+      //
+      // f32x4 / f64x2 per-lane unary + binary ops. Unary covers rounding
+      // (ceil/floor/trunc/nearest) and IEEE absolute / negate / sqrt. Binary
+      // covers add/sub/mul/div + min/max (NaN → canonical, matches scalar
+      // f32.min/f64.min) + pmin/pmax (NaN propagates from operand a per the
+      // wasm SIMD spec's `if b < a then b else a` form). abs/neg are
+      // bit-twiddles to preserve NaN payloads exactly per IEEE-754, so they
+      // route through the i32x4 / i64x2 lane helpers instead of float
+      // arithmetic.
+
+      // --- f32x4 unary --------------------------------------------------------
+
+      case 0x67 =>                                                                        // f32x4.ceil
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4UnOp(a, v => jl.Math.ceil(v.toDouble).toFloat))
+
+      case 0x68 =>                                                                        // f32x4.floor
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4UnOp(a, v => jl.Math.floor(v.toDouble).toFloat))
+
+      case 0x69 =>                                                                        // f32x4.trunc — round toward zero
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4UnOp(a, v =>
+          if jl.Float.isNaN(v) || jl.Float.isInfinite(v) then v
+          else if v < 0.0f then jl.Math.ceil(v.toDouble).toFloat
+          else jl.Math.floor(v.toDouble).toFloat))
+
+      case 0x6A =>                                                                        // f32x4.nearest (round half to even)
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4UnOp(a, v => jl.Math.rint(v.toDouble).toFloat))
+
+      case 0xE0 =>                                                                        // f32x4.abs — clear sign bit
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, b => b & 0x7fffffff))
+
+      case 0xE1 =>                                                                        // f32x4.neg — flip sign bit
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, b => b ^ 0x80000000))
+
+      case 0xE3 =>                                                                        // f32x4.sqrt
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4UnOp(a, v => jl.Math.sqrt(v.toDouble).toFloat))
+
+      // --- f32x4 binary -------------------------------------------------------
+
+      case 0xE4 =>                                                                        // f32x4.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => x + y))
+
+      case 0xE5 =>                                                                        // f32x4.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => x - y))
+
+      case 0xE6 =>                                                                        // f32x4.mul
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => x * y))
+
+      case 0xE7 =>                                                                        // f32x4.div
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => x / y))
+
+      case 0xE8 =>                                                                        // f32x4.min — IEEE min; NaN-in → NaN-out; -0 < +0
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => jl.Math.min(x, y)))
+
+      case 0xE9 =>                                                                        // f32x4.max
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => jl.Math.max(x, y)))
+
+      case 0xEA =>                                                                        // f32x4.pmin — `if b < a then b else a` (NaN-involving compare → a)
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => if y < x then y else x))
+
+      case 0xEB =>                                                                        // f32x4.pmax — `if a < b then b else a`
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => if x < y then y else x))
+
+      // --- f64x2 unary --------------------------------------------------------
+
+      case 0x74 =>                                                                        // f64x2.ceil
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2UnOp(a, v => jl.Math.ceil(v)))
+
+      case 0x75 =>                                                                        // f64x2.floor
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2UnOp(a, v => jl.Math.floor(v)))
+
+      case 0x7A =>                                                                        // f64x2.trunc
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2UnOp(a, v =>
+          if jl.Double.isNaN(v) || jl.Double.isInfinite(v) then v
+          else if v < 0.0 then jl.Math.ceil(v)
+          else jl.Math.floor(v)))
+
+      case 0x94 =>                                                                        // f64x2.nearest
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2UnOp(a, v => jl.Math.rint(v)))
+
+      case 0xEC =>                                                                        // f64x2.abs — clear sign bit
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, b => b & 0x7fffffffffffffffL))
+
+      case 0xED =>                                                                        // f64x2.neg — flip sign bit
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, b => b ^ 0x8000000000000000L))
+
+      case 0xEF =>                                                                        // f64x2.sqrt
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2UnOp(a, v => jl.Math.sqrt(v)))
+
+      // --- f64x2 binary -------------------------------------------------------
+
+      case 0xF0 =>                                                                        // f64x2.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => x + y))
+
+      case 0xF1 =>                                                                        // f64x2.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => x - y))
+
+      case 0xF2 =>                                                                        // f64x2.mul
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => x * y))
+
+      case 0xF3 =>                                                                        // f64x2.div
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => x / y))
+
+      case 0xF4 =>                                                                        // f64x2.min
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => jl.Math.min(x, y)))
+
+      case 0xF5 =>                                                                        // f64x2.max
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => jl.Math.max(x, y)))
+
+      case 0xF6 =>                                                                        // f64x2.pmin
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => if y < x then y else x))
+
+      case 0xF7 =>                                                                        // f64x2.pmax
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => if x < y then y else x))
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -867,6 +1045,65 @@ private[wasm] trait SimdDispatch:
       ln += 1
     r
 
+  // === Chunk F — float lane helpers =======================================
+  //
+  // Read each lane's raw bits, decode to Float/Double, apply the op, and
+  // store the result back via `*ToRawIntBits` / `*ToRawLongBits` so NaN
+  // payload bits round-trip unchanged. The wasm spec for SIMD float
+  // arithmetic says "if any operand is NaN, the result is a NaN" — the
+  // bit pattern is implementation-defined, same as for scalar f32/f64
+  // (where this codebase also doesn't canonicalise). JVM `Float.NaN`
+  // arithmetic already produces the canonical 0x7FC00000 pattern in
+  // practice, and the raw-bits writers preserve whatever the JVM hands
+  // back without disturbing it.
+  //
+  // For abs/neg we bit-twiddle the sign bit directly instead of routing
+  // through Float arithmetic — IEEE-754 specifies these as bitwise
+  // operations that preserve NaN payloads exactly, including signaling
+  // NaNs that arithmetic could otherwise turn quiet.
+
+  /** Unary op on each f32 lane (4 lanes, raw bits round-trip). */
+  private def f32x4UnOp(a: Array[Byte], op: Float => Float): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      val v = jl.Float.intBitsToFloat(readLaneI32(a, ln))
+      writeLaneI32(r, ln, jl.Float.floatToRawIntBits(op(v)))
+      ln += 1
+    r
+
+  /** Binary op on each f32 lane. */
+  private def f32x4BinOp(a: Array[Byte], b: Array[Byte], op: (Float, Float) => Float): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      val x = jl.Float.intBitsToFloat(readLaneI32(a, ln))
+      val y = jl.Float.intBitsToFloat(readLaneI32(b, ln))
+      writeLaneI32(r, ln, jl.Float.floatToRawIntBits(op(x, y)))
+      ln += 1
+    r
+
+  /** Unary op on each f64 lane (2 lanes, raw bits round-trip). */
+  private def f64x2UnOp(a: Array[Byte], op: Double => Double): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      val v = jl.Double.longBitsToDouble(readLaneI64(a, ln))
+      writeLaneI64(r, ln, jl.Double.doubleToRawLongBits(op(v)))
+      ln += 1
+    r
+
+  /** Binary op on each f64 lane. */
+  private def f64x2BinOp(a: Array[Byte], b: Array[Byte], op: (Double, Double) => Double): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      val x = jl.Double.longBitsToDouble(readLaneI64(a, ln))
+      val y = jl.Double.longBitsToDouble(readLaneI64(b, ln))
+      writeLaneI64(r, ln, jl.Double.doubleToRawLongBits(op(x, y)))
+      ln += 1
+    r
+
   /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
     * 8/width source lanes, and widen each into a `outLaneBytes`-byte
     * destination lane. `width` ∈ {1,2,4}, `outLaneBytes = width * 2`. */
@@ -978,6 +1215,17 @@ private[wasm] object SimdDispatch:
            0xAB | 0xAC | 0xAD |                                                   // i32x4  shl / shr_s / shr_u
            0xB6 | 0xB7 | 0xB8 | 0xB9 |                                            // i32x4  min/max  _s/_u
            0xCB | 0xCC | 0xCD =>                                                  // i64x2  shl / shr_s / shr_u
+        Right(p1)
+
+      // Chunk F — float arithmetic (no immediate past the sub-opcode).
+      case 0x67 | 0x68 | 0x69 | 0x6A |                                            // f32x4  ceil/floor/trunc/nearest
+           0x74 | 0x75 | 0x7A | 0x94 |                                            // f64x2  ceil/floor/trunc/nearest
+           0xE0 | 0xE1 | 0xE3 |                                                   // f32x4  abs/neg/sqrt
+           0xE4 | 0xE5 | 0xE6 | 0xE7 |                                            // f32x4  add/sub/mul/div
+           0xE8 | 0xE9 | 0xEA | 0xEB |                                            // f32x4  min/max/pmin/pmax
+           0xEC | 0xED | 0xEF |                                                   // f64x2  abs/neg/sqrt
+           0xF0 | 0xF1 | 0xF2 | 0xF3 |                                            // f64x2  add/sub/mul/div
+           0xF4 | 0xF5 | 0xF6 | 0xF7 =>                                           // f64x2  min/max/pmin/pmax
         Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))
