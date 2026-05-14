@@ -1,5 +1,7 @@
 package io.github.edadma.wasm.cli
 
+import io.github.edadma.wasm.wasi.{HostPreopen, WasiContext}
+
 import java.io.{ByteArrayOutputStream, PrintStream}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
@@ -63,6 +65,10 @@ object CliJvmTests:
   private final class CapturingPlatform(fixturePath: String) extends Cli.Platform:
     def readFile(path: String): Array[Byte] = Files.readAllBytes(Paths.get(path))
     def exit(code: Int): Nothing            = throw new Exited(code)
+    // Delegate to the real JVM HostPreopen factory; the test suite drives
+    // --preopen against actual on-disk temp directories below.
+    def openPreopen(hostPath: String, virtualName: String): WasiContext.Preopen =
+      HostPreopen.fromDir(hostPath, virtualName)
 
   /** Drive the CLI like a subprocess: redirect System.out / System.err
     * AND Scala's `Console.out` / `Console.err` to byte buffers for the
@@ -111,6 +117,7 @@ object CliJvmTests:
   private val HelloPutchar = "examples/hello.wasm"
   private val HelloWasi    = "wasi/shared/src/test/resources/fixtures/hello_wasi.wasm"
   private val WasiExit42   = "wasi/shared/src/test/resources/fixtures/wasi_exit.wasm"
+  private val RustFileRead = "wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm"
 
   // === Tests ===============================================================
 
@@ -157,6 +164,44 @@ object CliJvmTests:
       val (code, _, err) = runCli("/no/such/file.wasm")
       check(code == 1, s"expected exit 1 for missing file, got $code")
       check(err.contains("failed to read"), s"expected 'failed to read' in stderr, was:\n$err")
+    }
+
+    // === --preopen flag (Phase 7.E/F batch 5 follow-up) ===================
+
+    test("--preopen mounts a real host directory: rustc fileread reads through it") {
+      val tmp = Files.createTempDirectory("wasm-cli-preopen-").toFile
+      try
+        Files.writeString(tmp.toPath.resolve("hello.txt"), "from the host\n")
+        val (code, out, err) = runCli(
+          "--preopen", s"${tmp.getAbsolutePath}:/sandbox", RustFileRead,
+        )
+        check(code == 0, s"expected exit 0, got $code  err=$err")
+        check(out.contains("from the host"),
+          s"expected stdout to contain 'from the host', was:\n$out")
+      finally
+        // Best-effort cleanup; tests must not leak temp dirs.
+        Files.deleteIfExists(tmp.toPath.resolve("hello.txt"))
+        Files.deleteIfExists(tmp.toPath)
+    }
+
+    test("--preopen with a non-existent host directory fails cleanly with exit 1") {
+      val (code, _, err) = runCli(
+        "--preopen", "/this/path/does/not/exist:/sandbox", RustFileRead,
+      )
+      check(code == 1, s"expected exit 1, got $code")
+      check(err.contains("--preopen") && err.contains("does not exist"),
+        s"expected stderr to mention the bad preopen, was:\n$err")
+    }
+
+    test("--preopen without a colon fails validation before instantiation") {
+      val (code, _, err) = runCli("--preopen", "/no/colon", RustFileRead)
+      // scopt's validate-failure path takes a different exit (2 — usage
+      // error) than our own early-exit (1). Either is acceptable so long
+      // as we don't enter the interpreter; assertion verifies the
+      // diagnostic mentions the malformed spec.
+      check(code != 0, s"expected non-zero exit for bad --preopen, got $code")
+      check(err.contains("preopen") || err.contains("host-path"),
+        s"expected diagnostic about the spec format, was:\n$err")
     }
 
     println()
