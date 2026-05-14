@@ -38,16 +38,26 @@ import scopt.OParser
 object Cli:
 
   /** A thin abstraction over the platform — JVM/Native use java.nio, JS uses
-    * Node's `fs`; either way Cli stays free of platform-specific imports. */
+    * Node's `fs`; either way Cli stays free of platform-specific imports.
+    *
+    * `openPreopen` constructs a host-backed preopen from a real on-disk
+    * directory. Each platform's `Main.scala` wires it to its own
+    * [[HostPreopen.fromDir]] factory (JVM/Native go through `java.nio.file`
+    * + `FileChannel`; JS goes through Node `fs.*Sync`). Constructor throws
+    * `IllegalArgumentException` if `hostPath` isn't an existing directory;
+    * [[execute]] catches that and exits with a clear error before
+    * instantiation begins. */
   trait Platform:
     def readFile(path: String): Array[Byte]
     def exit(code: Int): Nothing
+    def openPreopen(hostPath: String, virtualName: String): WasiContext.Preopen
 
   final case class Config(
-      file:         String         = "",
-      invoke:       Option[String] = None,
-      args:         Seq[Int]       = Nil,
-      listExports:  Boolean        = false,
+      file:         String                = "",
+      invoke:       Option[String]        = None,
+      args:         Seq[Int]              = Nil,
+      listExports:  Boolean               = false,
+      preopens:     Seq[(String, String)] = Nil,
   )
 
   private val builder = OParser.builder[Config]
@@ -71,6 +81,23 @@ object Cli:
       opt[Unit]("list-exports")
         .action((_, c) => c.copy(listExports = true))
         .text("print exported function names and exit (no invocation)"),
+      // Split on the LAST `:` so Windows-style host paths like `C:\data:/d`
+      // still work (host = `C:\data`, virtual = `/d`). Wasi virtual names are
+      // sandboxed strings the program sees through fd_prestat_dir_name and
+      // typically don't contain `:`, so this is a safe choice.
+      opt[String]('p', "preopen")
+        .valueName("<host-path>:<virtual-name>")
+        .unbounded()
+        .validate { s =>
+          if s.lastIndexOf(':') < 0 then
+            failure(s"--preopen value must be host-path:virtual-name, got '$s'")
+          else success
+        }
+        .action { (s, c) =>
+          val n = s.lastIndexOf(':')
+          c.copy(preopens = c.preopens :+ ((s.take(n), s.drop(n + 1))))
+        }
+        .text("mount a host directory as a wasi preopen (repeatable)"),
       help("help").text("print this help message"),
       version("version").text("print version and exit"),
     )
@@ -89,12 +116,25 @@ object Cli:
         System.err.println(s"failed to read ${cfg.file}: ${e.getMessage}")
         platform.exit(1)
 
+    // Open each --preopen up front so a bad host path fails BEFORE we
+    // start instantiating the module. The factory throws
+    // `IllegalArgumentException` for missing / non-directory paths; we
+    // surface that as a clean exit with a descriptive message.
+    val preopens: Seq[WasiContext.Preopen] = cfg.preopens.map { case (host, virt) =>
+      try platform.openPreopen(host, virt)
+      catch case e: Throwable =>
+        System.err.println(s"--preopen $host:$virt failed: ${e.getMessage}")
+        platform.exit(1)
+    }
+
     // Wire both host modules unconditionally. The interpreter only resolves
     // imports the module actually declares, so a putchar-only module sees
     // the wasi shim as inert and a wasi command-mode module sees env as
     // inert. `WasiContext.default` sends fd 1 / fd 2 to System.out /
-    // System.err — exactly what `wasm <file>` users expect.
-    val hostModules = Seq(EnvModule.default, Wasi.preview1(WasiContext.default))
+    // System.err — exactly what `wasm <file>` users expect; any `--preopen`
+    // flags add real on-disk directories on top.
+    val ctx         = WasiContext.default.copy(preopens = preopens)
+    val hostModules = Seq(EnvModule.default, Wasi.preview1(ctx))
     Runtime.instantiate(bytes, hostModules) match
       case Left(err)   =>
         System.err.println(s"instantiate failed: $err")

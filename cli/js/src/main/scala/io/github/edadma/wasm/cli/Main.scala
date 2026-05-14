@@ -1,5 +1,7 @@
 package io.github.edadma.wasm.cli
 
+import io.github.edadma.wasm.wasi.{HostPreopen, WasiContext}
+
 import scala.scalajs.js
 import scala.scalajs.js.Dynamic.{global => g}
 import scala.scalajs.js.typedarray.Uint8Array
@@ -8,7 +10,8 @@ import scala.scalajs.js.typedarray.Uint8Array
   * `process.exit` for the exit primitive. Args come in through `main`'s
   * `args: Array[String]` (we keep `scalaJSUseMainModuleInitializer := false`
   * so sbt's InputTask forwards them; see build.sbt for the rationale).
-  */
+  * Host-backed preopens go through the JS `HostPreopen.fromDir` factory
+  * (Node `fs.*Sync`). */
 object Main:
 
   private val jsPlatform: Cli.Platform = new Cli.Platform:
@@ -25,6 +28,9 @@ object Main:
     def exit(code: Int): Nothing =
       g.process.exit(code)
       throw new RuntimeException("unreachable after process.exit")
+
+    def openPreopen(hostPath: String, virtualName: String): WasiContext.Preopen =
+      HostPreopen.fromDir(hostPath, virtualName)
 
   def main(args: Array[String]): Unit =
     // The scalajs linker calls `main(Array.empty)` regardless of process.argv
