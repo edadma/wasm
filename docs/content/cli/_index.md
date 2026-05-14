@@ -1,0 +1,26 @@
+---
+title: CLI
+summary: The command-line runner — `wasm <file>` with `--preopen`, `--invoke`, `--args`, `--list-exports`.
+weight: 40
+---
+
+The `cli/` sub-project builds a small wrapper around the interpreter and the WASI shim. Use it when you want to run a `.wasm` module from a shell — for quick experiments, for CI smoke tests against rustc-built binaries, or as a starting point for a longer-lived launcher.
+
+```text
+$ wasm --help
+wasm 0.0.1
+Usage: wasm [options] <file>
+
+  <file>                                       path to a .wasm module
+  -i, --invoke <export>                        name of the export to invoke (default: _start if exported, else main)
+  -a, --args n1,n2,...                         comma-separated decimal i32 arguments to the export
+  --list-exports                               print exported function names and exit (no invocation)
+  -p, --preopen <host-path>:<virtual-name>     mount a host directory as a wasi preopen (repeatable)
+  --help                                       print this help message
+  --version                                    print version and exit
+```
+
+The CLI cross-builds on JVM, Scala.js (Node), and Scala Native — all three are wired up in `build.sbt`.
+
+- [Flags](/cli/flags/) — every option, what it does, when to reach for it.
+- [Recipes](/cli/recipes/) — hand-written WAT, rustc-built WASI binaries, native binaries.

@@ -1,0 +1,43 @@
+# wasm docs site, deployed to https://edadma.github.io/wasm/.
+#
+# Built with juicer (the SSG) and themed with juicerdocs (vendored under
+# themes/juicerdocs/ so this repo stays self-contained).
+#
+# Local preview:
+#   sbt 'juicerJVM/run serve -s ../wasm/docs -L'      # from juicer's repo
+#
+# Production: pushed to `stable`, built + deployed by .github/workflows/docs.yml.
+
+title           = "wasm"
+author          = "Ed Maxedon"
+baseURL         = "https://edadma.github.io/wasm/"
+# repoURL drives the topbar GitHub icon and the "Star on GitHub" hero
+# button — both rendered conditionally by juicerdocs when this is set.
+repoURL         = "https://github.com/edadma/wasm"
+
+theme           = "juicerdocs"
+
+# The page <h1> comes from frontmatter title — markdown headings start at h2.
+headingShift    = 0
+
+# Static-host deploy: URL space must match disk layout. The default 'html'
+# segment is a dev-time convenience that doesn't survive GitHub Pages.
+htmlDir         = ""
+
+[juicerdocs]
+version         = "v0.4.4"
+
+# Brand palette — violet, evoking the WebAssembly logo lineage without
+# copying it outright. Distinct from juicer's plum, squiggly's cyan, and
+# markdown's slate, so the four sites read as siblings.
+brand           = "#7c3aed"        # violet-600  — primary
+brandStrong     = "#6d28d9"        # violet-700  — hover
+brandSoft       = "#ede9fe"        # violet-100  — backgrounds
+accent          = "#f59e0b"        # amber-500   — secondary
+leaf            = "#16a34a"        # green-600   — success / leaf
+
+brandDark       = "#a78bfa"        # violet-400
+brandStrongDark = "#c4b5fd"        # violet-300
+brandSoftDark   = "rgb(167 139 250 / .12)"
+accentDark      = "#fbbf24"        # amber-400
+leafDark        = "#22c55e"        # green-500
