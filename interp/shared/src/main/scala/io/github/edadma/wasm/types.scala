@@ -81,7 +81,7 @@ sealed trait Export { def name: String }
 final case class FuncExport(name: String, funcIdx: Int)     extends Export
 final case class GlobalExport(name: String, globalIdx: Int) extends Export
 final case class TableExport(name: String, tableIdx: Int)   extends Export
-// TODO: MemoryExport — not surfaced yet
+final case class MemoryExport(name: String, memIdx: Int)    extends Export
 
 final case class MemoryLimits(min: Int, max: Option[Int])
 

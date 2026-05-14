@@ -140,27 +140,27 @@ object MemoryTests:
       // addr 8 covering bytes 8..9 exhaustively pins the truncation.
     }
 
-    test("memory.size with non-zero reserved byte rejected at validation") {
-      // Phase 6: caught by the validator at instantiate, before any
-      // function runs. Patch the byte immediately after the first 0x3F
-      // (memory.size) from 0x00 to 0x01 — any non-zero value signals
-      // multi-memory which the MVP doesn't model.
+    test("memory.size with out-of-range memidx rejected at validation (Phase 8.D)") {
+      // Phase 8.D: the byte that used to be a must-be-zero reserved slot
+      // is now a memidx LEB. Patching it from 0x00 to 0x01 in a single-
+      // memory module surfaces the validator's "memidx 1 out of range"
+      // diagnostic rather than the pre-8.D "non-zero reserved byte".
       val src = Fixtures.memory_grow_basic
       val idx = src.indexOf(0x3f.toByte)
       check(idx >= 0, "memory.size opcode (0x3F) not found in fixture")
       val bad = patchByte(src, idx + 1, 0x01)
       expectInstantiateError(bad) {
-        case WasmError.InvalidModule(m) => m.contains("memory.size") && m.contains("reserved")
+        case WasmError.InvalidModule(m) => m.contains("memory.size") && m.contains("memidx") && m.contains("out of range")
       }
     }
 
-    test("memory.grow with non-zero reserved byte rejected at validation") {
+    test("memory.grow with out-of-range memidx rejected at validation (Phase 8.D)") {
       val src = Fixtures.memory_grow_basic
       val idx = src.indexOf(0x40.toByte)
       check(idx >= 0, "memory.grow opcode (0x40) not found in fixture")
       val bad = patchByte(src, idx + 1, 0x02)
       expectInstantiateError(bad) {
-        case WasmError.InvalidModule(m) => m.contains("memory.grow") && m.contains("reserved")
+        case WasmError.InvalidModule(m) => m.contains("memory.grow") && m.contains("memidx") && m.contains("out of range")
       }
     }
 

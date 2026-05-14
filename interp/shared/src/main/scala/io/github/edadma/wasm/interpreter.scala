@@ -109,6 +109,40 @@ object Interpreter:
   /** A function supplied by the host. */
   final case class HostBound(signature: FuncType, fn: HostFunc) extends ResolvedFunc
 
+  // === Phase 8.D: multi-memory memarg ======================================
+
+  /** One memarg immediate for a load/store opcode. The reference-types-era
+    * encoding extends the MVP `(align, offset)` pair with an optional
+    * memidx, signalled by bit 6 of the alignment LEB:
+    *
+    *   align-LEB-byte0 & 0x40  == 0 → MVP: just align + offset; memIdx = 0.
+    *   align-LEB-byte0 & 0x40  != 0 → bit 6 is a "memidx-present" flag;
+    *                                  alignment value is the LEB with that
+    *                                  bit cleared, then a memidx LEB
+    *                                  follows, then offset.
+    *
+    * The interpreter ignores `align` (alignment is advisory) — only
+    * `memIdx` + `offset` matter at run time. */
+  final case class MemArg(memIdx: Int, align: Int, offset: Int)
+
+  /** Read a memarg starting at `pc`. Returns `(MemArg, posAfter)`. The
+    * shape is identical for every load + store opcode, so threading this
+    * through `step` keeps the per-opcode code tiny. */
+  private[wasm] def readMemArg(body: Array[Byte], pc: Int): Either[WasmError, (MemArg, Int)] =
+    Leb128.readU32(body, pc) match
+      case Left(e) => Left(e)
+      case Right((alignFlag, p1)) =>
+        val memidxFlag = (alignFlag & 0x40) != 0
+        val align      = if memidxFlag then alignFlag & ~0x40 else alignFlag
+        val memStep: Either[WasmError, (Int, Int)] =
+          if memidxFlag then Leb128.readU32(body, p1) else Right((0, p1))
+        memStep match
+          case Left(e)             => Left(e)
+          case Right((memIdx, p2)) =>
+            Leb128.readU32(body, p2) match
+              case Left(e)             => Left(e)
+              case Right((offset, p3)) => Right((MemArg(memIdx, align, offset), p3))
+
   // === Pre-compute the matching-end lookup for one body ====================
 
   /** Scan a function body once and emit a map from each block/loop/if opcode
@@ -278,20 +312,15 @@ object Interpreter:
            0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 |       // i64.load{8,16,32}_{s,u}
            0x36 | 0x37 | 0x38 | 0x39 |                     // i32.store, i64.store, f32.store, f64.store
            0x3a | 0x3b | 0x3c | 0x3d | 0x3e =>             // i32.store8/16, i64.store{8,16,32}
-        for
-          (_, p1) <- Leb128.readU32(body, pc + 1)          // align
-          (_, p2) <- Leb128.readU32(body, p1)              // offset
-        yield p2
+        // Phase 8.D: memarg may carry a memidx (bit 6 of the align LEB).
+        // readMemArg handles both shapes.
+        readMemArg(body, pc + 1).map(_._2)
       case 0x3f | 0x40 =>                                  // memory.size / memory.grow
-        // Each takes a single 0x00 reserved byte (the MVP memidx). The
-        // step() dispatch verifies it's actually zero; here we only need
-        // to advance past it so the pre-scan tracks block-end positions
-        // correctly. Hand-folding a `readU32` would also work (a single
-        // 0x00 byte reads as the u32 value 0), but the explicit two-byte
-        // advance is clearer and immune to future multi-memory overloads.
-        if pc + 2 > body.length then
-          Left(WasmError.InvalidModule(s"truncated memory.size/grow reserved byte at $pc"))
-        else Right(pc + 2)
+        // Phase 8.D: the slot that was a "must-be-zero reserved byte"
+        // in the MVP is now a memidx LEB. For single-memory modules
+        // it's still always 0x00, but we read it as a u32 LEB so any
+        // memidx value parses cleanly.
+        Leb128.readU32(body, pc + 1).map(_._2)
       case 0x41 =>                                         // i32.const
         Leb128.readS32(body, pc + 1).map(_._2)
       case 0x42 =>                                         // i64.const (SLEB64 immediate)
@@ -338,25 +367,30 @@ object Interpreter:
             sub match
               case s if s >= 0 && s <= 7 =>                                    // i32/i64.trunc_sat_{f32,f64}_{s,u}
                 Right(p1)
-              case 8 =>                                                        // memory.init dataidx, memidx-reserved-byte
+              case 8 =>                                                        // memory.init dataidx, memidx
+                // Phase 8.D: second immediate is a memidx LEB (was a
+                // must-be-zero reserved byte pre-multi-memory).
                 Leb128.readU32(body, p1) match
                   case Left(e)            => Left(e)
                   case Right((_, p2)) =>
-                    if p2 + 1 > body.length then
-                      Left(WasmError.InvalidModule("truncated memory.init reserved memidx"))
-                    else Right(p2 + 1)
+                    Leb128.readU32(body, p2) match
+                      case Left(e)        => Left(e)
+                      case Right((_, p3)) => Right(p3)
               case 9 =>                                                        // data.drop dataidx
                 Leb128.readU32(body, p1) match
                   case Left(e)      => Left(e)
                   case Right((_, p2)) => Right(p2)
-              case 10 =>                                                       // memory.copy — two reserved bytes (dst, src memidx)
-                if p1 + 2 > body.length then
-                  Left(WasmError.InvalidModule("truncated memory.copy reserved bytes"))
-                else Right(p1 + 2)
-              case 11 =>                                                       // memory.fill — one reserved byte (memidx)
-                if p1 + 1 > body.length then
-                  Left(WasmError.InvalidModule("truncated memory.fill reserved byte"))
-                else Right(p1 + 1)
+              case 10 =>                                                       // memory.copy dst-memidx, src-memidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)            => Left(e)
+                  case Right((_, p2)) =>
+                    Leb128.readU32(body, p2) match
+                      case Left(e)        => Left(e)
+                      case Right((_, p3)) => Right(p3)
+              case 11 =>                                                       // memory.fill memidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)      => Left(e)
+                  case Right((_, p2)) => Right(p2)
               case 12 =>                                                       // table.init elemidx, tableidx
                 Leb128.readU32(body, p1) match
                   case Left(e)            => Left(e)
@@ -422,7 +456,11 @@ end Interpreter
   */
 final class Interpreter private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
-    val memory: Memory,
+    /** Phase 8.D: linear memories indexed by memidx. The MVP single-memory
+      * shape just makes this an `Array[Memory]` of length 1; multi-memory
+      * modules carry one entry per declared memory. Load/store paths read
+      * `memories(memArg.memIdx)` per opcode. */
+    private val memories: Array[Memory],
     /** Module-instance globals (shared across calls — that persistence is
       * the whole point of globals). The interpreter mutates entries in
       * place on `global.set`. */
@@ -710,82 +748,68 @@ final class Interpreter private[wasm] (
       // === memory ========================================================
 
       case 0x28 =>                                                                        // i32.load
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI32(loadI32(addr + offset))
+        pushI32(loadI32(mem, addr + memArg.offset))
 
       case 0x2c =>                                                                        // i32.load8_s
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI32(loadByte(addr + offset).toByte.toInt)                                     // sign-extend
+        pushI32(loadByte(mem, addr + memArg.offset).toByte.toInt)                                     // sign-extend
 
       case 0x2d =>                                                                        // i32.load8_u
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI32(loadByte(addr + offset) & 0xff)                                           // zero-extend
+        pushI32(loadByte(mem, addr + memArg.offset) & 0xff)                                           // zero-extend
 
       case 0x36 =>                                                                        // i32.store
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI32()
         val addr = popI32().toLong & 0xffffffffL
-        storeI32(addr + offset, v)
+        storeI32(mem, addr + memArg.offset, v)
 
       case 0x3a =>                                                                        // i32.store8
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI32()
         val addr = popI32().toLong & 0xffffffffL
-        storeByte(addr + offset, v & 0xff)
+        storeByte(mem, addr + memArg.offset, v & 0xff)
 
       case 0x2e =>                                                                        // i32.load16_s
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI32(loadI16(addr + offset))                                                   // already sign-extended by loadI16
+        pushI32(loadI16(mem, addr + memArg.offset))                                                   // already sign-extended by loadI16
 
       case 0x2f =>                                                                        // i32.load16_u
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI32(loadI16(addr + offset) & 0xffff)                                          // mask off the sign-extension
+        pushI32(loadI16(mem, addr + memArg.offset) & 0xffff)                                          // mask off the sign-extension
 
       case 0x3b =>                                                                        // i32.store16 — low 16 bits
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI32()
         val addr = popI32().toLong & 0xffffffffL
-        storeI16(addr + offset, v & 0xffff)
+        storeI16(mem, addr + memArg.offset, v & 0xffff)
 
-      case 0x3f =>                                                                        // memory.size
-        // Spec encodes a single 0x00 reserved byte after the opcode (the
-        // MVP memidx). A non-zero byte here would mean the binary is
-        // targeting multi-memory, which the MVP doesn't model — surface it
-        // as an `InvalidModule` rather than silently misreading.
-        val reserved = body(f.pc + 1) & 0xff
-        if reserved != 0 then
-          fail(WasmError.InvalidModule(s"memory.size: non-zero reserved byte 0x${reserved.toHexString}"))
-        f.pc += 2
-        pushI32(memory.currentPages)
+      case 0x3f =>                                                                        // memory.size memidx
+        // Phase 8.D: the byte that was a must-be-zero reserved slot in the
+        // MVP is now a memidx LEB. Single-memory modules still encode 0x00
+        // (one LEB byte = 0) and read the only memory; multi-memory
+        // modules can target memidx 1, 2, ... here.
+        val mem = readMemIdxMemory(f)
+        pushI32(mem.currentPages)
 
-      case 0x40 =>                                                                        // memory.grow
-        val reserved = body(f.pc + 1) & 0xff
-        if reserved != 0 then
-          fail(WasmError.InvalidModule(s"memory.grow: non-zero reserved byte 0x${reserved.toHexString}"))
-        f.pc += 2
+      case 0x40 =>                                                                        // memory.grow memidx
+        val mem   = readMemIdxMemory(f)
         val delta = popI32()
-        pushI32(memory.grow(delta))                                                       // -1 on failure (NOT a trap)
+        pushI32(mem.grow(delta))                                                          // -1 on failure (NOT a trap)
 
       // === i32 numeric ===================================================
 
@@ -856,85 +880,74 @@ final class Interpreter private[wasm] (
       // pattern as i32 — only the access width and sign-extension differ.
 
       case 0x29 =>                                                                        // i64.load (8 bytes)
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64(loadI64(addr + offset))
+        pushI64(loadI64(mem, addr + memArg.offset))
 
       case 0x30 =>                                                                        // i64.load8_s
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64(loadByte(addr + offset).toByte.toLong)                                    // sign-extend
+        pushI64(loadByte(mem, addr + memArg.offset).toByte.toLong)                                    // sign-extend
 
       case 0x31 =>                                                                        // i64.load8_u
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64((loadByte(addr + offset) & 0xff).toLong)
+        pushI64((loadByte(mem, addr + memArg.offset) & 0xff).toLong)
 
       case 0x32 =>                                                                        // i64.load16_s
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64(loadI16(addr + offset).toLong)                                            // already sign-extended
+        pushI64(loadI16(mem, addr + memArg.offset).toLong)                                            // already sign-extended
 
       case 0x33 =>                                                                        // i64.load16_u
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64((loadI16(addr + offset) & 0xffff).toLong)
+        pushI64((loadI16(mem, addr + memArg.offset) & 0xffff).toLong)
 
       case 0x34 =>                                                                        // i64.load32_s
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64(loadI32(addr + offset).toLong)                                            // sign-extend
+        pushI64(loadI32(mem, addr + memArg.offset).toLong)                                            // sign-extend
 
       case 0x35 =>                                                                        // i64.load32_u
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushI64(loadI32(addr + offset).toLong & 0xffffffffL)
+        pushI64(loadI32(mem, addr + memArg.offset).toLong & 0xffffffffL)
 
       case 0x37 =>                                                                        // i64.store (8 bytes)
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI64()
         val addr = popI32().toLong & 0xffffffffL
-        storeI64(addr + offset, v)
+        storeI64(mem, addr + memArg.offset, v)
 
       case 0x3c =>                                                                        // i64.store8 — low 8 bits
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI64()
         val addr = popI32().toLong & 0xffffffffL
-        storeByte(addr + offset, (v & 0xffL).toInt)
+        storeByte(mem, addr + memArg.offset, (v & 0xffL).toInt)
 
       case 0x3d =>                                                                        // i64.store16 — low 16 bits
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI64()
         val addr = popI32().toLong & 0xffffffffL
-        storeI16(addr + offset, (v & 0xffffL).toInt)
+        storeI16(mem, addr + memArg.offset, (v & 0xffffL).toInt)
 
       case 0x3e =>                                                                        // i64.store32 — low 32 bits
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popI64()
         val addr = popI32().toLong & 0xffffffffL
-        storeI32(addr + offset, v.toInt)
+        storeI32(mem, addr + memArg.offset, v.toInt)
 
       // === i64 numeric ===================================================
 
@@ -999,19 +1012,17 @@ final class Interpreter private[wasm] (
       // === f32 memory ====================================================
 
       case 0x2a =>                                                                        // f32.load (4 bytes IEEE-754)
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushF32(loadF32(addr + offset))
+        pushF32(loadF32(mem, addr + memArg.offset))
 
       case 0x38 =>                                                                        // f32.store
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popF32()
         val addr = popI32().toLong & 0xffffffffL
-        storeF32(addr + offset, v)
+        storeF32(mem, addr + memArg.offset, v)
 
       // === f32 numeric ===================================================
 
@@ -1069,19 +1080,17 @@ final class Interpreter private[wasm] (
       // === f64 memory ====================================================
 
       case 0x2b =>                                                                        // f64.load (8 bytes IEEE-754)
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val addr = popI32().toLong & 0xffffffffL
-        pushF64(loadF64(addr + offset))
+        pushF64(loadF64(mem, addr + memArg.offset))
 
       case 0x39 =>                                                                        // f64.store
-        val (_, p1)      = readU32At(f, f.pc + 1)
-        val (offset, p2) = readU32At(f, p1)
-        f.pc = p2
+        val memArg = readMemArgFrame(f)
+        val mem    = memArgMemory(memArg)
         val v    = popF64()
         val addr = popI32().toLong & 0xffffffffL
-        storeF64(addr + offset, v)
+        storeF64(mem, addr + memArg.offset, v)
 
       // === f64 numeric ===================================================
 
@@ -1526,12 +1535,13 @@ final class Interpreter private[wasm] (
       // (dataidx, elemidx, tableidx, reserved memidx); the interpreter
       // re-reads them via readU32At for the dispatch.
 
-      case 8 =>                                                                         // memory.init dataidx, memidx-reserved-byte
-        val (dataIdx, p2) = readU32At(f, p1)
-        val mem = body(p2) & 0xff
-        if mem != 0 then
-          fail(WasmError.InvalidModule(s"memory.init: non-zero reserved memidx $mem"))
-        f.pc = p2 + 1
+      case 8 =>                                                                         // memory.init dataidx, memidx
+        val (dataIdx, p2)  = readU32At(f, p1)
+        val (memIdx, p3)   = readU32At(f, p2)
+        f.pc = p3
+        if memIdx < 0 || memIdx >= memories.length then
+          fail(WasmError.InvalidModule(s"memory.init: memidx $memIdx out of range (have ${memories.length} memories)"))
+        val mem = memories(memIdx)
         val n   = popI32()
         val src = popI32()                                                              // offset into data segment
         val dst = popI32()                                                              // offset into memory
@@ -1545,10 +1555,10 @@ final class Interpreter private[wasm] (
         // that have been explicitly `data.drop`'d.
         val segLen =
           if dataDropped(dataIdx) then 0L else dataBytes(dataIdx).length.toLong
-        if srcL + nL > segLen || dstL + nL > memory.data.length.toLong then
+        if srcL + nL > segLen || dstL + nL > mem.data.length.toLong then
           fail(WasmError.MemoryOutOfBounds)
         if nL > 0L then
-          System.arraycopy(dataBytes(dataIdx), srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+          System.arraycopy(dataBytes(dataIdx), srcL.toInt, mem.data, dstL.toInt, nL.toInt)
 
       case 9 =>                                                                         // data.drop dataidx
         val (dataIdx, p2) = readU32At(f, p1)
@@ -1558,44 +1568,45 @@ final class Interpreter private[wasm] (
         dataDropped(dataIdx) = true
 
       case 10 =>                                                                        // memory.copy dst-memidx src-memidx
-        val dstMem = body(p1)     & 0xff
-        val srcMem = body(p1 + 1) & 0xff
-        if dstMem != 0 || srcMem != 0 then
-          fail(WasmError.InvalidModule(
-            s"memory.copy: non-zero reserved memidx ($dstMem, $srcMem)"))
-        f.pc = p1 + 2
+        val (dstMemIdx, p2) = readU32At(f, p1)
+        val (srcMemIdx, p3) = readU32At(f, p2)
+        f.pc = p3
+        if dstMemIdx < 0 || dstMemIdx >= memories.length then
+          fail(WasmError.InvalidModule(s"memory.copy: dst memidx $dstMemIdx out of range"))
+        if srcMemIdx < 0 || srcMemIdx >= memories.length then
+          fail(WasmError.InvalidModule(s"memory.copy: src memidx $srcMemIdx out of range"))
+        val dstMem = memories(dstMemIdx)
+        val srcMem = memories(srcMemIdx)
         val n   = popI32()
         val src = popI32()
         val dst = popI32()
-        // All three operands are wasm i32 — but the bounds check needs
-        // unsigned semantics because a high-bit-set address is a real
-        // address in the upper 2 GiB. Long arithmetic defeats wrap.
         val nL   = n.toLong   & 0xffffffffL
         val srcL = src.toLong & 0xffffffffL
         val dstL = dst.toLong & 0xffffffffL
-        val len  = memory.data.length.toLong
-        if srcL + nL > len || dstL + nL > len then
+        if srcL + nL > srcMem.data.length.toLong || dstL + nL > dstMem.data.length.toLong then
           fail(WasmError.MemoryOutOfBounds)
         if nL > 0L then
           // System.arraycopy handles overlapping copies correctly in both
-          // directions, matching the spec's required semantics.
-          System.arraycopy(memory.data, srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+          // directions when src and dst arrays are the same, matching the
+          // spec for same-memory overlap. Cross-memory uses distinct
+          // backing arrays, so no aliasing concern.
+          System.arraycopy(srcMem.data, srcL.toInt, dstMem.data, dstL.toInt, nL.toInt)
 
       case 11 =>                                                                        // memory.fill memidx
-        val mem = body(p1) & 0xff
-        if mem != 0 then
-          fail(WasmError.InvalidModule(s"memory.fill: non-zero reserved memidx $mem"))
-        f.pc = p1 + 1
+        val (memIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        if memIdx < 0 || memIdx >= memories.length then
+          fail(WasmError.InvalidModule(s"memory.fill: memidx $memIdx out of range"))
+        val mem = memories(memIdx)
         val n   = popI32()
         val v   = popI32()
         val dst = popI32()
         val nL   = n.toLong   & 0xffffffffL
         val dstL = dst.toLong & 0xffffffffL
-        val len  = memory.data.length.toLong
-        if dstL + nL > len then
+        if dstL + nL > mem.data.length.toLong then
           fail(WasmError.MemoryOutOfBounds)
         if nL > 0L then
-          java.util.Arrays.fill(memory.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
+          java.util.Arrays.fill(mem.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
 
       case 12 =>                                                                        // table.init elemidx, tableidx
         val (elemIdx, p2) = readU32At(f, p1)
@@ -1746,7 +1757,13 @@ final class Interpreter private[wasm] (
         val args = new Array[Value](n)
         var k    = n - 1
         while k >= 0 do { args(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
-        val results = fn(memory, args.toSeq)
+        // Host functions take the implicit "memory 0" handle. Phase 8.D
+        // multi-memory introspection is host-side only — host modules
+        // wanting access to memidx > 0 can reach through ModuleInstance
+        // separately; the per-call HostFunc surface keeps the MVP
+        // contract for backwards compat. memories.length is always >= 1
+        // (zero-memory modules get a synthetic zero-page placeholder).
+        val results = fn(memories(0), args.toSeq)
         if results.size != sig.results.size then fail(WasmError.TypeMismatch)
         results.foreach(valueStack += _)
 
@@ -1774,55 +1791,59 @@ final class Interpreter private[wasm] (
         frames += new Frame(wf, locals, stackBase = valueStack.size)
 
   // === memory access ======================================================
+  //
+  // Phase 8.D: each helper takes the target Memory explicitly. Callers
+  // resolve the memArg's memidx via `memArgMemory(memArg)` and pass the
+  // result through.
 
-  private inline def boundsCheck(addr: Long, n: Int): Unit =
-    if addr < 0 || addr + n > memory.data.length then fail(WasmError.MemoryOutOfBounds)
+  private inline def boundsCheck(mem: Memory, addr: Long, n: Int): Unit =
+    if addr < 0 || addr + n > mem.data.length then fail(WasmError.MemoryOutOfBounds)
 
-  private def loadByte(addr: Long): Int =
-    boundsCheck(addr, 1)
-    memory.data(addr.toInt) & 0xff
+  private def loadByte(mem: Memory, addr: Long): Int =
+    boundsCheck(mem, addr, 1)
+    mem.data(addr.toInt) & 0xff
 
-  private def storeByte(addr: Long, v: Int): Unit =
-    boundsCheck(addr, 1)
-    memory.data(addr.toInt) = v.toByte
+  private def storeByte(mem: Memory, addr: Long, v: Int): Unit =
+    boundsCheck(mem, addr, 1)
+    mem.data(addr.toInt) = v.toByte
 
   /** Little-endian 16-bit load — returns a sign-extended Int. Callers that
     * want the zero-extended form mask with `0xffff` themselves. */
-  private def loadI16(addr: Long): Int =
-    boundsCheck(addr, 2)
+  private def loadI16(mem: Memory, addr: Long): Int =
+    boundsCheck(mem, addr, 2)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     val raw = (d(a) & 0xff) | ((d(a + 1) & 0xff) << 8)
     (raw << 16) >> 16 // sign-extend the 16-bit value into an Int
 
-  private def storeI16(addr: Long, v: Int): Unit =
-    boundsCheck(addr, 2)
+  private def storeI16(mem: Memory, addr: Long, v: Int): Unit =
+    boundsCheck(mem, addr, 2)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     d(a)     = (v         & 0xff).toByte
     d(a + 1) = ((v >>> 8) & 0xff).toByte
 
   /** Little-endian 32-bit load. */
-  private def loadI32(addr: Long): Int =
-    boundsCheck(addr, 4)
+  private def loadI32(mem: Memory, addr: Long): Int =
+    boundsCheck(mem, addr, 4)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     (d(a) & 0xff) | ((d(a + 1) & 0xff) << 8) | ((d(a + 2) & 0xff) << 16) | ((d(a + 3) & 0xff) << 24)
 
-  private def storeI32(addr: Long, v: Int): Unit =
-    boundsCheck(addr, 4)
+  private def storeI32(mem: Memory, addr: Long, v: Int): Unit =
+    boundsCheck(mem, addr, 4)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     d(a)     = (v         & 0xff).toByte
     d(a + 1) = ((v >>>  8) & 0xff).toByte
     d(a + 2) = ((v >>> 16) & 0xff).toByte
     d(a + 3) = ((v >>> 24) & 0xff).toByte
 
   /** Little-endian 64-bit load. */
-  private def loadI64(addr: Long): Long =
-    boundsCheck(addr, 8)
+  private def loadI64(mem: Memory, addr: Long): Long =
+    boundsCheck(mem, addr, 8)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     (d(a)     & 0xffL)        |
     ((d(a + 1) & 0xffL) <<  8) |
     ((d(a + 2) & 0xffL) << 16) |
@@ -1832,10 +1853,10 @@ final class Interpreter private[wasm] (
     ((d(a + 6) & 0xffL) << 48) |
     ((d(a + 7) & 0xffL) << 56)
 
-  private def storeI64(addr: Long, v: Long): Unit =
-    boundsCheck(addr, 8)
+  private def storeI64(mem: Memory, addr: Long, v: Long): Unit =
+    boundsCheck(mem, addr, 8)
     val a = addr.toInt
-    val d = memory.data
+    val d = mem.data
     d(a)     = ( v         & 0xffL).toByte
     d(a + 1) = ((v >>>  8) & 0xffL).toByte
     d(a + 2) = ((v >>> 16) & 0xffL).toByte
@@ -1847,19 +1868,54 @@ final class Interpreter private[wasm] (
 
   /** Little-endian 32-bit IEEE-754 load. Uses the *raw* conversion so NaN
     * payloads survive a round-trip through memory. */
-  private def loadF32(addr: Long): Float =
-    jl.Float.intBitsToFloat(loadI32(addr))
+  private def loadF32(mem: Memory, addr: Long): Float =
+    jl.Float.intBitsToFloat(loadI32(mem, addr))
 
-  private def storeF32(addr: Long, v: Float): Unit =
-    storeI32(addr, jl.Float.floatToRawIntBits(v))
+  private def storeF32(mem: Memory, addr: Long, v: Float): Unit =
+    storeI32(mem, addr, jl.Float.floatToRawIntBits(v))
 
   /** Little-endian 64-bit IEEE-754 load. Same NaN-payload-preserving raw
     * conversion as the f32 path, just at Double width. */
-  private def loadF64(addr: Long): Double =
-    jl.Double.longBitsToDouble(loadI64(addr))
+  private def loadF64(mem: Memory, addr: Long): Double =
+    jl.Double.longBitsToDouble(loadI64(mem, addr))
 
-  private def storeF64(addr: Long, v: Double): Unit =
-    storeI64(addr, jl.Double.doubleToRawLongBits(v))
+  private def storeF64(mem: Memory, addr: Long, v: Double): Unit =
+    storeI64(mem, addr, jl.Double.doubleToRawLongBits(v))
+
+  // === memarg / memory-index helpers ======================================
+
+  /** Read the memarg starting just after the current opcode, advance the
+    * frame's pc past it, and return the immediate. Routes through the
+    * `Interpreter.readMemArg` companion-object helper so the encoding
+    * (incl. the multi-memory bit-6 flag) is shared with `skipImmediates`
+    * + the validator. */
+  private inline def readMemArgFrame(f: Frame): MemArg =
+    Interpreter.readMemArg(f.func.body, f.pc + 1) match
+      case Left(e) => fail(e)
+      case Right((memArg, p)) =>
+        f.pc = p
+        memArg
+
+  /** Resolve a memarg's memidx to the runtime [[Memory]]. The validator
+    * already range-checked the index, but a defensive check here keeps
+    * the runtime trap-shape clean for handwritten / malformed binaries
+    * that bypass validation (none should reach here today). */
+  private inline def memArgMemory(memArg: MemArg): Memory =
+    val i = memArg.memIdx
+    if i < 0 || i >= memories.length then
+      fail(WasmError.InvalidModule(s"memory op: memidx $i out of range (have ${memories.length} memories)"))
+    memories(i)
+
+  /** Read a single u32 LEB at `f.pc + 1`, advance `f.pc`, range-check
+    * the value against `memories.length`, and return the resolved
+    * memory. Used by the memory.size / memory.grow / memory.fill step
+    * cases whose only immediate is a single memidx LEB. */
+  private inline def readMemIdxMemory(f: Frame): Memory =
+    val (idx, p) = readU32At(f, f.pc + 1)
+    f.pc = p
+    if idx < 0 || idx >= memories.length then
+      fail(WasmError.InvalidModule(s"memory op: memidx $idx out of range (have ${memories.length} memories)"))
+    memories(idx)
 
   // === misc helpers =======================================================
 

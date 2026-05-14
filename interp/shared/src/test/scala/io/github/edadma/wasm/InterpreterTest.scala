@@ -47,6 +47,7 @@ object InterpreterTest:
     ParserAndRuntimeTests.run()
     MultiValueAndStartTests.run()
     RefTypesTests.run()
+    MultiMemoryTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size
