@@ -13,7 +13,8 @@ package io.github.edadma.wasm.wasi
   *   `WasiArgsTests`      — args_*, environ_*
   *   `WasiClockTests`     — clock_time_get, random_get
   *   `WasiFsTests`        — fd_prestat_get / fd_prestat_dir_name (7.E.1);
-  *                          path_open + general-fd fd_close (7.E.2)
+  *                          path_open + general-fd fd_close (7.E.2);
+  *                          fd_read / fd_seek / fd_filestat_get (7.E.3)
   *   `WasiRealRustTests`  — end-to-end smoke against a rustc-built
   *                          wasm32-wasip1 hello world (Phase 7.D)
   *

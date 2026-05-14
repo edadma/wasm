@@ -4,7 +4,7 @@ import io.github.edadma.wasm.{I32, I64, ModuleInstance}
 
 import WasiTestSupport.{check, instantiate, test}
 
-/** Filesystem-syscall tests — currently covering Phases 7.E.1 + 7.E.2:
+/** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3:
   *
   *   - **7.E.1** wired the preopen-walk syscalls (`fd_prestat_get` and
   *     `fd_prestat_dir_name`), the two functions wasi-libc reaches for at
@@ -19,14 +19,23 @@ import WasiTestSupport.{check, instantiate, test}
   *     [[WasiContext.Preopen]] trait grew an `open(path, oflags, fdflags)`
   *     method; the default impl returns `Left(Wasi.ENOTCAPABLE)`, and
   *     [[WasiContext.Preopen.inMemory]] is the read-only test-harness
-  *     impl backed by a `Map[String, Array[Byte]]`. Two new fixtures
-  *     drive the surface: `wasi_prestat.wat` (7.E.1, peek-only) and
-  *     `wasi_path_open.wat` (7.E.2, adds `call_path_open` /
-  *     `call_fd_close` / `store_byte`).
+  *     impl backed by a `Map[String, Array[Byte]]`.
   *
-  * Phase 7.E.3 will add `fd_read` / `fd_seek` / `fd_filestat_get` on top
-  * of the same [[Wasi.FsFile]] handle (extending its trait with the
-  * methods those syscalls need).
+  *   - **7.E.3** added the read/seek/stat trio: `fd_read` walks iovecs
+  *     into linear memory like `fd_write` in reverse; `fd_seek` does the
+  *     SET/CUR/END whence math at the syscall layer and stamps the new
+  *     position; `fd_filestat_get` writes the 64-byte filestat struct
+  *     (filetype dispatched by fd class — stdio is CHARACTER_DEVICE,
+  *     preopens are DIRECTORY, opened files are REGULAR_FILE). The
+  *     [[Wasi.FsFile]] trait grew `read` / `size` / `tell` / `seek`;
+  *     [[WasiContext.Preopen.inMemory]]'s `InMemoryFile` carries a
+  *     cursor that read advances.
+  *
+  * Three fixtures drive the surface: `wasi_prestat.wat` (7.E.1,
+  * peek-only), `wasi_path_open.wat` (7.E.2, adds `call_path_open` /
+  * `call_fd_close` / `store_byte`), and `wasi_fd_io.wat` (7.E.3, adds
+  * `call_fd_read` / `call_fd_seek` / `call_fd_filestat_get` plus
+  * `store_i32` for planting iovec entries).
   */
 object WasiFsTests:
 
@@ -356,6 +365,318 @@ object WasiFsTests:
         case other => check(false, s"call_fd_close: $other")
     }
 
+    // ===== fd_read + fd_seek + fd_filestat_get (7.E.3) ====================
+    //
+    // Pattern: open a file in InMemoryFs (single preopen at fd 3 → opened
+    // file lands at fd 4), plant an iovec table or seek args in linear
+    // memory via the fixture's `store_i32` export, drive the syscall via
+    // its `call_*` wrapper, and assert the result (errno + side-effects).
+    //
+    // Address layout (chosen by the tests, not the fixture):
+    //   path bytes        @ 0
+    //   opened_fd_out     @ 64
+    //   iovec table       @ 256
+    //   nread / newoffset @ 320 (newoffset is i64 = 8 bytes)
+    //   filestat scratch  @ 512 (64 bytes)
+    //   read destination  @ 768 onward
+
+    test("fd_read: single iovec reads the file into linear memory") {
+      val files = Map("hello.txt" -> "Hello, WASI!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "hello.txt")
+
+      // iovec: { buf = 768, len = 12 } at addr 256.
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 12)
+      callFdRead(inst, fd = 4, iovs = 256, iovsLen = 1, nreadOut = 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want 0)")
+        case other => check(false, s"call_fd_read: $other")
+      val nread = peekI32(inst, 320)
+      check(nread == 12, s"nread=$nread (want 12)")
+      val got = readBytes(inst, 768, 12)
+      val want = "Hello, WASI!".getBytes("UTF-8")
+      check(got.sameElements(want),
+            s"bytes=${new String(got, "UTF-8")} (want 'Hello, WASI!')")
+    }
+
+    test("fd_read: multi-iovec splits the read across two buffers") {
+      // Two 4-byte buffers — first should get "Hell", second "o, W".
+      val files = Map("h" -> "Hello, WASI!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      storeI32(inst, 256, 768)   // iovec[0].buf
+      storeI32(inst, 260, 4)     // iovec[0].len
+      storeI32(inst, 264, 800)   // iovec[1].buf
+      storeI32(inst, 268, 4)     // iovec[1].len
+      callFdRead(inst, fd = 4, iovs = 256, iovsLen = 2, nreadOut = 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want 0)")
+        case other => check(false, s"call_fd_read: $other")
+      check(peekI32(inst, 320) == 8, s"nread=${peekI32(inst, 320)} (want 8)")
+      val a = new String(readBytes(inst, 768, 4), "UTF-8")
+      val b = new String(readBytes(inst, 800, 4), "UTF-8")
+      check(a == "Hell", s"iov[0]='$a' (want 'Hell')")
+      check(b == "o, W", s"iov[1]='$b' (want 'o, W')")
+    }
+
+    test("fd_read: short read at EOF reports the partial count and stops") {
+      // File holds 3 bytes; ask for 4 in the first iovec, 4 in the second.
+      // First iovec returns 3 (EOF) — wasi short-read semantics say stop
+      // walking even if a second iovec was queued.
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 4)
+      storeI32(inst, 264, 800)
+      storeI32(inst, 268, 4)
+      callFdRead(inst, fd = 4, iovs = 256, iovsLen = 2, nreadOut = 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want 0)")
+        case other => check(false, s"call_fd_read: $other")
+      check(peekI32(inst, 320) == 3, s"nread=${peekI32(inst, 320)} (want 3)")
+      check(readBytes(inst, 768, 3).sameElements("abc".getBytes("UTF-8")),
+            "first iovec must hold 'abc'")
+      // The second iovec must not have been touched.
+      check(readBytes(inst, 800, 4).forall(_ == 0),
+            "second iovec must remain zero — short-read stopped the walk")
+    }
+
+    test("fd_read: subsequent call returns 0 (EOF) and writes no bytes") {
+      val files = Map("h" -> "ab".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 16)
+      callFdRead(inst, 4, 256, 1, 320)
+      check(peekI32(inst, 320) == 2, "first read drains 2 bytes")
+
+      // Re-issue. nread must be 0; the dst buffer's first byte must
+      // still hold 'a' (no clobbering).
+      callFdRead(inst, 4, 256, 1, 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want 0)")
+        case other => check(false, s"call_fd_read: $other")
+      check(peekI32(inst, 320) == 0, s"second nread=${peekI32(inst, 320)} (want 0)")
+      check(loadByte(inst, 768) == 'a'.toInt,
+            "dst[0] must remain 'a' — no write past EOF")
+    }
+
+    test("fd_read: EBADF on stdio/preopen/never-opened fds") {
+      val files = Map("h" -> "x".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 4)
+      // fd 0/1/2 — stdio. fd 3 — preopen (directory, not readable). fd 99
+      // — never opened.
+      for badFd <- Seq(0, 1, 2, 3, 99) do
+        callFdRead(inst, fd = badFd, iovs = 256, iovsLen = 1, nreadOut = 320) match
+          case Right(Seq(I32(errno))) =>
+            check(errno == Wasi.EBADF, s"fd=$badFd errno=$errno (want EBADF)")
+          case other => check(false, s"call_fd_read(fd=$badFd): $other")
+    }
+
+    test("fd_read: EFAULT when iovec buffer falls outside live memory") {
+      val files = Map("h" -> "abcdef".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      // buf=65530 + len=10 → end 65540 > 65536.
+      storeI32(inst, 256, 65530)
+      storeI32(inst, 260, 10)
+      callFdRead(inst, 4, 256, 1, 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.EFAULT, s"errno=$errno (want EFAULT)")
+        case other => check(false, s"call_fd_read: $other")
+    }
+
+    test("fd_read: EFAULT when nread_out has no room for 4 bytes") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 4)
+      callFdRead(inst, fd = 4, iovs = 256, iovsLen = 1, nreadOut = 65535) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.EFAULT, s"errno=$errno (want EFAULT)")
+        case other => check(false, s"call_fd_read: $other")
+    }
+
+    test("fd_seek: SET / CUR / END all return correct new offset") {
+      val files = Map("h" -> "0123456789".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      // SET 3 → cursor 3
+      callFdSeek(inst, fd = 4, offset = 3L, whence = 0, newOffsetOut = 320) match
+        case Right(Seq(I32(e))) => check(e == 0, s"SET errno=$e")
+        case other              => check(false, s"call_fd_seek: $other")
+      check(peekI64(inst, 320) == 3L, s"SET newoffset=${peekI64(inst, 320)}")
+
+      // CUR +2 → cursor 5
+      callFdSeek(inst, fd = 4, offset = 2L, whence = 1, newOffsetOut = 320) match
+        case Right(Seq(I32(e))) => check(e == 0, s"CUR errno=$e")
+        case other              => check(false, s"call_fd_seek: $other")
+      check(peekI64(inst, 320) == 5L, s"CUR newoffset=${peekI64(inst, 320)}")
+
+      // END -1 → cursor 9
+      callFdSeek(inst, fd = 4, offset = -1L, whence = 2, newOffsetOut = 320) match
+        case Right(Seq(I32(e))) => check(e == 0, s"END errno=$e")
+        case other              => check(false, s"call_fd_seek: $other")
+      check(peekI64(inst, 320) == 9L, s"END newoffset=${peekI64(inst, 320)}")
+    }
+
+    test("fd_seek: read after seek returns bytes from the new cursor") {
+      val files = Map("h" -> "0123456789".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      callFdSeek(inst, 4, 4L, 0, 320)
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 3)
+      callFdRead(inst, 4, 256, 1, 320)
+      check(peekI32(inst, 320) == 3, "read 3 bytes from offset 4")
+      val got = new String(readBytes(inst, 768, 3), "UTF-8")
+      check(got == "456", s"bytes='$got' (want '456')")
+    }
+
+    test("fd_seek: past-end is accepted; subsequent read returns 0") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+
+      callFdSeek(inst, 4, 100L, 0, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (past-end seek is ESUCCESS)")
+        case other => check(false, s"call_fd_seek: $other")
+      check(peekI64(inst, 320) == 100L, s"newoffset=${peekI64(inst, 320)} (want 100)")
+
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 4)
+      callFdRead(inst, 4, 256, 1, 320)
+      check(peekI32(inst, 320) == 0, "read past EOF returns 0")
+    }
+
+    test("fd_seek: EINVAL on bad whence") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      for badWhence <- Seq(3, 99, -1) do
+        callFdSeek(inst, 4, 0L, badWhence, 320) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EINVAL,
+                  s"whence=$badWhence errno=$e (want EINVAL)")
+          case other => check(false, s"call_fd_seek($badWhence): $other")
+    }
+
+    test("fd_seek: EINVAL on a resulting negative cursor (SET -1)") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      callFdSeek(inst, 4, -1L, 0, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_seek: $other")
+    }
+
+    test("fd_seek: CUR offset that would underflow returns EINVAL") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      // Cursor starts at 0; CUR -5 would land at -5.
+      callFdSeek(inst, 4, -5L, 1, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_seek: $other")
+    }
+
+    test("fd_seek: EBADF on stdio/preopen/never-opened fds") {
+      val files = Map("h" -> "x".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      for badFd <- Seq(0, 2, 3, 99) do
+        callFdSeek(inst, fd = badFd, offset = 0L,
+                   whence = 0, newOffsetOut = 320) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EBADF, s"fd=$badFd errno=$e (want EBADF)")
+          case other => check(false, s"call_fd_seek(fd=$badFd): $other")
+    }
+
+    test("fd_seek: EFAULT when newoffset_out has no room for 8 bytes") {
+      val files = Map("h" -> "abc".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "h")
+      callFdSeek(inst, 4, 0L, 0, 65530) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"call_fd_seek: $other")
+    }
+
+    test("fd_filestat_get: opened file reports REGULAR_FILE + size") {
+      val files = Map("hello.txt" -> "Hello, WASI!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "hello.txt")
+      callFdFilestatGet(inst, fd = 4, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_filestat_get: $other")
+      // filetype at offset 16 — REGULAR_FILE = 4.
+      check(loadByte(inst, 512 + 16) == 4,
+            s"filetype=${loadByte(inst, 512 + 16)} (want REGULAR_FILE=4)")
+      // nlink at offset 24 — always 1 here.
+      check(peekI64(inst, 512 + 24) == 1L,
+            s"nlink=${peekI64(inst, 512 + 24)} (want 1)")
+      // size at offset 32 — 12 bytes of "Hello, WASI!".
+      check(peekI64(inst, 512 + 32) == 12L,
+            s"size=${peekI64(inst, 512 + 32)} (want 12)")
+      // Padding bytes 17..23 (between filetype u8 and nlink u64) must
+      // be zero — wasi-libc reads the full struct, so a non-zero pad
+      // would leak whatever the program last stored at that address.
+      for off <- 17 to 23 do
+        check(loadByte(inst, 512 + off) == 0,
+              s"pad[$off]=${loadByte(inst, 512 + off)} (want 0)")
+    }
+
+    test("fd_filestat_get: preopen fd reports DIRECTORY + size 0") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      callFdFilestatGet(inst, fd = 3, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_filestat_get: $other")
+      check(loadByte(inst, 512 + 16) == 3,
+            s"filetype=${loadByte(inst, 512 + 16)} (want DIRECTORY=3)")
+      check(peekI64(inst, 512 + 32) == 0L,
+            s"size=${peekI64(inst, 512 + 32)} (want 0 for a directory)")
+    }
+
+    test("fd_filestat_get: stdio fds report CHARACTER_DEVICE") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq.empty)
+      for fd <- Seq(0, 1, 2) do
+        callFdFilestatGet(inst, fd, 512) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd errno=$e")
+          case other => check(false, s"call_fd_filestat_get(fd=$fd): $other")
+        check(loadByte(inst, 512 + 16) == 2,
+              s"fd=$fd filetype=${loadByte(inst, 512 + 16)} " +
+              s"(want CHARACTER_DEVICE=2)")
+    }
+
+    test("fd_filestat_get: EBADF on fd outside every dispatch") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      // fd 4 is past the preopen and not in the fd table.
+      callFdFilestatGet(inst, 4, 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_filestat_get: $other")
+      // Negative fd too.
+      callFdFilestatGet(inst, -1, 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_filestat_get(-1): $other")
+    }
+
+    test("fd_filestat_get: EFAULT when buf+64 extends past memory") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      // 1 page = 65536; buf=65500 + 64 = 65564 > 65536.
+      callFdFilestatGet(inst, 3, 65500) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"call_fd_filestat_get: $other")
+    }
+
   // ----- helpers ----------------------------------------------------------
 
   /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
@@ -396,5 +717,81 @@ object WasiFsTests:
     inst.invoke("load_i32", Seq(I32(addr))) match
       case Right(Seq(I32(v))) => v
       case other              => throw new AssertionError(s"load_i32($addr): $other")
+
+  /** i64 sibling of [[peekI32]] — reads the 8-byte little-endian word at
+    * `addr` via the fixture's `load_i64` helper. Used by `fd_seek`'s
+    * newoffset readout and `fd_filestat_get`'s size/nlink fields. */
+  private def peekI64(inst: ModuleInstance, addr: Int): Long =
+    inst.invoke("load_i64", Seq(I32(addr))) match
+      case Right(Seq(I64(v))) => v
+      case other              => throw new AssertionError(s"load_i64($addr): $other")
+
+  /** Plant a little-endian i32 at `addr`. Tests use this to write iovec
+    * entries (buf-pointer + length pairs) before invoking `call_fd_read`. */
+  private def storeI32(inst: ModuleInstance, addr: Int, v: Int): Unit =
+    inst.invoke("store_i32", Seq(I32(addr), I32(v))) match
+      case Right(_) => ()
+      case other    => throw new AssertionError(s"store_i32($addr, $v): $other")
+
+  /** Read back a single unsigned byte. Returns Int because the fixture's
+    * `load_byte` is `i32.load8_u` (already zero-extended). */
+  private def loadByte(inst: ModuleInstance, addr: Int): Int =
+    inst.invoke("load_byte", Seq(I32(addr))) match
+      case Right(Seq(I32(b))) => b
+      case other              => throw new AssertionError(s"load_byte($addr): $other")
+
+  /** Slurp `len` bytes from linear memory starting at `addr`. Used to
+    * verify what `fd_read` planted. */
+  private def readBytes(inst: ModuleInstance, addr: Int, len: Int): Array[Byte] =
+    val out = new Array[Byte](len)
+    var i = 0
+    while i < len do
+      out(i) = loadByte(inst, addr + i).toByte
+      i += 1
+    out
+
+  /** 4-arg `fd_read` wrapper — same arity as the underlying syscall. */
+  private def callFdRead(inst:     ModuleInstance,
+                         fd:       Int,
+                         iovs:     Int,
+                         iovsLen:  Int,
+                         nreadOut: Int) =
+    inst.invoke("call_fd_read",
+                Seq(I32(fd), I32(iovs), I32(iovsLen), I32(nreadOut)))
+
+  /** 4-arg `fd_seek` wrapper. `offset` is the 64-bit signed delta. */
+  private def callFdSeek(inst:         ModuleInstance,
+                         fd:           Int,
+                         offset:       Long,
+                         whence:       Int,
+                         newOffsetOut: Int) =
+    inst.invoke("call_fd_seek",
+                Seq(I32(fd), I64(offset), I32(whence), I32(newOffsetOut)))
+
+  /** 2-arg `fd_filestat_get` wrapper. `buf` is the 64-byte struct
+    * destination. */
+  private def callFdFilestatGet(inst: ModuleInstance, fd: Int, buf: Int) =
+    inst.invoke("call_fd_filestat_get", Seq(I32(fd), I32(buf)))
+
+  /** Open a single-preopen InMemoryFs, store the path bytes at addr 0,
+    * open the file via `call_path_open`, and assert the returned fd is
+    * 4 (one preopen → first opened-file fd is 3 + 1). Returns the
+    * instance plus the captured collecting context so callers can keep
+    * working with it. Used by every fd_read / fd_seek / fd_filestat_get
+    * happy-path test as the common boilerplate. */
+  private def openSingleFile(files:    Map[String, Array[Byte]],
+                             pathKey:  String): (ModuleInstance, WasiContext.Collecting) =
+    val (inst, ctx) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+    storePath(inst, 0, pathKey)
+    callPathOpen(inst, dirfd = 3, pathPtr = 0,
+                 pathLen = pathKey.getBytes("UTF-8").length,
+                 openedFdOut = 64) match
+      case Right(Seq(I32(errno))) if errno == 0 => ()
+      case other => throw new AssertionError(s"openSingleFile: $other")
+    val fd = peekI32(inst, 64)
+    if fd != 4 then
+      throw new AssertionError(s"openSingleFile: expected fd 4, got $fd")
+    (inst, ctx)
 
 end WasiFsTests

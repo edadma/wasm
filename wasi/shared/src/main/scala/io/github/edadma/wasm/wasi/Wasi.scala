@@ -2,19 +2,20 @@ package io.github.edadma.wasm.wasi
 
 import scala.collection.mutable.ArrayBuffer
 
-import io.github.edadma.wasm.{HostFunc, HostModule, I32, Memory, ModuleInstance, Value, WasmError}
+import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInstance, Value, WasmError}
 
 /** WASI Preview 1 host shim for the `wasm` interpreter.
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.2 the
-  * shim resolves twelve syscalls: `fd_write`, `fd_close` (full table —
-  * stdio, preopens, opened-file fds), `proc_exit`, `args_sizes_get` /
-  * `args_get`, `environ_sizes_get` / `environ_get`, `clock_time_get`,
-  * `random_get`, `fd_prestat_get`, `fd_prestat_dir_name`, and
-  * `path_open`. Phase 7.E.3 will land the read/seek/stat trio
-  * (`fd_read` / `fd_seek` / `fd_filestat_get`).
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.3 the
+  * shim resolves fifteen syscalls: `fd_write`, `fd_read`, `fd_close`
+  * (full table — stdio, preopens, opened-file fds), `fd_seek`,
+  * `fd_filestat_get`, `proc_exit`, `args_sizes_get` / `args_get`,
+  * `environ_sizes_get` / `environ_get`, `clock_time_get`, `random_get`,
+  * `fd_prestat_get`, `fd_prestat_dir_name`, and `path_open`. The 7.E.4
+  * sub-phase is the end-to-end smoke test that boots a rustc-built
+  * `wasm32-wasip1` file-reader binary through this surface.
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -74,25 +75,47 @@ object Wasi:
     * path", ENOTCAPABLE says "you can't even ask through this preopen". */
   val ENOTCAPABLE:  Int = 76
 
-  // === File handle abstraction (Phase 7.E.2) ================================
+  // === File handle abstraction (Phase 7.E.2 + 7.E.3) ========================
 
   /** An opaque handle to an opened file, returned by
     * [[WasiContext.Preopen.open]] and stored in the per-instantiation fd
     * table that `Wasi.preview1` allocates.
     *
-    * Phase 7.E.2 ships only `close()` — the lifecycle hook. Phase 7.E.3
-    * extends the trait with `read` / `seek` / `size` for `fd_read`,
-    * `fd_seek`, and `fd_filestat_get`. Splitting the surface keeps each
-    * sub-phase's diff focused, and the 7.E.2 InMemoryFs impl already
-    * carries the bytes it would need to satisfy the 7.E.3 methods. */
+    * Phase 7.E.2 shipped `close()` only — the lifecycle hook. Phase 7.E.3
+    * added the read/seek/stat surface: `read` (host-buffer destination,
+    * returns bytes-read), `size` (total file size in bytes), `tell` (the
+    * current cursor as a wasi `filesize`), and `seek` (absolute set —
+    * whence math is done at the syscall layer because it doesn't depend
+    * on the impl). Real-FS impls in a future sub-phase can plug in
+    * against the same trait without touching the syscall layer. */
   trait FsFile:
     /** Release any host resources backing this handle. For the in-memory
       * test impl this is a no-op. Real-FS impls (a future
       * `java.nio.file`-backed `Preopen`) close their underlying handle
-      * here. Return type is `Unit` for the slim 7.E.2 surface — real-FS
-      * impls that surface close errors can refactor to
-      * `Either[Int, Unit]` later. */
+      * here. Return type is `Unit` for the slim surface — real-FS impls
+      * that surface close errors can refactor to `Either[Int, Unit]`
+      * later. */
     def close(): Unit
+
+    /** Read up to `length` bytes from the current cursor into
+      * `dst[offset .. offset + length)`. Returns the number of bytes
+      * actually written (`0` = EOF, never negative). Advances the
+      * cursor by the returned count. Impls must never read past
+      * end-of-file: when `tell ≥ size` the call returns 0 cleanly. */
+    def read(dst: Array[Byte], offset: Int, length: Int): Int
+
+    /** Total file size in bytes. Static for the lifetime of the handle
+      * at this slice — there's no write surface yet. */
+    def size: Long
+
+    /** Current cursor position in bytes. `0` immediately after `open`. */
+    def tell: Long
+
+    /** Move the cursor to an absolute byte position. Caller (the
+      * syscall layer) validates `pos ≥ 0`; POSIX (and wasi-preview1
+      * by inheritance) allows `pos > size`, in which case a subsequent
+      * `read` returns 0 without advancing further. */
+    def seek(pos: Long): Unit
 
   // === proc_exit unwind exception ===========================================
 
@@ -131,7 +154,10 @@ object Wasi:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
         "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx)),
+        "fd_read"             -> ((mem, args) => fdRead(mem, args, ctx, fdTable)),
         "fd_close"            -> ((_,   args) => fdClose(args, ctx, fdTable)),
+        "fd_seek"             -> ((mem, args) => fdSeek(mem, args, ctx, fdTable)),
+        "fd_filestat_get"     -> ((mem, args) => fdFilestatGet(mem, args, ctx, fdTable)),
         "proc_exit"           -> ((_,   args) => procExit(args)),
         "args_sizes_get"      -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
         "args_get"            -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
@@ -226,6 +252,179 @@ object Wasi:
             writeI32LE(data, nwrittenPtr, total)
             Seq(I32(ESUCCESS))
 
+      case _ => Seq(I32(EINVAL))
+
+  // === fd_read + fd_seek + fd_filestat_get (Phase 7.E.3) ====================
+  //
+  // The three remaining wasi-preview1 file syscalls a typical "read a file"
+  // program reaches for after `path_open`. `fd_read` mirrors `fd_write` —
+  // walk iovecs, but this time the file is the source and linear memory
+  // the destination. `fd_seek` does the SET/CUR/END whence math at the
+  // syscall layer (the impl just sees absolute positions via [[FsFile.seek]]).
+  // `fd_filestat_get` writes the 64-byte `__wasi_filestat_t` struct.
+  //
+  // The fd→file lookup is shared: stdio and preopens are not [[FsFile]]s
+  // (they're sinks/directories), so `fd_read` and `fd_seek` only resolve
+  // fds in the [[FdTable]]. `fd_filestat_get` is different — it answers
+  // for every valid fd in the system (stdio as CHARACTER_DEVICE, preopens
+  // as DIRECTORY, opened files as REGULAR_FILE) because `fstat` on stdio
+  // is part of any reasonable wasi-libc startup.
+
+  /** Resolve `fd` to an [[FsFile]] for the read/seek syscalls. Returns
+    * `None` for any fd in the stdio/preopen range (those aren't reading
+    * surfaces at this slice) or any fd not currently allocated in the
+    * fd table. `fd_filestat_get` does its own dispatch and does NOT use
+    * this helper. */
+  private inline def lookupFile(fd: Int, ctx: WasiContext,
+                                fdTable: FdTable): Option[FsFile] =
+    if fd < 3 + ctx.preopens.length then None else fdTable.lookup(fd)
+
+  /** `fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> errno`
+    *
+    * Walks the iovec table the same shape `fd_write` does (each entry is
+    * an i32 buf pointer followed by an i32 length), but reads from the
+    * [[FsFile]] backing `fd` and writes into linear memory at each
+    * iovec's buffer. Stops at the first short read (`n < len`) — that's
+    * EOF on the file side, and POSIX `readv` is documented to return
+    * however many bytes it managed.
+    *
+    * Errno discipline:
+    *   - `EBADF` if `fd` doesn't resolve to an opened file. stdio fds
+    *     and preopen-directory fds aren't readable through this slice
+    *     (a future stdin slice can lift fd 0 into the table).
+    *   - `EFAULT` if the iovec table, any iovec buffer, or `nread`
+    *     itself falls outside live memory. Validated up front so a
+    *     bad `nread` doesn't strand the file with an advanced cursor
+    *     and no way to report the count. */
+  private def fdRead(memory: Memory, args: Seq[Value],
+                     ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(iovsPtr), I32(iovsLen), I32(nreadPtr)) =>
+        lookupFile(fd, ctx, fdTable) match
+          case None => Seq(I32(EBADF))
+          case Some(file) =>
+            val data    = memory.data
+            val dataLen = data.length
+
+            val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
+            if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
+              return Seq(I32(EFAULT))
+            if nreadPtr < 0 || nreadPtr.toLong + 4L > dataLen then
+              return Seq(I32(EFAULT))
+
+            // Walk the iovec table. For each entry, bounds-check the
+            // destination buffer before reading; the read itself may
+            // come up short (EOF), at which point we stop walking —
+            // matches POSIX `readv` semantics.
+            var total = 0
+            var i     = 0
+            var done  = false
+            while i < iovsLen && !done do
+              val iovec = iovsPtr + i * 8
+              val buf   = readI32LE(data, iovec)
+              val len   = readI32LE(data, iovec + 4)
+              val end   = buf.toLong + len.toLong
+              if buf < 0 || len < 0 || end > dataLen then
+                return Seq(I32(EFAULT))
+              val n = file.read(data, buf, len)
+              total += n
+              if n < len then done = true
+              i += 1
+            writeI32LE(data, nreadPtr, total)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_seek(fd: i32, offset: i64, whence: i32, newoffset: i32) -> errno`
+    *
+    * Move the cursor. wasi-preview1's `whence` matches POSIX:
+    *   - 0 SET — `newpos = offset`
+    *   - 1 CUR — `newpos = tell + offset`
+    *   - 2 END — `newpos = size + offset`
+    * Any other value returns `EINVAL`. The math is done with `Long`
+    * arithmetic at the syscall layer (so `FsFile` impls don't all have
+    * to reimplement it), and a resulting negative position rejects with
+    * `EINVAL` — POSIX `lseek` semantics. POSITIVE past-end positions
+    * are accepted; subsequent reads then return 0. */
+  private def fdSeek(memory: Memory, args: Seq[Value],
+                     ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I64(offset), I32(whence), I32(newOffsetPtr)) =>
+        lookupFile(fd, ctx, fdTable) match
+          case None => Seq(I32(EBADF))
+          case Some(file) =>
+            val data    = memory.data
+            val dataLen = data.length
+            if newOffsetPtr < 0 || newOffsetPtr.toLong + 8L > dataLen then
+              return Seq(I32(EFAULT))
+            val newPos: Long = whence match
+              case 0 => offset
+              case 1 => file.tell + offset
+              case 2 => file.size + offset
+              case _ => return Seq(I32(EINVAL))
+            if newPos < 0 then return Seq(I32(EINVAL))
+            file.seek(newPos)
+            writeI64LE(data, newOffsetPtr, newPos)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_filestat_get(fd: i32, buf: i32) -> errno`
+    *
+    * Writes the 64-byte `__wasi_filestat_t` struct at `buf`. Layout
+    * (witx canonical, 8-byte-aligned fields):
+    *
+    *   off  0 : u64 dev      — device id (0 — single-device shim)
+    *   off  8 : u64 ino      — inode (0 — wasi-libc tolerates this)
+    *   off 16 : u8  filetype — see dispatch below; bytes 17..23 padding
+    *   off 24 : u64 nlink    — hard-link count (always 1 here)
+    *   off 32 : u64 size     — file size in bytes
+    *   off 40 : u64 atim     — last-access time, ns (0 here)
+    *   off 48 : u64 mtim     — last-modify time, ns (0 here)
+    *   off 56 : u64 ctim     — last-status-change time, ns (0 here)
+    *
+    * fd dispatch:
+    *   - `fd 0/1/2`               → CHARACTER_DEVICE (2), size 0
+    *   - `fd 3 .. 3 + N − 1`      → DIRECTORY        (3), size 0
+    *   - `fd ≥ 3 + N` (fd table)  → REGULAR_FILE     (4), size = file.size
+    *   - else                     → EBADF
+    *
+    * The struct is zeroed first so reserved/zero fields don't carry
+    * whatever the program last wrote at this address. */
+  private def fdFilestatGet(memory: Memory, args: Seq[Value],
+                            ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(bufPtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if bufPtr < 0 || bufPtr.toLong + 64L > dataLen then
+          return Seq(I32(EFAULT))
+
+        // Filetype + size dispatch first — we need this before touching
+        // memory so EBADF stays atomic (no half-written struct on error).
+        var filetype: Byte = 0
+        var fileSize: Long = 0L
+        if fd < 0 then return Seq(I32(EBADF))
+        else if fd <= 2 then
+          filetype = 2       // CHARACTER_DEVICE — stdio
+        else if fd - 3 < ctx.preopens.length then
+          filetype = 3       // DIRECTORY — preopen
+        else
+          fdTable.lookup(fd) match
+            case Some(file) =>
+              filetype = 4   // REGULAR_FILE — opened file
+              fileSize = file.size
+            case None => return Seq(I32(EBADF))
+
+        // Zero the whole struct, then stamp the four fields that
+        // actually carry information. Padding bytes 17..23 stay zero
+        // because we zeroed first.
+        var i = 0
+        while i < 64 do
+          data(bufPtr + i) = 0
+          i += 1
+        data(bufPtr + 16) = filetype
+        writeI64LE(data, bufPtr + 24, 1L)        // nlink
+        writeI64LE(data, bufPtr + 32, fileSize)  // size
+        Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
   // === args + environ (Phase 7.B) ===========================================
@@ -786,11 +985,28 @@ object WasiContext:
 
     /** Read-only in-memory [[Wasi.FsFile]] impl for [[inMemory]].
       * `close()` is a no-op — there's no host resource to release.
-      * Phase 7.E.3 will reach into `bytes` for `fd_read` / `fd_seek` /
-      * `fd_filestat_get` via methods added to the [[Wasi.FsFile]]
-      * trait at that slice. */
+      * The cursor starts at 0 and advances on `read`. `seek` is an
+      * unconditional set — `pos > size` is allowed (subsequent reads
+      * then return 0, matching POSIX semantics for lseek past EOF).
+      * Negative cursors can't be reached through the syscall surface
+      * (`fd_seek` rejects them with EINVAL before calling), but the
+      * `read` impl still guards against `cursor < 0` so a hand-written
+      * test that pokes the impl directly stays safe. */
     private final class InMemoryFile(val bytes: Array[Byte]) extends Wasi.FsFile:
+      private var cursor: Long = 0L
       def close(): Unit = ()
+      def size:    Long = bytes.length.toLong
+      def tell:    Long = cursor
+      def seek(pos: Long): Unit = cursor = pos
+      def read(dst: Array[Byte], offset: Int, length: Int): Int =
+        if cursor < 0 || cursor >= bytes.length || length <= 0 then 0
+        else
+          // bytes.length is Int so the remaining-bytes count fits in Int
+          // once we've ruled out cursor ≥ length above.
+          val available = math.min(bytes.length - cursor, length.toLong).toInt
+          System.arraycopy(bytes, cursor.toInt, dst, offset, available)
+          cursor += available
+          available
 
   /** A pair of clocks — wall clock and a non-decreasing monotonic source.
     * Both surfaced as nanoseconds because that's the wasi-preview1 ABI
