@@ -8,14 +8,15 @@ import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInst
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.3 the
-  * shim resolves fifteen syscalls: `fd_write`, `fd_read`, `fd_close`
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.4 the
+  * shim resolves sixteen syscalls: `fd_write`, `fd_read`, `fd_close`
   * (full table — stdio, preopens, opened-file fds), `fd_seek`,
-  * `fd_filestat_get`, `proc_exit`, `args_sizes_get` / `args_get`,
-  * `environ_sizes_get` / `environ_get`, `clock_time_get`, `random_get`,
-  * `fd_prestat_get`, `fd_prestat_dir_name`, and `path_open`. The 7.E.4
-  * sub-phase is the end-to-end smoke test that boots a rustc-built
-  * `wasm32-wasip1` file-reader binary through this surface.
+  * `fd_filestat_get`, `fd_fdstat_get`, `proc_exit`, `args_sizes_get` /
+  * `args_get`, `environ_sizes_get` / `environ_get`, `clock_time_get`,
+  * `random_get`, `fd_prestat_get`, `fd_prestat_dir_name`, and
+  * `path_open`. 7.E.4 is the end-to-end smoke test that boots a real
+  * rustc-built `wasm32-wasip1` file-reader binary through this surface;
+  * `fd_fdstat_get` was the only gap the binary surfaced.
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -158,6 +159,7 @@ object Wasi:
         "fd_close"            -> ((_,   args) => fdClose(args, ctx, fdTable)),
         "fd_seek"             -> ((mem, args) => fdSeek(mem, args, ctx, fdTable)),
         "fd_filestat_get"     -> ((mem, args) => fdFilestatGet(mem, args, ctx, fdTable)),
+        "fd_fdstat_get"       -> ((mem, args) => fdFdstatGet(mem, args, ctx, fdTable)),
         "proc_exit"           -> ((_,   args) => procExit(args)),
         "args_sizes_get"      -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
         "args_get"            -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
@@ -424,6 +426,66 @@ object Wasi:
         data(bufPtr + 16) = filetype
         writeI64LE(data, bufPtr + 24, 1L)        // nlink
         writeI64LE(data, bufPtr + 32, fileSize)  // size
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_fdstat_get(fd: i32, buf: i32) -> errno`
+    *
+    * Writes the 24-byte `__wasi_fdstat_t` struct at `buf`. wasi-libc
+    * (and therefore Rust's `std::fs`) hits this immediately after
+    * `path_open` to learn whether the new fd supports seek/tell, what
+    * flags it carries, and how broad its rights mask is. Layout:
+    *
+    *   off  0 : u8  fs_filetype           — same dispatch as fd_filestat_get
+    *   off  1 : padding (1 byte)
+    *   off  2 : u16 fs_flags              — append / nonblock / sync (all 0 here)
+    *   off  4 : padding (4 bytes)
+    *   off  8 : u64 fs_rights_base        — current rights bitmask
+    *   off 16 : u64 fs_rights_inheriting  — rights inheritable to children
+    *
+    * fd dispatch matches `fd_filestat_get`:
+    *   - `fd 0/1/2`               → CHARACTER_DEVICE (2)
+    *   - `fd 3 .. 3 + N − 1`      → DIRECTORY        (3)
+    *   - `fd ≥ 3 + N` (fd table)  → REGULAR_FILE     (4)
+    *   - else                     → EBADF
+    *
+    * `fs_flags` stays 0: the shim's [[FsFile]] surface has no APPEND /
+    * NONBLOCK / SYNC modes. Rights are deliberately permissive (all bits
+    * set) at this slice — `path_open` doesn't validate against rights
+    * yet, so giving wasi-libc a generous mask is consistent with the
+    * shim's actual capability. When `path_open` learns to gate rights,
+    * tighten these per-filetype too. */
+  private def fdFdstatGet(memory: Memory, args: Seq[Value],
+                          ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(bufPtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if bufPtr < 0 || bufPtr.toLong + 24L > dataLen then
+          return Seq(I32(EFAULT))
+
+        // Same EBADF-atomic discipline as fd_filestat_get: resolve the
+        // filetype before touching `buf` so a bad fd leaves the destination
+        // untouched.
+        var filetype: Byte = 0
+        if fd < 0 then return Seq(I32(EBADF))
+        else if fd <= 2 then
+          filetype = 2       // CHARACTER_DEVICE — stdio
+        else if fd - 3 < ctx.preopens.length then
+          filetype = 3       // DIRECTORY — preopen
+        else
+          fdTable.lookup(fd) match
+            case Some(_) => filetype = 4   // REGULAR_FILE — opened file
+            case None    => return Seq(I32(EBADF))
+
+        var i = 0
+        while i < 24 do
+          data(bufPtr + i) = 0
+          i += 1
+        data(bufPtr + 0) = filetype
+        // fs_flags @ 2..3 stays 0.
+        writeI64LE(data, bufPtr + 8,  -1L)   // fs_rights_base — full mask
+        writeI64LE(data, bufPtr + 16, -1L)   // fs_rights_inheriting — full mask
         Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 

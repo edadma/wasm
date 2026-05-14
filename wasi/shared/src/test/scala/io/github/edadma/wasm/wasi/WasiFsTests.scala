@@ -4,7 +4,7 @@ import io.github.edadma.wasm.{I32, I64, ModuleInstance}
 
 import WasiTestSupport.{check, instantiate, test}
 
-/** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3:
+/** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3 + 7.E.4:
   *
   *   - **7.E.1** wired the preopen-walk syscalls (`fd_prestat_get` and
   *     `fd_prestat_dir_name`), the two functions wasi-libc reaches for at
@@ -31,11 +31,20 @@ import WasiTestSupport.{check, instantiate, test}
   *     [[WasiContext.Preopen.inMemory]]'s `InMemoryFile` carries a
   *     cursor that read advances.
   *
+  *   - **7.E.4** added `fd_fdstat_get`, the one gap surfaced by the
+  *     real rustc-built file-reader binary (see
+  *     [[WasiRealRustTests]]). Rust's `std::fs::File::open` queries it
+  *     immediately after `path_open` to learn whether the new fd
+  *     supports Seek. Writes the 24-byte `__wasi_fdstat_t` (u8
+  *     filetype, u16 flags, two u64 rights words); filetype dispatch
+  *     matches `fd_filestat_get`, flags are zero (no APPEND/NONBLOCK),
+  *     rights are full-mask at this slice.
+  *
   * Three fixtures drive the surface: `wasi_prestat.wat` (7.E.1,
   * peek-only), `wasi_path_open.wat` (7.E.2, adds `call_path_open` /
-  * `call_fd_close` / `store_byte`), and `wasi_fd_io.wat` (7.E.3, adds
-  * `call_fd_read` / `call_fd_seek` / `call_fd_filestat_get` plus
-  * `store_i32` for planting iovec entries).
+  * `call_fd_close` / `store_byte`), and `wasi_fd_io.wat` (7.E.3 + 7.E.4,
+  * adds `call_fd_read` / `call_fd_seek` / `call_fd_filestat_get` /
+  * `call_fd_fdstat_get` plus `store_i32` for planting iovec entries).
   */
 object WasiFsTests:
 
@@ -677,6 +686,95 @@ object WasiFsTests:
         case other => check(false, s"call_fd_filestat_get: $other")
     }
 
+    // ----- fd_fdstat_get (Phase 7.E.4) ----------------------------------
+    //
+    // Surfaced as the only gap by the real rustc-built file-reader binary
+    // (wasi_real_rust_fileread): Rust's `std::fs::File::open` queries
+    // `fd_fdstat_get` immediately after `path_open` to learn whether the
+    // fd supports Seek, what its current flags are, and what rights it
+    // carries. The 24-byte `__wasi_fdstat_t` layout differs from the
+    // 64-byte filestat: u8 filetype @ 0, u16 flags @ 2, two u64 rights
+    // words @ 8 and 16.
+
+    test("fd_fdstat_get: opened file reports REGULAR_FILE + zero flags") {
+      val files = Map("hello.txt" -> "Hello, WASI!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "hello.txt")
+      callFdFdstatGet(inst, fd = 4, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_fdstat_get: $other")
+      // filetype at offset 0 — REGULAR_FILE = 4.
+      check(loadByte(inst, 512 + 0) == 4,
+            s"filetype=${loadByte(inst, 512 + 0)} (want REGULAR_FILE=4)")
+      // pad byte 1 stays 0.
+      check(loadByte(inst, 512 + 1) == 0,
+            s"pad[1]=${loadByte(inst, 512 + 1)} (want 0)")
+      // fs_flags u16 @ 2..3 — no APPEND / NONBLOCK / SYNC at this slice.
+      check(loadByte(inst, 512 + 2) == 0,
+            s"fs_flags[lo]=${loadByte(inst, 512 + 2)} (want 0)")
+      check(loadByte(inst, 512 + 3) == 0,
+            s"fs_flags[hi]=${loadByte(inst, 512 + 3)} (want 0)")
+      // Padding 4..7 stays 0 (struct aligned for the u64 that follows).
+      for off <- 4 to 7 do
+        check(loadByte(inst, 512 + off) == 0,
+              s"pad[$off]=${loadByte(inst, 512 + off)} (want 0)")
+      // fs_rights_base @ 8 + fs_rights_inheriting @ 16 — full mask
+      // (-1 == 0xFFFF_FFFF_FFFF_FFFF) at this slice; tighten when
+      // path_open learns to gate.
+      check(peekI64(inst, 512 + 8) == -1L,
+            s"fs_rights_base=${peekI64(inst, 512 + 8)} (want -1)")
+      check(peekI64(inst, 512 + 16) == -1L,
+            s"fs_rights_inheriting=${peekI64(inst, 512 + 16)} (want -1)")
+    }
+
+    test("fd_fdstat_get: preopen fd reports DIRECTORY") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      callFdFdstatGet(inst, fd = 3, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_fdstat_get: $other")
+      check(loadByte(inst, 512 + 0) == 3,
+            s"filetype=${loadByte(inst, 512 + 0)} (want DIRECTORY=3)")
+    }
+
+    test("fd_fdstat_get: stdio fds report CHARACTER_DEVICE") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq.empty)
+      for fd <- Seq(0, 1, 2) do
+        callFdFdstatGet(inst, fd, 512) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd errno=$e")
+          case other => check(false, s"call_fd_fdstat_get(fd=$fd): $other")
+        check(loadByte(inst, 512 + 0) == 2,
+              s"fd=$fd filetype=${loadByte(inst, 512 + 0)} " +
+              s"(want CHARACTER_DEVICE=2)")
+    }
+
+    test("fd_fdstat_get: EBADF on fd outside every dispatch") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      // fd 4 is past the preopen and never opened.
+      callFdFdstatGet(inst, 4, 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_fdstat_get: $other")
+      // Negative fd.
+      callFdFdstatGet(inst, -1, 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_fdstat_get(-1): $other")
+    }
+
+    test("fd_fdstat_get: EFAULT when buf+24 extends past memory") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      // 1 page = 65536; buf=65520 + 24 = 65544 > 65536.
+      callFdFdstatGet(inst, 3, 65520) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"call_fd_fdstat_get: $other")
+    }
+
   // ----- helpers ----------------------------------------------------------
 
   /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
@@ -767,6 +865,12 @@ object WasiFsTests:
                          newOffsetOut: Int) =
     inst.invoke("call_fd_seek",
                 Seq(I32(fd), I64(offset), I32(whence), I32(newOffsetOut)))
+
+  /** 2-arg `fd_fdstat_get` wrapper. `buf` is the 24-byte struct
+    * destination (`fs_filetype` at 0, `fs_flags` at 2, rights words at
+    * 8 and 16). Mirrors [[callFdFilestatGet]]'s shape. */
+  private def callFdFdstatGet(inst: ModuleInstance, fd: Int, buf: Int) =
+    inst.invoke("call_fd_fdstat_get", Seq(I32(fd), I32(buf)))
 
   /** 2-arg `fd_filestat_get` wrapper. `buf` is the 64-byte struct
     * destination. */

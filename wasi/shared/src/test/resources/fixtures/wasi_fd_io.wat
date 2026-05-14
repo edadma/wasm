@@ -1,4 +1,5 @@
-;; Phase 7.E.3 — fd_read / fd_seek / fd_filestat_get passthrough.
+;; Phase 7.E.3 + 7.E.4 — fd_read / fd_seek / fd_filestat_get / fd_fdstat_get
+;; passthrough.
 ;;
 ;; Tests open a file via call_path_open, plant iovec entries with
 ;; store_i32, drive each syscall via the matching call_* wrapper, and
@@ -25,6 +26,8 @@
     (func $fd_seek (param i32 i64 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_filestat_get"
     (func $fd_filestat_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_fdstat_get"
+    (func $fd_fdstat_get (param i32 i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -73,6 +76,12 @@
     local.get $fd
     local.get $buf
     call $fd_filestat_get)
+
+  (func (export "call_fd_fdstat_get")
+        (param $fd i32) (param $buf i32) (result i32)
+    local.get $fd
+    local.get $buf
+    call $fd_fdstat_get)
 
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)
