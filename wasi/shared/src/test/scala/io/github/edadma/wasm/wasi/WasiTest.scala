@@ -9,9 +9,11 @@ package io.github.edadma.wasm.wasi
   * Tests are split across category files so each stays focused enough
   * to read top-to-bottom:
   *
-  *   `WasiFdTests`     — fd_write, fd_close, proc_exit, Wasi.run misc
-  *   `WasiArgsTests`   — args_*, environ_*
-  *   `WasiClockTests`  — clock_time_get, random_get
+  *   `WasiFdTests`        — fd_write, fd_close, proc_exit, Wasi.run misc
+  *   `WasiArgsTests`      — args_*, environ_*
+  *   `WasiClockTests`     — clock_time_get, random_get
+  *   `WasiRealRustTests`  — end-to-end smoke against a rustc-built
+  *                          wasm32-wasip1 hello world (Phase 7.D)
   *
   * Shared state (`passed` / `failures`) and helpers live in
   * `WasiTestSupport`. `WasiTest.main` reads the totals at the end and
@@ -27,6 +29,7 @@ object WasiTest:
     WasiFdTests.run()
     WasiArgsTests.run()
     WasiClockTests.run()
+    WasiRealRustTests.run()
 
     println()
     val total = WasiTestSupport.passed + WasiTestSupport.failures.size

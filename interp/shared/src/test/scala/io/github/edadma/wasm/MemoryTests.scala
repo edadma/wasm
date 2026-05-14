@@ -14,6 +14,7 @@ object MemoryTests:
   def run(): Unit =
     baseline()
     phase4()
+    bulkMemory()
 
   // === Pre-Phase-4 baseline ===============================================
 
@@ -160,5 +161,116 @@ object MemoryTests:
       val inst = instantiate(bad)
       expectError(inst, "grow_by", Seq(I32(0))) {
         case WasmError.InvalidModule(m) => m.contains("memory.grow") && m.contains("reserved")
+      }
+    }
+
+  // === Phase 7.D: bulk-memory subset (memory.copy / memory.fill) ==========
+  //
+  // Required by rustc-emitted wasi binaries to splat / move `.rodata` blocks
+  // and zero stack frames. We only land the two memidx-zero forms; other
+  // 0xFC sub-opcodes stay UnknownOpcode until a real binary forces them.
+
+  private def bulkMemory(): Unit =
+
+    test("memory.fill: writes n bytes of v at dst") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      inst.invoke("do_fill", Seq(I32(100), I32(0xab), I32(8))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_fill: $other")
+      var i = 0
+      while i < 8 do
+        check(callI32(inst, "load_byte", 100 + i) == 0xab, s"byte[${100 + i}] should be 0xab")
+        i += 1
+      // Neighbours stay zero — fill must not bleed past `n`.
+      check(callI32(inst, "load_byte", 99)  == 0x00, "byte 99 untouched")
+      check(callI32(inst, "load_byte", 108) == 0x00, "byte 108 untouched")
+    }
+
+    test("memory.fill: n == 0 is a no-op (no bounds check beyond dst itself)") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      // dst at the very end-of-memory boundary with n=0 is permitted by the
+      // spec: only `dst + n > size` traps.
+      inst.invoke("do_fill", Seq(I32(65536), I32(0xff), I32(0))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_fill n=0 at end: $other")
+    }
+
+    test("memory.fill: only the low 8 bits of v are stored") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      inst.invoke("do_fill", Seq(I32(200), I32(0xdeadbe), I32(4))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_fill: $other")
+      var i = 0
+      while i < 4 do
+        check(callI32(inst, "load_byte", 200 + i) == 0xbe, s"byte[${200 + i}] should be 0xbe (low byte of 0xdeadbe)")
+        i += 1
+    }
+
+    test("memory.fill: dst + n > size traps MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      // 1 page = 65536. fill at 65530 with n=10 overruns by 4 bytes.
+      expectError(inst, "do_fill", Seq(I32(65530), I32(0x42), I32(10))) {
+        case WasmError.MemoryOutOfBounds => true
+      }
+    }
+
+    test("memory.copy: copies n bytes from src to dst (non-overlapping)") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      // Seed source at 0..7 = [1, 2, 3, 4, 5, 6, 7, 8].
+      var i = 0
+      while i < 8 do
+        inst.invoke("store_byte", Seq(I32(i), I32(i + 1))) match
+          case Right(Seq()) => ()
+          case other        => check(false, s"store_byte($i): $other")
+        i += 1
+      inst.invoke("do_copy", Seq(I32(100), I32(0), I32(8))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_copy: $other")
+      i = 0
+      while i < 8 do
+        check(callI32(inst, "load_byte", 100 + i) == i + 1,
+              s"dst[${100 + i}] should be ${i + 1}")
+        i += 1
+    }
+
+    test("memory.copy: forward-overlap (dst > src, regions overlap) preserves source bytes") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      // Seed 0..7 = [1, 2, 3, 4, 5, 6, 7, 8] then copy 8 bytes from 0 → 4.
+      // The spec mandates the copy happen as-if from a temp buffer, so
+      // dst bytes 4..11 should be the *original* source 0..7 bytes.
+      var i = 0
+      while i < 8 do
+        inst.invoke("store_byte", Seq(I32(i), I32(i + 1))) match
+          case Right(Seq()) => ()
+          case _            => ()
+        i += 1
+      inst.invoke("do_copy", Seq(I32(4), I32(0), I32(8))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_copy: $other")
+      i = 0
+      while i < 8 do
+        check(callI32(inst, "load_byte", 4 + i) == i + 1,
+              s"dst[${4 + i}] should be ${i + 1} (original src[$i])")
+        i += 1
+    }
+
+    test("memory.copy: n == 0 is a no-op even at memory-end boundary") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      inst.invoke("do_copy", Seq(I32(65536), I32(65536), I32(0))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_copy n=0 at end: $other")
+    }
+
+    test("memory.copy: src + n > size traps MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      expectError(inst, "do_copy", Seq(I32(0), I32(65530), I32(10))) {
+        case WasmError.MemoryOutOfBounds => true
+      }
+    }
+
+    test("memory.copy: dst + n > size traps MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.bulk_memory)
+      expectError(inst, "do_copy", Seq(I32(65530), I32(0), I32(10))) {
+        case WasmError.MemoryOutOfBounds => true
       }
     }

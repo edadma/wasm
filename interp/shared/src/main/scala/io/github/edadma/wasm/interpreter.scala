@@ -188,6 +188,25 @@ object Interpreter:
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
            0x23 | 0x24 =>                                  // global.{get,set}
         Leb128.readU32(body, pc + 1).map(_._2)
+      case 0x0e =>                                         // br_table — vec(labelidx) + default labelidx
+        // vec(u32) count, then `count` LEB u32 entries, then one more u32
+        // for the default label. Each LEB u32 is variable-length, so this
+        // must walk one at a time.
+        Leb128.readU32(body, pc + 1) match
+          case Left(e)            => Left(e)
+          case Right((count, p0)) =>
+            if count < 0 then Left(WasmError.InvalidModule(s"br_table: negative vec count $count"))
+            else
+              var i  = 0
+              var p  = p0
+              var er: WasmError = null
+              while i < count && er == null do
+                Leb128.readU32(body, p) match
+                  case Left(e)         => er = e
+                  case Right((_, np))  => p = np
+                i += 1
+              if er != null then Left(er)
+              else Leb128.readU32(body, p).map(_._2)            // default labelidx
       case 0x11 =>                                         // call_indirect — typeidx, tableidx
         for
           (_, p1) <- Leb128.readU32(body, pc + 1)
@@ -234,9 +253,29 @@ object Interpreter:
       // f32 unary + f32 numeric/min/max/copysign (0x8B–0x98), f64 unary
       // + f64 numeric (0x99–0xA6), and every numeric conversion opcode
       // (0xA7–0xBF: wrap/extend/trunc/convert/demote/promote/reinterpret).
-      // All single-byte.
-      case b if b >= 0x79 && b <= 0xbf =>
+      // 0xC0–0xC4: the sign-extension proposal (i32.extend8_s / 16_s,
+      // i64.extend8_s / 16_s / 32_s). All single-byte.
+      case b if b >= 0x79 && b <= 0xc4 =>
         Right(pc + 1)
+      case 0xfc =>
+        // 0xFC is a multibyte-opcode prefix; the sub-opcode is a LEB u32.
+        // Sub-immediates depend on the sub-opcode — only the two bulk-memory
+        // forms we currently dispatch are wired here. Anything else surfaces
+        // as `UnknownOpcode(0xFC)` so a future sub-opcode addition (memory.init,
+        // table.copy, etc.) is forced through dispatch + skipImmediates together.
+        Leb128.readU32(body, pc + 1) match
+          case Left(e)          => Left(e)
+          case Right((sub, p1)) =>
+            sub match
+              case 10 =>                                                       // memory.copy — two reserved bytes (dst, src memidx)
+                if p1 + 2 > body.length then
+                  Left(WasmError.InvalidModule("truncated memory.copy reserved bytes"))
+                else Right(p1 + 2)
+              case 11 =>                                                       // memory.fill — one reserved byte (memidx)
+                if p1 + 1 > body.length then
+                  Left(WasmError.InvalidModule("truncated memory.fill reserved byte"))
+                else Right(p1 + 1)
+              case _  => Left(WasmError.UnknownOpcode(0xfc))
       case other =>
         Left(WasmError.UnknownOpcode(other))
 
@@ -422,6 +461,29 @@ final class Interpreter private[wasm] (
         f.pc = p
         val cond = popI32()
         if cond != 0 then branchTo(n)
+
+      case 0x0e =>                                                                        // br_table L* L_default
+        // vec(labelidx) count, then `count` LEB u32 entries, then one more
+        // u32 for the default. Pop an i32 selector; if it's in [0, count)
+        // branch to vec(selector) else branch to default.
+        val (count, p0) = readU32At(f, f.pc + 1)
+        if count < 0 then fail(WasmError.InvalidModule(s"br_table: negative vec count $count"))
+        val targets = new Array[Int](count)
+        var i  = 0
+        var pp = p0
+        while i < count do
+          val (lbl, np) = readU32At(f, pp)
+          targets(i) = lbl
+          pp = np
+          i += 1
+        val (dflt, pend) = readU32At(f, pp)
+        f.pc = pend
+        val sel = popI32()
+        // Spec semantics: index is unsigned. A negative sel (sign-bit set)
+        // falls through to the default branch.
+        val branchN =
+          if sel >= 0 && sel < count then targets(sel) else dflt
+        branchTo(branchN)
 
       case 0x0f => returnFromFunction()                                                   // return
 
@@ -1133,9 +1195,76 @@ final class Interpreter private[wasm] (
         pushF64(jl.Double.longBitsToDouble(v))
         f.pc += 1
 
+      // === sign-extension proposal =======================================
+      //
+      // Five opcodes added by the post-MVP sign-extension proposal. rustc
+      // emits 0xC0 (i32.extend8_s) from `as i8 as i32`, `i64 << 56 >> 56`,
+      // etc. — common enough to land alongside MVP. All single-byte.
+
+      case 0xc0 => unop  (a => (a << 24) >> 24); f.pc += 1                                  // i32.extend8_s
+      case 0xc1 => unop  (a => (a << 16) >> 16); f.pc += 1                                  // i32.extend16_s
+      case 0xc2 => unop64(v => (v << 56) >> 56); f.pc += 1                                  // i64.extend8_s
+      case 0xc3 => unop64(v => (v << 48) >> 48); f.pc += 1                                  // i64.extend16_s
+      case 0xc4 => unop64(v => (v << 32) >> 32); f.pc += 1                                  // i64.extend32_s
+
+      // === 0xFC multibyte prefix (bulk-memory subset) ====================
+      //
+      // The 0xFC prefix family carries the bulk-memory + table proposal
+      // ops, the non-trapping (saturating) float-to-int conversions, and
+      // a handful of table ops. Only `memory.copy` (sub 10) and `memory.fill`
+      // (sub 11) are needed for the rustc-built wasi hello world; the rest
+      // remain unsupported until they actually surface in a real binary —
+      // each will land alongside its own dispatch + skipImmediates pair
+      // and regression tests.
+
+      case 0xfc =>
+        val (sub, p1) = readU32At(f, f.pc + 1)
+        sub match
+          case 10 =>                                                                        // memory.copy dst-memidx src-memidx
+            val dstMem = body(p1)     & 0xff
+            val srcMem = body(p1 + 1) & 0xff
+            if dstMem != 0 || srcMem != 0 then
+              fail(WasmError.InvalidModule(
+                s"memory.copy: non-zero reserved memidx ($dstMem, $srcMem)"))
+            f.pc = p1 + 2
+            val n   = popI32()
+            val src = popI32()
+            val dst = popI32()
+            // All three operands are wasm i32 — but the bounds check needs
+            // unsigned semantics because a high-bit-set address is a real
+            // address in the upper 2 GiB. Long arithmetic defeats wrap.
+            val nL   = n.toLong   & 0xffffffffL
+            val srcL = src.toLong & 0xffffffffL
+            val dstL = dst.toLong & 0xffffffffL
+            val len  = memory.data.length.toLong
+            if srcL + nL > len || dstL + nL > len then
+              fail(WasmError.MemoryOutOfBounds)
+            if nL > 0L then
+              // System.arraycopy handles overlapping copies correctly in both
+              // directions, matching the spec's required semantics.
+              System.arraycopy(memory.data, srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+
+          case 11 =>                                                                        // memory.fill memidx
+            val mem = body(p1) & 0xff
+            if mem != 0 then
+              fail(WasmError.InvalidModule(s"memory.fill: non-zero reserved memidx $mem"))
+            f.pc = p1 + 1
+            val n   = popI32()
+            val v   = popI32()
+            val dst = popI32()
+            val nL   = n.toLong   & 0xffffffffL
+            val dstL = dst.toLong & 0xffffffffL
+            val len  = memory.data.length.toLong
+            if dstL + nL > len then
+              fail(WasmError.MemoryOutOfBounds)
+            if nL > 0L then
+              java.util.Arrays.fill(memory.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
+
+          case _ =>
+            fail(WasmError.UnknownOpcode(0xfc))
+
       // === unsupported ===================================================
 
-      // TODO: 0x3F memory.size, 0x40 memory.grow.
       case other => fail(WasmError.UnknownOpcode(other))
 
   // === Control-flow helpers ===============================================

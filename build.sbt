@@ -57,6 +57,14 @@ def generateFixtures(outFile: File, fixturesDir: File, log: Logger, pkg: String,
   val wasmFiles = Option(fixturesDir.listFiles()).getOrElse(Array.empty[File])
     .filter(_.getName.endsWith(".wasm"))
     .sortBy(_.getName)
+  // Each `Array[Byte](b0, b1, ...)` element compiles to ~10 bytes of JVM
+  // bytecode (dup / push-index / push-value / i2b / bastore), so a 40KB
+  // fixture would generate >400KB of <clinit> bytecode and trip the 64KB
+  // method-size limit. We base64-encode each fixture as one or more string
+  // constants and decode at class-init time. Each string stays under 60K
+  // chars to keep the constant pool's per-entry UTF-8 byte budget happy
+  // (65535 bytes; base64 is ASCII so 1:1).
+  val ChunkChars = 60000
   val sb = new StringBuilder
   sb.append(s"package $pkg\n\n")
   // Note: Scala supports nested block comments, so we have to avoid producing
@@ -65,18 +73,35 @@ def generateFixtures(outFile: File, fixturesDir: File, log: Logger, pkg: String,
   sb.append("  *\n")
   sb.append("  * Do not edit by hand — change a `.wat`, run `wat2wasm` to refresh the `.wasm`,\n")
   sb.append("  * and this file rebuilds on the next `sbt compile`.\n")
+  sb.append("  *\n")
+  sb.append("  * Fixtures are stored as base64-encoded string constants (chunked into\n")
+  sb.append("  * pieces that fit a single JVM constant-pool UTF-8 entry) and decoded\n")
+  sb.append("  * once at class init via `java.util.Base64`. This avoids the 64KB JVM\n")
+  sb.append("  * method-size limit that the previous `Array[Byte](...)` literal form\n")
+  sb.append("  * hit on real-world fixtures (rustc-built wasi binaries, ~40KB+).\n")
   sb.append("  */\n")
   sb.append(s"object $obj:\n\n")
+  sb.append("  private val decoder = java.util.Base64.getDecoder\n\n")
+  sb.append("  private def decode(parts: String*): Array[Byte] =\n")
+  sb.append("    val bufs  = parts.map(decoder.decode)\n")
+  sb.append("    val total = bufs.iterator.map(_.length).sum\n")
+  sb.append("    val out   = new Array[Byte](total)\n")
+  sb.append("    var off   = 0\n")
+  sb.append("    bufs.foreach { b =>\n")
+  sb.append("      System.arraycopy(b, 0, out, off, b.length)\n")
+  sb.append("      off += b.length\n")
+  sb.append("    }\n")
+  sb.append("    out\n\n")
   wasmFiles.foreach { f =>
-    val name  = f.getName.stripSuffix(".wasm")
-    val bytes = IO.readBytes(f)
-    val hex   = bytes.iterator
-      .map { b => val u = b & 0xff; f"0x$u%02x.toByte" }
-      .grouped(12)
-      .map(_.mkString("    ", ", ", ""))
-      .mkString(",\n")
+    val name   = f.getName.stripSuffix(".wasm")
+    val bytes  = IO.readBytes(f)
+    val b64    = java.util.Base64.getEncoder.encodeToString(bytes)
+    val chunks = b64.grouped(ChunkChars).toSeq
     sb.append(s"  /** Compiled from `fixtures/$name.wat`. */\n")
-    sb.append(s"  val $name: Array[Byte] = Array[Byte](\n$hex,\n  )\n\n")
+    sb.append(s"  val $name: Array[Byte] = decode(\n")
+    val q = "\""
+    chunks.foreach(c => sb.append("    " + q + c + q + ",\n"))
+    sb.append("  )\n\n")
   }
   IO.write(outFile, sb.toString)
   log.info(s"wrote ${outFile.getName} (${wasmFiles.length} fixtures)")

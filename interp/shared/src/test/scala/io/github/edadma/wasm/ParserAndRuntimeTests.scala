@@ -220,12 +220,12 @@ object ParserAndRuntimeTests:
     test("interpreter: 0x12 (reserved, post-call_indirect) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x12), 0x12, "0x12 (reserved)")
     }
-    // Retargeted from 0x76 (formerly i32.shr_u, now supported in Phase 1.5)
-    // to 0xC4 — a reserved byte with no MVP meaning, and not the lead byte
-    // of any prefixed instruction set we currently parse. Same code path,
-    // same expected typed error.
-    test("interpreter: 0xC4 (unassigned in MVP) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc4), 0xc4, "0xC4 (reserved)")
+    // Retargeted from 0xC4 (now i64.extend32_s in the sign-extension proposal,
+    // Phase 7.D) to 0xC5 — also reserved, no MVP meaning, and not a prefix
+    // byte of any instruction set we currently parse. Same code path through
+    // `skipImmediates`'s default branch.
+    test("interpreter: 0xC5 (unassigned) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc5), 0xc5, "0xC5 (reserved)")
     }
     // Retargeted from 0x3F / 0x40 (formerly memory.size / memory.grow,
     // now supported in Phase 4) to 0x06 and 0x07 — both belong to the
@@ -289,6 +289,27 @@ object ParserAndRuntimeTests:
       expectError(inst, "test_br", Seq(I32(1))) {
         case WasmError.InvalidModule(msg) => msg.contains("branch index")
       }
+    }
+
+    // === Phase 7.D: br_table (0x0E) =====================================
+    //
+    // Indexed jump used by `match` ladders in rustc-emitted binaries. Selector
+    // in [0, count) picks vec(selector); anything outside (including negative)
+    // falls through to the default label.
+
+    test("br_table: in-range selectors pick the expected branch") {
+      val inst = instantiate(Fixtures.br_table)
+      check(callI32(inst, "select", 0) == 10, "sel=0 → branch 0")
+      check(callI32(inst, "select", 1) == 20, "sel=1 → branch 1")
+      check(callI32(inst, "select", 2) == 30, "sel=2 → branch 2")
+    }
+
+    test("br_table: out-of-range selectors hit the default branch") {
+      val inst = instantiate(Fixtures.br_table)
+      check(callI32(inst, "select", 3)         == 99, "sel=3 (just past vec) → default")
+      check(callI32(inst, "select", 999)       == 99, "sel=999 → default")
+      check(callI32(inst, "select", -1)        == 99, "sel=-1 (unsigned: huge) → default")
+      check(callI32(inst, "select", Int.MinValue) == 99, "sel=Int.MinValue → default")
     }
 
     test("runtime: local.get with out-of-range index returns InvalidModule") {

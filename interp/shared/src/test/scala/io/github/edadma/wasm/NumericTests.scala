@@ -19,6 +19,7 @@ object NumericTests:
     f32Tests()
     f64Tests()
     conversionTests()
+    signExtensionTests()
 
   // === i32 baseline =======================================================
 
@@ -1174,4 +1175,59 @@ object NumericTests:
       // -0 stays distinct from +0 after a round-trip (sign bit preserved).
       check(callI32V(inst, "i32_reinterpret_f32", F32(-0.0f)) == Int.MinValue,  "f32 -0 -> 0x80000000")
       check(callI64(inst, "i64_reinterpret_f64", F64(-0.0))   == Long.MinValue, "f64 -0 -> sign bit only")
+    }
+
+  // === Phase 7.D: sign-extension proposal (0xC0–0xC4) =====================
+  //
+  // rustc emits `i32.extend8_s` for `as i8 as i32` and friends. The five
+  // ops all reinterpret the low N bits of their operand as a signed N-bit
+  // integer and sign-extend to the operand's full width. No traps.
+
+  private def signExtensionTests(): Unit =
+
+    test("i32.extend8_s: low 8 bits sign-extend into i32") {
+      val inst = instantiate(Fixtures.sign_extend)
+      check(callI32(inst, "i32_extend8_s", 0x00) ==  0,    "0 stays 0")
+      check(callI32(inst, "i32_extend8_s", 0x7f) ==  127,  "max positive byte")
+      check(callI32(inst, "i32_extend8_s", 0x80) == -128,  "min negative byte (high bit set)")
+      check(callI32(inst, "i32_extend8_s", 0xff) == -1,    "0xff → -1")
+      // High bits above the low byte are ignored — that's the whole point.
+      check(callI32(inst, "i32_extend8_s", 0xdeadbe80.toInt) == -128, "high bits dropped")
+    }
+
+    test("i32.extend16_s: low 16 bits sign-extend into i32") {
+      val inst = instantiate(Fixtures.sign_extend)
+      check(callI32(inst, "i32_extend16_s", 0x0000) == 0,         "0 stays 0")
+      check(callI32(inst, "i32_extend16_s", 0x7fff) == 32767,     "max positive short")
+      check(callI32(inst, "i32_extend16_s", 0x8000) == -32768,    "min negative short")
+      check(callI32(inst, "i32_extend16_s", 0xffff) == -1,        "0xffff → -1")
+      check(callI32(inst, "i32_extend16_s", 0xdead8000.toInt) == -32768, "high bits dropped")
+    }
+
+    test("i64.extend8_s: low 8 bits sign-extend into i64") {
+      val inst = instantiate(Fixtures.sign_extend)
+      check(callI64(inst, "i64_extend8_s", I64(0x00L)) ==  0L,    "0 stays 0")
+      check(callI64(inst, "i64_extend8_s", I64(0x7fL)) ==  127L,  "max positive byte")
+      check(callI64(inst, "i64_extend8_s", I64(0x80L)) == -128L,  "min negative byte")
+      check(callI64(inst, "i64_extend8_s", I64(0xffL)) == -1L,    "0xff → -1")
+      check(callI64(inst, "i64_extend8_s", I64(0xdeadbeefcafe1234L)) == 0x34, "high bits dropped (0x34 is positive)")
+    }
+
+    test("i64.extend16_s: low 16 bits sign-extend into i64") {
+      val inst = instantiate(Fixtures.sign_extend)
+      check(callI64(inst, "i64_extend16_s", I64(0x0000L)) ==  0L,     "0 stays 0")
+      check(callI64(inst, "i64_extend16_s", I64(0x7fffL)) ==  32767L, "max positive short")
+      check(callI64(inst, "i64_extend16_s", I64(0x8000L)) == -32768L, "min negative short")
+      check(callI64(inst, "i64_extend16_s", I64(0xffffL)) == -1L,     "0xffff → -1")
+    }
+
+    test("i64.extend32_s: low 32 bits sign-extend into i64") {
+      val inst = instantiate(Fixtures.sign_extend)
+      check(callI64(inst, "i64_extend32_s", I64(0x00000000L)) ==  0L,           "0 stays 0")
+      check(callI64(inst, "i64_extend32_s", I64(0x7fffffffL)) ==  2147483647L,  "max positive i32")
+      check(callI64(inst, "i64_extend32_s", I64(0x80000000L)) == -2147483648L,  "min negative i32")
+      check(callI64(inst, "i64_extend32_s", I64(0xffffffffL)) == -1L,           "all-ones low 32 → -1")
+      // High 32 bits get clobbered by the sign bit:
+      check(callI64(inst, "i64_extend32_s", I64(0xdeadbeef80000000L)) == 0xffffffff80000000L,
+            "high 32 bits replaced by sign extension of low 32")
     }
