@@ -50,6 +50,7 @@ object InterpreterTest:
     MultiMemoryTests.run()
     TypedSelectTests.run()
     HostMultiMemoryTests.run()
+    SimdConstTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

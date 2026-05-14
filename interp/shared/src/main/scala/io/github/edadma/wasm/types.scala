@@ -15,6 +15,23 @@ final case class I64(value: Long)   extends Value
 final case class F32(value: Float)  extends Value
 final case class F64(value: Double) extends Value
 
+/** A 128-bit SIMD vector — the lane-shape (i8x16, i16x8, ..., f64x2) is
+  * chosen per-opcode, not per-value, so we keep the raw 16-byte payload
+  * here and let each lane-aware op pick the right interpretation.
+  *
+  * Byte order is little-endian per the SIMD proposal — lane 0 of any
+  * shape starts at byte 0. The `bits.length` invariant is always 16;
+  * the constructor doesn't enforce it, but every interpreter path that
+  * produces a V128 satisfies it (parser `v128.const` reads 16 bytes,
+  * arithmetic ops allocate `new Array[Byte](16)`).
+  *
+  * Equality uses `Array[Byte]` reference equality through `equals` —
+  * `V128(a) == V128(b)` is true iff `a eq b`. Host-side callers that
+  * want value-equality should compare the byte arrays directly. The
+  * tests reach into `.bits` rather than relying on `==`.
+  */
+final case class V128(bits: Array[Byte]) extends Value
+
 /** A typed null reference. `refType` distinguishes a funcref-null from an
   * externref-null, since the spec's `ref.is_null` is polymorphic over both
   * but `table.set` is not (an externref-null can't go into a funcref table).
@@ -60,6 +77,9 @@ enum ValueType:
   case F64Type
   case FuncRefType
   case ExternRefType
+  /** SIMD v128 (Phase 8.E). Wire byte `0x7B`. Joins the four scalar +
+    * two reference value types as a first-class operand. */
+  case V128Type
 
 object ValueType:
   /** Convert a [[RefType]] into the matching `ValueType`. The validator's

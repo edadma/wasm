@@ -4,7 +4,7 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), and the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
+The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0), and the **foundations of the SIMD proposal** (`V128` value type plumbed end-to-end + `v128.const`; lane-aware ops landing chunk-by-chunk through 8.E). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
 ## Numeric (full MVP, all four scalar types)
 
@@ -87,6 +87,18 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 - **Untyped `select`** (`0x1B`) — operand types are inferred. Spec-restricted to numeric value types when reference types are present; a reftype operand is rejected at validation with a "use select t*" diagnostic.
 - **Typed `select t*`** (`0x1C`) — explicit operand type, encoded as `0x1C u32:count valtype[count]` with `count == 1` (multi-value `select` isn't enabled by any shipped proposal). Required for funcref / externref operands; also accepts the four numeric scalars.
 
+## SIMD (Phase 8.E, in progress)
+
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunk A (foundations + `v128.const`) is shipped.** Chunks B..I add the lane-aware load/store, splat/extract/replace, integer and float arithmetic, comparisons, conversions, and the special dot/lane ops.
+
+### Foundations (Chunk A — done)
+
+- **`V128` value type** (wire byte `0x7B`). First-class in function params, results, locals, globals, and blocktypes. Locals zero-init to 16 zero bytes.
+- **`v128.const`** (`0xFD 0x0C` + 16 raw little-endian bytes). The wat-side annotations (`i32x4 1 2 3 4`, `i16x8 ...`, etc.) are text-form only; the binary just sees 16 opaque bytes.
+- **0xFD prefix dispatch** — the SIMD sub-opcode is LEB-encoded. Currently only `v128.const` (sub 12) is implemented; other sub-opcodes surface as `UnknownOpcode(0xFD)`.
+
+Tests cover raw byte round-trips, parameter / local / block-result plumbing, zero-init, and the wat-form lane-annotation equivalence (`v128.const i8x16` and `v128.const i16x8` of the same byte payload produce identical V128 values).
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -102,7 +114,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD (v128) | every `v128.*` opcode, `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | not yet (8.E) |
+| SIMD remainder | every `v128.*` opcode except `v128.const`, plus `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | in progress (8.E, chunks B..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |

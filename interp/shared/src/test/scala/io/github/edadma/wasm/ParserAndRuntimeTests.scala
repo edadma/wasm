@@ -617,18 +617,19 @@ object ParserAndRuntimeTests:
 
   private def regressions(): Unit =
 
-    test("regression: unsupported blocktype (0x7B) returns InvalidModule, not RuntimeException") {
+    test("regression: unsupported blocktype (0x71) returns InvalidModule, not RuntimeException") {
       // Bug: `Interpreter.readBlocktype` threw `RuntimeException` for any
       // blocktype other than 0x40 / 0x7F, bypassing the WasmError discipline.
       // Fixed to `Left(InvalidModule(...))` so the pre-scan reports it cleanly.
       //
       // The fixture's block declares an i32 result (`0x02 0x7F`); we patch the
       // blocktype byte to a still-unsupported value. The original repro bytes
-      // 0x7E (i64), 0x7D (f32) and 0x7C (f64) are all valid blocktypes now,
-      // so the regression test has been retargeted through each phase to the
-      // latest genuinely-unsupported form. 0x7B is in the negative-s33
-      // valtype range and not assigned by the MVP — same code path, same
-      // expected typed error.
+      // 0x7E (i64), 0x7D (f32), 0x7C (f64) and 0x7B (v128) are all valid
+      // blocktypes now after their respective phases landed, so the regression
+      // test has been retargeted through each phase to the latest genuinely-
+      // unsupported form. 0x71 is high-bit-clear, decoded as SLEB 113; the
+      // fixture has only 1 type, so the typeidx-out-of-range path returns
+      // the same typed-error class — same code path, same expected typed error.
       val src = Fixtures.block_result
       val pat = b(0x02, 0x7f)
       var idx = -1
@@ -637,7 +638,7 @@ object ParserAndRuntimeTests:
         if src(i) == pat(0) && src(i + 1) == pat(1) then idx = i
         i += 1
       check(idx >= 0, "block + i32-blocktype pattern not found")
-      val bad = patchByte(src, idx + 1, 0x7b)            // blocktype byte → unsupported
+      val bad = patchByte(src, idx + 1, 0x71)            // blocktype byte → unsupported
       Runtime.instantiate(bad, Seq(EnvModule.default)) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("blocktype"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(blocktype), got $other")

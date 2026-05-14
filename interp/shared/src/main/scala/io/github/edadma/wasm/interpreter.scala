@@ -243,6 +243,8 @@ object Interpreter:
       // and `(block (result externref))` are both legal.
       case 0x70 => Right((BlockSig(0, 1), pos + 1))            // funcref result
       case 0x6f => Right((BlockSig(0, 1), pos + 1))            // externref result
+      // Phase 8.E: v128 result blocktype.
+      case 0x7b => Right((BlockSig(0, 1), pos + 1))            // v128 result
       case _ =>
         // Multi-value form: signed LEB128 typeidx (the spec says s33;
         // readS32 is sufficient because any plausible typeidx fits well
@@ -426,6 +428,21 @@ object Interpreter:
                   case Left(e)      => Left(e)
                   case Right((_, p2)) => Right(p2)
               case _  => Left(WasmError.UnknownOpcode(0xfc))
+      case 0xfd =>
+        // 0xFD is the SIMD opcode prefix (Phase 8.E). Sub-opcode is LEB
+        // u32. Chunk A only handles `v128.const` (sub 12), with a 16-
+        // byte raw-literal immediate after the sub-opcode. Subsequent
+        // chunks will fan this out as the surface grows.
+        Leb128.readU32(body, pc + 1) match
+          case Left(e)          => Left(e)
+          case Right((sub, p1)) =>
+            sub match
+              case 12 =>                                                        // v128.const : 16 raw bytes
+                val end = p1 + 16
+                if end > body.length then
+                  Left(WasmError.InvalidModule(s"truncated v128.const literal at $pc"))
+                else Right(end)
+              case _ => Left(WasmError.UnknownOpcode(0xfd))
       case other =>
         Left(WasmError.UnknownOpcode(other))
 
@@ -1463,6 +1480,17 @@ final class Interpreter private[wasm] (
         f.pc = p
         valueStack += RefFunc(idx)
 
+      // === Phase 8.E: SIMD prefix ========================================
+      //
+      // 0xFD introduces the SIMD opcode family. Sub-opcodes are LEB-
+      // encoded (one byte in practice for every opcode the spec defines
+      // today). Extracted into a separate stepFd method from day 1 — the
+      // SIMD proposal adds ~236 opcodes and would otherwise push `step`
+      // past the JVM's 64KB method ceiling almost immediately. Pattern
+      // mirrors `stepFc`'s extraction.
+      case 0xfd =>
+        stepFd(f)
+
       // === unsupported ===================================================
 
       case other => fail(WasmError.UnknownOpcode(other))
@@ -1730,6 +1758,37 @@ final class Interpreter private[wasm] (
       case _ =>
         fail(WasmError.UnknownOpcode(0xfc))
 
+  /** Dispatch one 0xFD sub-opcode (SIMD). Sub-opcode is LEB-encoded;
+    * the spec assigns ~236 opcodes across this prefix. Extracted from
+    * `step` from day 1 of Phase 8.E because the cumulative arms would
+    * push the parent past the JVM's 64KB method ceiling within a few
+    * chunks. Same structural pattern as `stepFc`.
+    *
+    * Chunk A: only `v128.const` (sub 12) is implemented. Subsequent
+    * chunks add the lane-load/store family (B), splat/extract/replace
+    * (C), arithmetic (D-F), bitwise + comparisons (G), conversions
+    * (H), and the special dot/lane ops (I). Unknown sub-opcodes fall
+    * through to `UnknownOpcode(0xfd)`.
+    */
+  private def stepFd(f: Frame): Unit =
+    val body = f.func.body
+    val (sub, p1) = readU32At(f, f.pc + 1)
+    sub match
+      case 12 =>                                                                          // v128.const
+        // Encoding: 0xFD 0x0C followed by 16 raw bytes (little-endian).
+        // The wat-side `i32x4 1 2 3 4` is just an annotation — the
+        // binary form is always 16 opaque bytes.
+        val end = p1 + 16
+        if end > body.length then
+          fail(WasmError.InvalidModule(s"truncated v128.const literal at ${f.pc}"))
+        val bits = new Array[Byte](16)
+        System.arraycopy(body, p1, bits, 0, 16)
+        f.pc = end
+        valueStack += V128(bits)
+
+      case _ =>
+        fail(WasmError.UnknownOpcode(0xfd))
+
   // === Control-flow helpers ===============================================
 
   private def branchTo(n: Int): Unit =
@@ -1820,6 +1879,8 @@ final class Interpreter private[wasm] (
             case ValueType.F64Type       => F64(0.0)
             case ValueType.FuncRefType   => RefNull(RefType.FuncRef)
             case ValueType.ExternRefType => RefNull(RefType.ExternRef)
+            // Phase 8.E: v128 locals zero-init to 16 zero bytes.
+            case ValueType.V128Type      => V128(new Array[Byte](16))
           j += 1
         frames += new Frame(wf, locals, stackBase = valueStack.size)
 
