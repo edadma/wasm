@@ -26,10 +26,14 @@ import java.lang as jl
   *   - D: 29 integer-arithmetic ops (abs / neg / add / sub / mul /
   *     saturating / avgr_u across i8x16, i16x8, i32x4, i64x2 —
   *     subs 0x60..0x7B, 0x80..0x9B, 0xA0..0xB5, 0xC0..0xD5).
+  *   - E: 24 shift + min/max ops (shl / shr_s / shr_u on all four
+  *     integer shapes; min/max _s/_u on i8x16, i16x8, i32x4 — subs
+  *     0x6B..0x6D / 0x76..0x79, 0x8B..0x8D / 0x96..0x99, 0xAB..0xAD /
+  *     0xB6..0xB9, 0xCB..0xCD).
   *
-  * Chunks remaining: E (shifts + min/max), F (float arithmetic),
-  * G (bitwise + comparisons + reductions), H (narrow/widen + float
-  * conversions), I (special — dot product + load_lane / store_lane).
+  * Chunks remaining: F (float arithmetic), G (bitwise + comparisons +
+  * reductions), H (narrow/widen + float conversions), I (special —
+  * dot product + load_lane / store_lane).
   * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
@@ -465,6 +469,166 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(i64x2BinOp(a, b, (x, y) => x * y))
 
+      // === Chunk E — shifts + min/max =========================================
+      //
+      // Shifts pop an i32 count first (top of stack), then a v128 base.
+      // The shift count is taken `cnt mod lane_width` per the spec, so
+      // `i8x16.shl(_, 8)` is the identity. `shl` is signedness-irrelevant
+      // (the low bits of the result match either way); `shr_s` needs the
+      // signed lane reader; `shr_u` needs the zero-extending lane reader
+      // (`i8x16UnOpU` / `i16x8UnOpU`, added next to the chunk-D helpers).
+      // For i32x4 / i64x2 the lane already fits a Java Int / Long, so
+      // Java's `>>>` is logical for free.
+      //
+      // Min/max are per-lane signed (`_s`) or unsigned (`_u`) min or max.
+      // i8x16 / i16x8 reuse the chunk-D `BinOpS` / `BinOpU` helpers; i32x4
+      // has no zero-extending wide-lane reader (Int is already wide), so
+      // the unsigned variants compare with `jl.Integer.compareUnsigned`
+      // inside the lambda. i64x2 has no min/max — the SIMD spec excludes
+      // them (i32x4 is the widest shape with min/max).
+
+      // --- i8x16 --------------------------------------------------------------
+
+      case 0x6B =>                                                                        // i8x16.shl
+        val cnt = popI32() & 7
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpS(a, x => x << cnt))
+
+      case 0x6C =>                                                                        // i8x16.shr_s
+        val cnt = popI32() & 7
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpS(a, x => x >> cnt))
+
+      case 0x6D =>                                                                        // i8x16.shr_u
+        val cnt = popI32() & 7
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpU(a, x => x >>> cnt))
+
+      case 0x76 =>                                                                        // i8x16.min_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) => if x < y then x else y))
+
+      case 0x77 =>                                                                        // i8x16.min_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpU(a, b, (x, y) => if x < y then x else y))
+
+      case 0x78 =>                                                                        // i8x16.max_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) => if x > y then x else y))
+
+      case 0x79 =>                                                                        // i8x16.max_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpU(a, b, (x, y) => if x > y then x else y))
+
+      // --- i16x8 --------------------------------------------------------------
+
+      case 0x8B =>                                                                        // i16x8.shl
+        val cnt = popI32() & 15
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8UnOpS(a, x => x << cnt))
+
+      case 0x8C =>                                                                        // i16x8.shr_s
+        val cnt = popI32() & 15
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8UnOpS(a, x => x >> cnt))
+
+      case 0x8D =>                                                                        // i16x8.shr_u
+        val cnt = popI32() & 15
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8UnOpU(a, x => x >>> cnt))
+
+      case 0x96 =>                                                                        // i16x8.min_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) => if x < y then x else y))
+
+      case 0x97 =>                                                                        // i16x8.min_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpU(a, b, (x, y) => if x < y then x else y))
+
+      case 0x98 =>                                                                        // i16x8.max_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) => if x > y then x else y))
+
+      case 0x99 =>                                                                        // i16x8.max_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpU(a, b, (x, y) => if x > y then x else y))
+
+      // --- i32x4 --------------------------------------------------------------
+
+      case 0xAB =>                                                                        // i32x4.shl
+        val cnt = popI32() & 31
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, x => x << cnt))
+
+      case 0xAC =>                                                                        // i32x4.shr_s
+        val cnt = popI32() & 31
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, x => x >> cnt))
+
+      case 0xAD =>                                                                        // i32x4.shr_u
+        val cnt = popI32() & 31
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, x => x >>> cnt))
+
+      case 0xB6 =>                                                                        // i32x4.min_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) => if x < y then x else y))
+
+      case 0xB7 =>                                                                        // i32x4.min_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) =>
+          if jl.Integer.compareUnsigned(x, y) < 0 then x else y))
+
+      case 0xB8 =>                                                                        // i32x4.max_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) => if x > y then x else y))
+
+      case 0xB9 =>                                                                        // i32x4.max_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) =>
+          if jl.Integer.compareUnsigned(x, y) > 0 then x else y))
+
+      // --- i64x2 (shifts only; no min/max in the SIMD spec) -------------------
+
+      case 0xCB =>                                                                        // i64x2.shl
+        val cnt = popI32() & 63
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, x => x << cnt))
+
+      case 0xCC =>                                                                        // i64x2.shr_s
+        val cnt = popI32() & 63
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, x => x >> cnt))
+
+      case 0xCD =>                                                                        // i64x2.shr_u
+        val cnt = popI32() & 63
+        val a   = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, x => x >>> cnt))
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -612,6 +776,18 @@ private[wasm] trait SimdDispatch:
       i += 1
     r
 
+  /** Zero-extending unary op on each i8 lane (operand 0..255). Used by
+    * `i8x16.shr_u`, where the lane bits must be zero-extended before the
+    * logical right shift; the signed reader would propagate the sign bit
+    * into the high bits and give the wrong low-byte result. */
+  private def i8x16UnOpU(a: Array[Byte], op: Int => Int): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = op(a(i) & 0xff).toByte
+      i += 1
+    r
+
   /** Sign-extending unary op on each i16 lane. */
   private def i16x8UnOpS(a: Array[Byte], op: Int => Int): Array[Byte] =
     val r  = new Array[Byte](16)
@@ -641,6 +817,17 @@ private[wasm] trait SimdDispatch:
       val au = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
       val bu = (b(ln * 2) & 0xff) | ((b(ln * 2 + 1) & 0xff) << 8)
       writeLaneI16(r, ln, op(au, bu))
+      ln += 1
+    r
+
+  /** Zero-extending unary op on each i16 lane (operand 0..65535). Used by
+    * `i16x8.shr_u` for the same reason `i8x16UnOpU` is needed. */
+  private def i16x8UnOpU(a: Array[Byte], op: Int => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val au = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, op(au))
       ln += 1
     r
 
@@ -779,6 +966,18 @@ private[wasm] object SimdDispatch:
            0x8E | 0x8F | 0x90 | 0x91 | 0x92 | 0x93 | 0x95 | 0x9B |                // i16x8  add/sub/sat/mul/avgr
            0xA0 | 0xA1 | 0xAE | 0xB1 | 0xB5 |                                     // i32x4  abs/neg/add/sub/mul
            0xC0 | 0xC1 | 0xCE | 0xD1 | 0xD5 =>                                    // i64x2  abs/neg/add/sub/mul
+        Right(p1)
+
+      // Chunk E — shifts + min/max. Shifts read the i32 count from the
+      // operand stack (not an immediate), min/max are v128×v128 → v128.
+      // Either way, nothing follows the sub-opcode byte.
+      case 0x6B | 0x6C | 0x6D |                                                   // i8x16  shl / shr_s / shr_u
+           0x76 | 0x77 | 0x78 | 0x79 |                                            // i8x16  min/max  _s/_u
+           0x8B | 0x8C | 0x8D |                                                   // i16x8  shl / shr_s / shr_u
+           0x96 | 0x97 | 0x98 | 0x99 |                                            // i16x8  min/max  _s/_u
+           0xAB | 0xAC | 0xAD |                                                   // i32x4  shl / shr_s / shr_u
+           0xB6 | 0xB7 | 0xB8 | 0xB9 |                                            // i32x4  min/max  _s/_u
+           0xCB | 0xCC | 0xCD =>                                                  // i64x2  shl / shr_s / shr_u
         Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))

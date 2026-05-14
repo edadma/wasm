@@ -983,6 +983,25 @@ object Validator:
                0xCE | 0xD1 | 0xD5 =>                                              // i64x2
             binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
 
+          // --- Chunk E — shifts + min/max -----------------------------
+          //
+          // Shifts have shape `(v128, i32) → v128` — the shift count is
+          // a regular operand-stack i32, NOT an immediate (note the
+          // mismatch with skipImmediates, which sees no operand past the
+          // sub-opcode because the i32 lives on the stack). Min/max are
+          // the same `(v128, v128) → v128` shape as chunk-D binaries.
+
+          case 0x6B | 0x6C | 0x6D |                                               // i8x16 shl / shr_s / shr_u
+               0x8B | 0x8C | 0x8D |                                               // i16x8 shl / shr_s / shr_u
+               0xAB | 0xAC | 0xAD |                                               // i32x4 shl / shr_s / shr_u
+               0xCB | 0xCC | 0xCD =>                                              // i64x2 shl / shr_s / shr_u
+            binop(ValueType.V128Type, ValueType.I32Type, ValueType.V128Type)
+
+          case 0x76 | 0x77 | 0x78 | 0x79 |                                        // i8x16 min/max _s/_u
+               0x96 | 0x97 | 0x98 | 0x99 |                                        // i16x8 min/max _s/_u
+               0xB6 | 0xB7 | 0xB8 | 0xB9 =>                                       // i32x4 min/max _s/_u
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
