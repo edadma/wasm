@@ -598,6 +598,18 @@ object Validator:
       case 0xfc =>
         val sub = readU32()
         sub match
+          // sub 0..3 pop the float type and push i32; sub 4..7 push i64.
+          // No further immediates. Float source: f32 for sub 0/1/4/5,
+          // f64 for sub 2/3/6/7. Signedness (s/u) doesn't change the
+          // stack shape — same float in, same int out.
+          case 0 => unop(ValueType.F32Type, ValueType.I32Type)                  // i32.trunc_sat_f32_s
+          case 1 => unop(ValueType.F32Type, ValueType.I32Type)                  // i32.trunc_sat_f32_u
+          case 2 => unop(ValueType.F64Type, ValueType.I32Type)                  // i32.trunc_sat_f64_s
+          case 3 => unop(ValueType.F64Type, ValueType.I32Type)                  // i32.trunc_sat_f64_u
+          case 4 => unop(ValueType.F32Type, ValueType.I64Type)                  // i64.trunc_sat_f32_s
+          case 5 => unop(ValueType.F32Type, ValueType.I64Type)                  // i64.trunc_sat_f32_u
+          case 6 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_s
+          case 7 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_u
           case 10 =>                                                            // memory.copy
             requireMemory("memory.copy")
             if pc + 2 > body.length then

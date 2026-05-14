@@ -303,14 +303,19 @@ object Interpreter:
         Right(pc + 1)
       case 0xfc =>
         // 0xFC is a multibyte-opcode prefix; the sub-opcode is a LEB u32.
-        // Sub-immediates depend on the sub-opcode — only the two bulk-memory
-        // forms we currently dispatch are wired here. Anything else surfaces
-        // as `UnknownOpcode(0xFC)` so a future sub-opcode addition (memory.init,
-        // table.copy, etc.) is forced through dispatch + skipImmediates together.
+        // Sub 0..7 are the non-trapping (saturating) float→int conversions
+        // from the trunc_sat proposal — single-LEB encoding, no further
+        // immediates. Sub 10/11 are the two bulk-memory forms (memory.copy
+        // / memory.fill) which carry reserved memidx bytes. Anything else
+        // surfaces as `UnknownOpcode(0xFC)` so a future sub-opcode addition
+        // (memory.init, table.copy, etc.) is forced through dispatch +
+        // skipImmediates together.
         Leb128.readU32(body, pc + 1) match
           case Left(e)          => Left(e)
           case Right((sub, p1)) =>
             sub match
+              case s if s >= 0 && s <= 7 =>                                    // i32/i64.trunc_sat_{f32,f64}_{s,u}
+                Right(p1)
               case 10 =>                                                       // memory.copy — two reserved bytes (dst, src memidx)
                 if p1 + 2 > body.length then
                   Left(WasmError.InvalidModule("truncated memory.copy reserved bytes"))
@@ -1264,19 +1269,116 @@ final class Interpreter private[wasm] (
       case 0xc3 => unop64(v => (v << 48) >> 48); f.pc += 1                                  // i64.extend16_s
       case 0xc4 => unop64(v => (v << 32) >> 32); f.pc += 1                                  // i64.extend32_s
 
-      // === 0xFC multibyte prefix (bulk-memory subset) ====================
+      // === 0xFC multibyte prefix (trunc_sat + bulk-memory subset) ========
       //
       // The 0xFC prefix family carries the bulk-memory + table proposal
-      // ops, the non-trapping (saturating) float-to-int conversions, and
-      // a handful of table ops. Only `memory.copy` (sub 10) and `memory.fill`
-      // (sub 11) are needed for the rustc-built wasi hello world; the rest
-      // remain unsupported until they actually surface in a real binary —
-      // each will land alongside its own dispatch + skipImmediates pair
-      // and regression tests.
+      // ops and the non-trapping (saturating) float-to-int conversions.
+      // Sub 0..7 are trunc_sat (Phase 8.A); sub 10/11 are memory.copy /
+      // memory.fill (Phase 7.B); the remaining bulk-memory + table ops
+      // (memory.init, data.drop, table.copy, table.init, elem.drop) stay
+      // UnknownOpcode until they surface in a real binary — each will land
+      // alongside its own dispatch + skipImmediates pair and regression tests.
+      //
+      // === trunc_sat semantics (all 8) ===
+      //   NaN              → 0
+      //   v < INT_MIN      → INT_MIN   (signed)   /   0       (unsigned)
+      //   v > INT_MAX      → INT_MAX
+      //   otherwise        → truncate toward zero
+      // The boundary values used here mirror the trapping versions
+      // (0xA8..0xAB, 0xAE..0xB1) — Float can represent ±2^31 / ±2^63 / 2^32
+      // / 2^64 exactly (all powers of 2), so the strict-`>=` upper-bound and
+      // strict-`<` (signed) / `<= -1` (unsigned) lower-bound conventions
+      // pick out exactly the in-range half-open interval. For
+      // i64.trunc_sat_*_u in [2^63, 2^64), the bit-splice trick (subtract
+      // 2^63, convert, OR back the sign bit) mirrors the trapping version
+      // because Java's `Float.toLong` clamps to Long.MaxValue for values
+      // past 2^63.
 
       case 0xfc =>
         val (sub, p1) = readU32At(f, f.pc + 1)
         sub match
+          case 0 =>                                                                         // i32.trunc_sat_f32_s
+            val v = popF32()
+            val r =
+              if jl.Float.isNaN(v)              then 0
+              else if v < -2147483648.0f        then Int.MinValue
+              else if v >=  2147483648.0f       then Int.MaxValue
+              else                                   v.toInt
+            pushI32(r)
+            f.pc = p1
+
+          case 1 =>                                                                         // i32.trunc_sat_f32_u
+            val v = popF32()
+            val r =
+              if jl.Float.isNaN(v)              then 0
+              else if v <= -1.0f                then 0
+              else if v >=  4294967296.0f       then -1                                    // 0xFFFFFFFF as signed Int
+              else                                   v.toLong.toInt
+            pushI32(r)
+            f.pc = p1
+
+          case 2 =>                                                                         // i32.trunc_sat_f64_s
+            val v = popF64()
+            val r =
+              if jl.Double.isNaN(v)             then 0
+              else if v < -2147483648.0         then Int.MinValue
+              else if v >=  2147483648.0        then Int.MaxValue
+              else                                   v.toInt
+            pushI32(r)
+            f.pc = p1
+
+          case 3 =>                                                                         // i32.trunc_sat_f64_u
+            val v = popF64()
+            val r =
+              if jl.Double.isNaN(v)             then 0
+              else if v <= -1.0                 then 0
+              else if v >=  4294967296.0        then -1
+              else                                   v.toLong.toInt
+            pushI32(r)
+            f.pc = p1
+
+          case 4 =>                                                                         // i64.trunc_sat_f32_s
+            val v = popF32()
+            val r =
+              if jl.Float.isNaN(v)              then 0L
+              else if v < -9223372036854775808.0f  then Long.MinValue
+              else if v >=  9223372036854775808.0f then Long.MaxValue
+              else                                   v.toLong
+            pushI64(r)
+            f.pc = p1
+
+          case 5 =>                                                                         // i64.trunc_sat_f32_u
+            val v = popF32()
+            val r =
+              if jl.Float.isNaN(v)              then 0L
+              else if v <= -1.0f                then 0L
+              else if v >= 18446744073709551616.0f then -1L                                // UInt64.MaxValue
+              else if v < 9223372036854775808.0f   then v.toLong
+              else (v - 9223372036854775808.0f).toLong | Long.MinValue
+            pushI64(r)
+            f.pc = p1
+
+          case 6 =>                                                                         // i64.trunc_sat_f64_s
+            val v = popF64()
+            val r =
+              if jl.Double.isNaN(v)             then 0L
+              else if v < -9223372036854775808.0  then Long.MinValue
+              else if v >=  9223372036854775808.0 then Long.MaxValue
+              else                                   v.toLong
+            pushI64(r)
+            f.pc = p1
+
+          case 7 =>                                                                         // i64.trunc_sat_f64_u
+            val v = popF64()
+            val r =
+              if jl.Double.isNaN(v)             then 0L
+              else if v <= -1.0                 then 0L
+              else if v >= 18446744073709551616.0 then -1L
+              else if v < 9223372036854775808.0   then v.toLong
+              else (v - 9223372036854775808.0).toLong | Long.MinValue
+            pushI64(r)
+            f.pc = p1
+
           case 10 =>                                                                        // memory.copy dst-memidx src-memidx
             val dstMem = body(p1)     & 0xff
             val srcMem = body(p1 + 1) & 0xff

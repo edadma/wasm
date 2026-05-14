@@ -1085,6 +1085,106 @@ object NumericTests:
       }
     }
 
+    // === Phase 8.A: non-trapping (saturating) float→int conversions =======
+    //
+    // Same input domains as the trapping versions (0xA8..0xAB, 0xAE..0xB1),
+    // but instead of raising `InvalidModule("... NaN")` /
+    // `InvalidModule("out of range")` they clamp:
+    //   NaN              → 0
+    //   v < MIN          → MIN  (signed) / 0   (unsigned)
+    //   v > MAX          → MAX
+    //   in-range         → truncate toward zero (same as the trapping form)
+    // One export per sub-opcode in `trunc_sat.wat`; each test pins the
+    // four saturation paths plus an in-range positive truncation.
+
+    test("conv: i32.trunc_sat_f32_s — saturates instead of trapping") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32(Float.NaN))               == 0,            "NaN -> 0")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32(Float.PositiveInfinity))  == Int.MaxValue, "+Inf -> MAX")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32(Float.NegativeInfinity))  == Int.MinValue, "-Inf -> MIN")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32( 2147483648.0f))          == Int.MaxValue, "exactly 2^31 -> MAX")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32(-2147483904.0f))          == Int.MinValue, "below MIN -> MIN")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32(-1.9f))                   == -1,           "-1.9 truncates to -1")
+      check(callI32V(inst, "i32_trunc_sat_f32_s", F32( 1.9f))                   ==  1,           " 1.9 truncates to  1")
+    }
+
+    test("conv: i32.trunc_sat_f32_u — saturates to [0, 2^32)") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(Float.NaN))               ==  0, "NaN -> 0")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(Float.NegativeInfinity))  ==  0, "-Inf -> 0")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(-1.0f))                   ==  0, "-1.0 -> 0 (boundary)")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(-0.5f))                   ==  0, "-0.5 -> 0 (in range, trunc to 0)")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(Float.PositiveInfinity))  == -1, "+Inf -> 0xFFFFFFFF")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(4294967296.0f))           == -1, "exactly 2^32 -> 0xFFFFFFFF")
+      check(callI32V(inst, "i32_trunc_sat_f32_u", F32(2147483648.0f))           == Int.MinValue, "2^31 -> bit pattern 0x80000000")
+    }
+
+    test("conv: i32.trunc_sat_f64_s — same shape, f64 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64(Double.NaN))              == 0,            "NaN -> 0")
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64(Double.PositiveInfinity)) == Int.MaxValue, "+Inf -> MAX")
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64(Double.NegativeInfinity)) == Int.MinValue, "-Inf -> MIN")
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64( 2147483648.0))           == Int.MaxValue, "exactly 2^31 -> MAX")
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64(-2147483649.0))           == Int.MinValue, "below MIN -> MIN")
+      check(callI32V(inst, "i32_trunc_sat_f64_s", F64( 12345.678))              == 12345,        "in-range truncates")
+    }
+
+    test("conv: i32.trunc_sat_f64_u — same shape, f64 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64(Double.NaN))              ==  0, "NaN -> 0")
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64(-1.0))                    ==  0, "-1.0 -> 0 (boundary)")
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64(Double.PositiveInfinity)) == -1, "+Inf -> 0xFFFFFFFF")
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64( 4294967296.0))           == -1, "exactly 2^32 -> 0xFFFFFFFF")
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64( 4294967295.0))           == -1, "2^32-1 fits as 0xFFFFFFFF")
+      check(callI32V(inst, "i32_trunc_sat_f64_u", F64(-0.5))                    ==  0, "-0.5 -> 0 (in range)")
+    }
+
+    test("conv: i64.trunc_sat_f32_s — i64 saturation, f32 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32(Float.NaN))                == 0L,            "NaN -> 0")
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32(Float.PositiveInfinity))   == Long.MaxValue, "+Inf -> MAX")
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32(Float.NegativeInfinity))   == Long.MinValue, "-Inf -> MIN")
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32( 9223372036854775808.0f))  == Long.MaxValue, "exactly 2^63 -> MAX")
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32(-9223372036854775808.0f))  == Long.MinValue, "exactly -2^63 -> MIN exact")
+      check(callI64(inst, "i64_trunc_sat_f32_s", F32( 100.5f))                  == 100L,          "100.5 -> 100")
+    }
+
+    test("conv: i64.trunc_sat_f32_u — i64 saturation [0, 2^64), f32 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI64(inst, "i64_trunc_sat_f32_u", F32(Float.NaN))                ==  0L, "NaN -> 0")
+      check(callI64(inst, "i64_trunc_sat_f32_u", F32(-1.0f))                    ==  0L, "-1.0 -> 0 (boundary)")
+      check(callI64(inst, "i64_trunc_sat_f32_u", F32(Float.PositiveInfinity))   == -1L, "+Inf -> UINT64_MAX")
+      check(callI64(inst, "i64_trunc_sat_f32_u", F32(18446744073709551616.0f))  == -1L, "exactly 2^64 -> UINT64_MAX")
+      // 1.0e18 sits comfortably in [0, 2^63) — the bit-splice path is not used.
+      check(jl.Long.compareUnsigned(callI64(inst, "i64_trunc_sat_f32_u", F32(1.0e18f)), 0L) > 0,
+            "1e18 -> positive unsigned i64")
+      // 1.0e19 > 2^63, so the bit-splice trick activates. Bit pattern must be high-bit-set.
+      check(callI64(inst, "i64_trunc_sat_f32_u", F32(1.0e19f)) < 0L,
+            "1e19 -> high-bit-set i64 (unsigned > 2^63)")
+    }
+
+    test("conv: i64.trunc_sat_f64_s — i64 saturation, f64 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64(Double.NaN))               == 0L,            "NaN -> 0")
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64(Double.PositiveInfinity))  == Long.MaxValue, "+Inf -> MAX")
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64(Double.NegativeInfinity))  == Long.MinValue, "-Inf -> MIN")
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64( 9223372036854775808.0))   == Long.MaxValue, "exactly 2^63 -> MAX")
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64(Long.MinValue.toDouble))   == Long.MinValue, "Long.MIN exact")
+      check(callI64(inst, "i64_trunc_sat_f64_s", F64(-1.5))                     == -1L,           "-1.5 -> -1 (toward 0)")
+    }
+
+    test("conv: i64.trunc_sat_f64_u — i64 saturation [0, 2^64), f64 source") {
+      val inst = instantiate(Fixtures.trunc_sat)
+      check(callI64(inst, "i64_trunc_sat_f64_u", F64(Double.NaN))               ==  0L, "NaN -> 0")
+      check(callI64(inst, "i64_trunc_sat_f64_u", F64(-1.0))                     ==  0L, "-1.0 -> 0 (boundary)")
+      check(callI64(inst, "i64_trunc_sat_f64_u", F64(Double.PositiveInfinity))  == -1L, "+Inf -> UINT64_MAX")
+      check(callI64(inst, "i64_trunc_sat_f64_u", F64(18446744073709551616.0))   == -1L, "exactly 2^64 -> UINT64_MAX")
+      // 1.8e19 is < 2^64 but > 2^63 — bit-splice trick is exercised.
+      val r = callI64(inst, "i64_trunc_sat_f64_u", F64(1.8e19))
+      check(jl.Long.compareUnsigned(r, 0L) > 0,    "1.8e19 -> positive unsigned i64")
+      check(jl.Long.compareUnsigned(r, -1L) <= 0,  "still <= UINT64_MAX")
+    }
+
     test("conv: f32.convert_i32_s / _u — signed and unsigned agree on positives, diverge on negatives") {
       val inst = instantiate(Fixtures.conv_convert)
       check(callF32(inst, "f32_convert_i32_s", I32(1))             ==  1.0f, "1 -> 1")
