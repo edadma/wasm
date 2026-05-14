@@ -371,20 +371,30 @@ object Validator:
       if pc + n > body.length then fail(s"truncated immediate of $n bytes")
       pc += n
 
-    /** Consume an `align` + `offset` LEB pair (every memory op). The
-      * values are ignored by the type-check (alignment is dynamic,
-      * offset doesn't affect typing) — we only need to advance pc. */
-    def skipMemArg(): Unit =
-      readU32(); readU32()
+    /** Read + validate one memarg (every load/store op). Phase 8.D: the
+      * alignment LEB carries a bit-6 "memidx-present" flag; when set, a
+      * memidx LEB follows. The validator range-checks the memidx against
+      * the module's memory count. Alignment + offset values are ignored
+      * by the type check (alignment is dynamic, offset doesn't affect
+      * typing) — we just advance pc. */
+    def skipMemArg(label: String): Unit =
+      val alignFlag = readU32()
+      val memIdx =
+        if (alignFlag & 0x40) != 0 then readU32()
+        else 0
+      if memIdx < 0 || memIdx >= memoryCount then
+        fail(s"$label: memidx $memIdx out of range (have $memoryCount memories)")
+      readU32() // offset (discarded)
       ()
 
-    /** Consume one reserved byte (memory.size / memory.grow).
-      * Non-zero indicates multi-memory, which the MVP doesn't model. */
-    def skipReservedByte(label: String): Unit =
-      if pc >= body.length then fail(s"truncated $label reserved byte")
-      val b = body(pc) & 0xff
-      if b != 0 then fail(s"$label: non-zero reserved byte 0x${b.toHexString}")
-      pc += 1
+    /** Read + validate a single memidx LEB immediate. Phase 8.D-shaped
+      * replacement for the MVP's "skip one must-be-zero reserved byte" —
+      * memory.size, memory.grow, memory.fill, and (the second immediate
+      * of) memory.init all take this shape. */
+    def readAndValidateMemIdx(label: String): Unit =
+      val m = readU32()
+      if m < 0 || m >= memoryCount then
+        fail(s"$label: memidx $m out of range (have $memoryCount memories)")
 
     // --- walker ----
 
@@ -634,13 +644,13 @@ object Validator:
       case 0x3a | 0x3b => memStore(ValueType.I32Type)                           // i32.store{8,16}
       case 0x3c | 0x3d | 0x3e => memStore(ValueType.I64Type)                    // i64.store{8,16,32}
 
-      case 0x3f =>                                                              // memory.size
+      case 0x3f =>                                                              // memory.size memidx
         requireMemory("memory.size")
-        skipReservedByte("memory.size")
+        readAndValidateMemIdx("memory.size")
         pushVal(ValueType.I32Type)
-      case 0x40 =>                                                              // memory.grow
+      case 0x40 =>                                                              // memory.grow memidx
         requireMemory("memory.grow")
-        skipReservedByte("memory.grow")
+        readAndValidateMemIdx("memory.grow")
         popVal(ValueType.I32Type)
         pushVal(ValueType.I32Type)
 
@@ -734,19 +744,16 @@ object Validator:
           case 5 => unop(ValueType.F32Type, ValueType.I64Type)                  // i64.trunc_sat_f32_u
           case 6 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_s
           case 7 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_u
-          case 8 =>                                                             // memory.init dataidx, memidx-reserved-byte
+          case 8 =>                                                             // memory.init dataidx, memidx
             requireMemory("memory.init")
             if !dataCountPresent then
               fail("memory.init requires a Data Count section (Section 12)")
             val dataIdx = readU32()
             if dataIdx < 0 || dataIdx >= dataSegmentCount then
               fail(s"memory.init: data index $dataIdx out of range (have $dataSegmentCount segments)")
-            if pc + 1 > body.length then
-              fail("truncated memory.init reserved memidx byte")
-            val mem = body(pc) & 0xff
-            if mem != 0 then
-              fail(s"memory.init: non-zero reserved memidx byte 0x${mem.toHexString}")
-            pc += 1
+            // Phase 8.D: second immediate is a memidx LEB (was a must-be-
+            // zero reserved byte pre-multi-memory).
+            readAndValidateMemIdx("memory.init")
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // src (offset into data segment)
             popVal(ValueType.I32Type)                                           // dst (offset into memory)
@@ -756,26 +763,18 @@ object Validator:
             val dataIdx = readU32()
             if dataIdx < 0 || dataIdx >= dataSegmentCount then
               fail(s"data.drop: data index $dataIdx out of range (have $dataSegmentCount segments)")
-          case 10 =>                                                            // memory.copy
+          case 10 =>                                                            // memory.copy dst-memidx src-memidx
             requireMemory("memory.copy")
-            if pc + 2 > body.length then
-              fail("truncated memory.copy reserved bytes")
-            val a = body(pc) & 0xff
-            val b = body(pc + 1) & 0xff
-            if a != 0 || b != 0 then
-              fail(s"memory.copy: non-zero reserved bytes 0x${a.toHexString} 0x${b.toHexString}")
-            pc += 2
+            // Phase 8.D: two memidx LEBs (dst, src) instead of two reserved
+            // bytes. Each must be in-range.
+            readAndValidateMemIdx("memory.copy dst")
+            readAndValidateMemIdx("memory.copy src")
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // src
             popVal(ValueType.I32Type)                                           // dst
-          case 11 =>                                                            // memory.fill
+          case 11 =>                                                            // memory.fill memidx
             requireMemory("memory.fill")
-            if pc + 1 > body.length then
-              fail("truncated memory.fill reserved byte")
-            val r = body(pc) & 0xff
-            if r != 0 then
-              fail(s"memory.fill: non-zero reserved byte 0x${r.toHexString}")
-            pc += 1
+            readAndValidateMemIdx("memory.fill")
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // value
             popVal(ValueType.I32Type)                                           // dst
@@ -852,17 +851,19 @@ object Validator:
       popVal(a)
       pushVal(out)
 
-    /** Walk a memory load: addr=i32 → result type. Memory must exist. */
+    /** Walk a memory load: addr=i32 → result type. Memory must exist;
+      * the memarg's memidx must be in range (Phase 8.D). */
     def memLoad(out: ValueType): Unit =
       requireMemory("memory load")
-      skipMemArg()
+      skipMemArg("memory load")
       popVal(ValueType.I32Type)
       pushVal(out)
 
-    /** Walk a memory store: addr=i32, value=t. Memory must exist. */
+    /** Walk a memory store: addr=i32, value=t. Memory must exist;
+      * the memarg's memidx must be in range. */
     def memStore(t: ValueType): Unit =
       requireMemory("memory store")
-      skipMemArg()
+      skipMemArg("memory store")
       popVal(t)
       popVal(ValueType.I32Type)
 

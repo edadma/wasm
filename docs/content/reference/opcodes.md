@@ -4,7 +4,7 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), and the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
+The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`), and the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
 ## Numeric (full MVP, all four scalar types)
 
@@ -84,13 +84,21 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 `drop`, `select`. The untyped `select` (`0x1B`) is spec-restricted to numeric value types when reference types are present — the typed `select t*` (`0x1C`) is on the 8.C follow-up list (no real-world emitter hits it today).
 
-## What isn't implemented yet
+## Multi-memory (Phase 8.D)
 
-The Phase-8 menu after reference types:
+Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
+
+- **Load/store memarg** — Phase 8.D repurposes bit 6 of the alignment LEB as a "memidx-present" flag. When set, a memidx LEB follows; alignment is the LEB with that bit cleared. Single-memory modules emit the MVP shape (no flag, memidx = 0 implicit).
+- **`memory.size` / `memory.grow` / `memory.fill`** — the byte that was a must-be-zero reserved slot becomes a memidx LEB.
+- **`memory.copy`** — two memidx LEBs (dst, src), allowing memory-to-memory copies between distinct memories.
+- **`memory.init`** — second immediate is a memidx LEB (was reserved).
+
+`ModuleInstance.memories: Array[Memory]` exposes the full vector; `.memory` keeps backwards compat returning memory 0. `.exportedMemory(name)` resolves an exported memory by name.
+
+## What isn't implemented yet
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| Multi-memory | every memory opcode with a non-zero memory index | not yet (8.D) |
 | Typed select | `select t*` (`0x1C`) | not yet (8.C follow-up) |
 | SIMD (v128) | every `v128.*` opcode, `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | not yet (8.E) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |

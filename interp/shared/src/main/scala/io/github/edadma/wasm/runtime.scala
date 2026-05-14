@@ -22,13 +22,19 @@ import scala.collection.mutable.ArrayBuffer
   */
 final class ModuleInstance private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
-    val memory: Memory,
+    /** Linear memories, indexed by memidx. Phase 8.D promotes this from a
+      * single `Memory` to an `Array[Memory]` so multi-memory modules work
+      * end-to-end. Backwards-compat: `.memory` returns the first entry (or
+      * a zero-page placeholder if the module has none), keeping the
+      * existing public API + WASI shim contract intact. */
+    val memories: Array[Memory],
     private val globals: Array[Value],
     private val globalMutable: Array[Boolean],
     private val tables: Array[RuntimeTable],
     private val types: Vector[FuncType],
     private val exportFuncs: Map[String, Int],
     private val exportGlobals: Map[String, Int],
+    private val exportMemories: Map[String, Int],
     // Phase 8.B: bulk-memory state. Both `dataBytes`/`dataDropped` and
     // `elemRefs`/`elemDropped` persist across `invoke` calls — `data.drop`
     // / `elem.drop` flips bits that subsequent `memory.init` / `table.init`
@@ -40,6 +46,15 @@ final class ModuleInstance private[wasm] (
     private val elemDropped: Array[Boolean],
 ):
 
+  /** Public access to memory 0. Most callers only have one memory (the
+    * single-memory MVP shape) and don't need to distinguish; for those
+    * this stays the friendly accessor it always was. Multi-memory modules
+    * should reach for `.memories` directly. If the module has *no*
+    * memory, returns a zero-page placeholder so callers don't have to
+    * handle Option themselves. */
+  val memory: Memory =
+    if memories.length > 0 then memories(0) else new Memory(0)
+
   /** Invoke an exported function. Each call gets a fresh interpreter so
     * memory, globals, and tables persist across calls but the value/call
     * stacks don't. */
@@ -47,7 +62,7 @@ final class ModuleInstance private[wasm] (
     exportFuncs.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => new Interpreter(
-        funcs, memory, globals, globalMutable, tables, types,
+        funcs, memories, globals, globalMutable, tables, types,
         dataBytes, dataDropped, elemRefs, elemDropped,
       ).invoke(idx, args)
 
@@ -68,6 +83,15 @@ final class ModuleInstance private[wasm] (
     exportGlobals.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(globals(idx))
+
+  /** Look up an exported memory by name. Phase 8.D surface: most modules
+    * export a single `"memory"` and the existing `.memory` accessor
+    * suffices; multi-memory modules can iterate `.memories` and
+    * cross-reference names through this map. */
+  def exportedMemory(name: String): Either[WasmError, Memory] =
+    exportMemories.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(memories(idx))
 
 /** A runtime-side table. The MVP shape was `Array[Int]` (funcidx, or -1
   * for null). Phase 8.C generalises slots to typed [[Value]]s — `RefNull`
@@ -181,25 +205,32 @@ object Runtime:
       )
     }
 
-    // === memory =============================================================
-    // The MVP allows at most one memory; we still keep the conditional so an
-    // empty `memories` vector instantiates as a zero-page memory (some tools
-    // emit modules that never declare one when no `i32.load`/`i32.store` is
-    // present). The declared max — when supplied — is threaded into the
-    // `Memory` so `memory.grow` returns -1 verbatim on overflow rather than
-    // resizing past the host's intent.
-    val pages    = if module.memories.nonEmpty then module.memories.head.min else 0
-    val maxPages = if module.memories.nonEmpty then module.memories.head.max else None
-    if pages < 0 || pages.toLong * Memory.PageSize > Int.MaxValue then
-      fail(WasmError.InvalidModule(s"unsupported memory size: $pages pages"))
-    val memory = new Memory(pages, maxPages)
+    // === memories ===========================================================
+    // Phase 8.D: surface multiple memories per module. The MVP shape was a
+    // single memory (any module without a memory section still got an
+    // implicit zero-page placeholder so `i32.load`/`i32.store` validation
+    // wouldn't crash); we keep that placeholder behaviour for zero-memory
+    // modules and otherwise allocate one `Memory` per binary entry.
+    val memories =
+      if module.memories.isEmpty then Array(new Memory(0))
+      else
+        val arr = new Array[Memory](module.memories.size)
+        var mi = 0
+        while mi < module.memories.size do
+          val ml = module.memories(mi)
+          if ml.min < 0 || ml.min.toLong * Memory.PageSize > Int.MaxValue then
+            fail(WasmError.InvalidModule(s"memory $mi: unsupported size ${ml.min} pages"))
+          arr(mi) = new Memory(ml.min, ml.max)
+          mi += 1
+        arr
 
     // === data segments =====================================================
-    // Active segments copy into memory at instantiation as they did before
-    // Phase 8.B; post-init they're marked "dropped" so subsequent
+    // Active segments copy into their target memory at instantiation as they
+    // did before Phase 8.B; post-init they're marked "dropped" so subsequent
     // `memory.init` with n > 0 traps OOB (the spec models this as the
     // segment's byte vector becoming empty). Passive segments keep their
-    // bytes addressable as dataidx until `data.drop` flips the bit.
+    // bytes addressable as dataidx until `data.drop` flips the bit. Phase
+    // 8.D: active segments may target any memidx, not just memory 0.
     //
     // We store BOTH kinds in the same `dataBytes` array indexed by dataidx
     // so the interpreter doesn't have to translate between the binary's
@@ -211,12 +242,14 @@ object Runtime:
     while di < nData do
       module.data(di) match
         case DataSegment.Active(memIdx, offset, bytes) =>
-          if memIdx != 0 then
+          // Multi-memory modules can target memidx ≥ 1; range-check.
+          if memIdx < 0 || memIdx >= memories.length then
             fail(WasmError.InvalidModule(
-              s"active data segment $di: memIdx=$memIdx (multi-memory not supported yet)"))
-          val end = offset.toLong + bytes.length
-          if offset < 0 || end > memory.size then fail(WasmError.MemoryOutOfBounds)
-          System.arraycopy(bytes, 0, memory.data, offset, bytes.length)
+              s"active data segment $di: memidx $memIdx out of range (have ${memories.length} memories)"))
+          val targetMem = memories(memIdx)
+          val end       = offset.toLong + bytes.length
+          if offset < 0 || end > targetMem.size then fail(WasmError.MemoryOutOfBounds)
+          System.arraycopy(bytes, 0, targetMem.data, offset, bytes.length)
           dataBytes(di)   = bytes
           dataDropped(di) = true                                            // active = "dropped right after init"
         case DataSegment.Passive(bytes) =>
@@ -339,6 +372,15 @@ object Runtime:
         name -> idx
     }.toMap
 
+    // Phase 8.D: surface MemoryExport so multi-memory modules can name
+    // each memory and the host can pull them back out by name.
+    val exportMemories: Map[String, Int] = module.exports.iterator.collect {
+      case MemoryExport(name, idx) =>
+        if idx < 0 || idx >= memories.length then
+          fail(WasmError.InvalidModule(s"export `$name` references invalid memory $idx"))
+        name -> idx
+    }.toMap
+
     // Validate any TableExport indices up front. Phase 3 doesn't ship a
     // host-side `tableValue` accessor (the surface is internal to
     // `call_indirect`), but a bogus index in the binary should still
@@ -371,7 +413,7 @@ object Runtime:
         fail(WasmError.InvalidModule(
           s"start: function $startIdx has signature $sig, expected () -> ()"))
       val interp = new Interpreter(
-        funcs.toIndexedSeq, memory, globals, globalMutable, tables, module.types,
+        funcs.toIndexedSeq, memories, globals, globalMutable, tables, module.types,
         dataBytes, dataDropped, elemRefs, elemDropped,
       )
       interp.invoke(startIdx, Seq.empty) match
@@ -381,13 +423,14 @@ object Runtime:
 
     new ModuleInstance(
       funcs.toIndexedSeq,
-      memory,
+      memories,
       globals,
       globalMutable,
       tables,
       module.types,
       exportFuncs,
       exportGlobals,
+      exportMemories,
       dataBytes,
       dataDropped,
       elemRefs,

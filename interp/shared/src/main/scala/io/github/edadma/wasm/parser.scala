@@ -272,8 +272,8 @@ object Parser:
       kind match
         case 0x00 => out += FuncExport(name, idx)
         case 0x01 => out += TableExport(name, idx)
+        case 0x02 => out += MemoryExport(name, idx)
         case 0x03 => out += GlobalExport(name, idx)
-        case 0x02 => () // memory — silently ignored until Phase 4 surfaces it
         case other => fail(WasmError.InvalidModule(s"unknown export kind 0x${other.toHexString}"))
       i += 1
     out.toVector
