@@ -4,7 +4,7 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`), and the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
+The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), and the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
 ## Numeric (full MVP, all four scalar types)
 
@@ -82,7 +82,10 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## Stack
 
-`drop`, `select`. The untyped `select` (`0x1B`) is spec-restricted to numeric value types when reference types are present — the typed `select t*` (`0x1C`) is on the 8.C follow-up list (no real-world emitter hits it today).
+`drop`, `select`. Two `select` forms:
+
+- **Untyped `select`** (`0x1B`) — operand types are inferred. Spec-restricted to numeric value types when reference types are present; a reftype operand is rejected at validation with a "use select t*" diagnostic.
+- **Typed `select t*`** (`0x1C`) — explicit operand type, encoded as `0x1C u32:count valtype[count]` with `count == 1` (multi-value `select` isn't enabled by any shipped proposal). Required for funcref / externref operands; also accepts the four numeric scalars.
 
 ## Multi-memory (Phase 8.D)
 
@@ -99,7 +102,6 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| Typed select | `select t*` (`0x1C`) | not yet (8.C follow-up) |
 | SIMD (v128) | every `v128.*` opcode, `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | not yet (8.E) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |

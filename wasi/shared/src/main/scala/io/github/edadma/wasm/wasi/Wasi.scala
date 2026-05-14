@@ -292,7 +292,7 @@ object Wasi:
     val fdTable = new FdTable(ctx.preopens.length)
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
-      val functions: Map[String, HostFunc] = Map(
+      override val functions: Map[String, HostFunc] = Map(
         "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx, fdTable)),
         "fd_read"             -> ((mem, args) => fdRead(mem, args, ctx, fdTable)),
         "fd_close"            -> ((_,   args) => fdClose(args, ctx, fdTable)),

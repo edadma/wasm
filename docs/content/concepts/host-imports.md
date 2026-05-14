@@ -9,12 +9,16 @@ WebAssembly modules can declare imports — functions provided by the host. The 
 ```scala
 trait HostModule:
   def name: String
-  def functions: Map[String, HostFunc]
+  def functions:      Map[String, HostFunc]      = Map.empty
+  def functionsMulti: Map[String, HostFuncMulti] = Map.empty
 
-type HostFunc = (Memory, Seq[Value]) => Seq[Value]
+type HostFunc      = (Memory,             Seq[Value]) => Seq[Value]
+type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
 ```
 
-Each `HostFunc` takes the guest's `Memory` instance (so the host can read the guest's linear memory directly), a sequence of `Value` arguments matching the import's declared signature, and returns a sequence of `Value` results matching the import's declared results. Pure functions, no `Future` / `IO` wrapping.
+A `HostFunc` takes the guest's `Memory` instance (memidx 0) plus a sequence of `Value` arguments matching the import's declared signature, and returns a sequence of `Value` results matching the import's declared results. Pure functions, no `Future` / `IO` wrapping.
+
+A `HostFuncMulti` takes the guest's full vector of memories (length ≥ 1) instead of just memidx 0 — useful only for multi-memory modules (the multi-memory proposal landed in Phase 8.D). Single-memory programs should stay on `HostFunc`; multi-memory hosts that need to inspect or write a non-zero memidx use `HostFuncMulti`. A name registered in *both* maps resolves to the multi-memory form.
 
 ## EnvModule.default
 
@@ -107,3 +111,25 @@ The host-import surface is deliberately a `Map[String, HostFunc]` of dynamically
 - **Multi-platform shared code.** The same `HostModule` definition compiles for JVM, Scala.js, and Scala Native without `@JSExport` / `@ExportTopLevel` annotations — the `Value` types are platform-agnostic.
 
 For a stronger-typed wrapper, a separate `wasm-bindgen`-style library could be layered on top without touching the `interp` core.
+
+## Multi-memory host functions
+
+When a guest module declares more than one linear memory (a multi-memory proposal feature; see [Opcodes → Multi-memory](/reference/opcodes/)), `HostFunc` only gets a handle to memidx 0. Register through `functionsMulti` instead to receive the whole `IndexedSeq[Memory]`:
+
+```scala
+import io.github.edadma.wasm.*
+
+object DualBuffer extends HostModule:
+  def name: String = "dual"
+
+  override def functionsMulti: Map[String, HostFuncMulti] = Map(
+    // Copies one byte from mem0 into mem1 at the same offset.
+    "mirror" -> { (mems: IndexedSeq[Memory], args: Seq[Value]) =>
+      val I32(addr) +: _ = args: @unchecked
+      mems(1).data(addr) = mems(0).data(addr)
+      Seq.empty
+    },
+  )
+```
+
+The vector is always length ≥ 1 — zero-memory modules get a synthetic placeholder at index 0 so `mems.head` is safe to dereference. Single-memory `HostFunc` registrations continue to work unchanged against single-memory modules; the runtime wraps them at import-resolution time so they always see `mems.head`.

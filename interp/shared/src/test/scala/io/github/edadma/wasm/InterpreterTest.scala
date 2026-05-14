@@ -48,6 +48,8 @@ object InterpreterTest:
     MultiValueAndStartTests.run()
     RefTypesTests.run()
     MultiMemoryTests.run()
+    TypedSelectTests.run()
+    HostMultiMemoryTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size
