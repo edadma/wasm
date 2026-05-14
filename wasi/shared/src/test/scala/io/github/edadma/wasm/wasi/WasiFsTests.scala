@@ -708,7 +708,7 @@ object WasiFsTests:
     // 64-byte filestat: u8 filetype @ 0, u16 flags @ 2, two u64 rights
     // words @ 8 and 16.
 
-    test("fd_fdstat_get: opened file reports REGULAR_FILE + zero flags") {
+    test("fd_fdstat_get: opened file reports REGULAR_FILE + per-filetype rights") {
       val files = Map("hello.txt" -> "Hello, WASI!".getBytes("UTF-8"))
       val (inst, _) = openSingleFile(files, "hello.txt")
       callFdFdstatGet(inst, fd = 4, buf = 512) match
@@ -730,16 +730,18 @@ object WasiFsTests:
       for off <- 4 to 7 do
         check(loadByte(inst, 512 + off) == 0,
               s"pad[$off]=${loadByte(inst, 512 + off)} (want 0)")
-      // fs_rights_base @ 8 + fs_rights_inheriting @ 16 — full mask
-      // (-1 == 0xFFFF_FFFF_FFFF_FFFF) at this slice; tighten when
-      // path_open learns to gate.
-      check(peekI64(inst, 512 + 8) == -1L,
-            s"fs_rights_base=${peekI64(inst, 512 + 8)} (want -1)")
-      check(peekI64(inst, 512 + 16) == -1L,
-            s"fs_rights_inheriting=${peekI64(inst, 512 + 16)} (want -1)")
+      // fs_rights_base @ 8 — RIGHTS_REGULAR_FILE (read/write/seek + filestat
+      // + advise/allocate/sync). Tightened from the pre-hardening "-1L full
+      // mask" so userspace gating against absent bits behaves correctly.
+      check(peekI64(inst, 512 + 8) == Wasi.RIGHTS_REGULAR_FILE,
+            s"fs_rights_base=${peekI64(inst, 512 + 8)} " +
+            s"(want ${Wasi.RIGHTS_REGULAR_FILE})")
+      // fs_rights_inheriting @ 16 — regular files have no children, so 0.
+      check(peekI64(inst, 512 + 16) == 0L,
+            s"fs_rights_inheriting=${peekI64(inst, 512 + 16)} (want 0)")
     }
 
-    test("fd_fdstat_get: preopen fd reports DIRECTORY") {
+    test("fd_fdstat_get: preopen fd reports DIRECTORY + DIRECTORY_BASE/INHERITING rights") {
       val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
                                   preopens = Seq(Preopen.named("/s")))
       callFdFdstatGet(inst, fd = 3, buf = 512) match
@@ -748,9 +750,25 @@ object WasiFsTests:
         case other => check(false, s"call_fd_fdstat_get: $other")
       check(loadByte(inst, 512 + 0) == 3,
             s"filetype=${loadByte(inst, 512 + 0)} (want DIRECTORY=3)")
+      // Directory fds advertise path_* + fd_readdir + fd_filestat_get in
+      // base, plus union of regular-file rights in inheriting (since a
+      // path_open through the dir may yield either a file or a subdir).
+      check(peekI64(inst, 512 + 8)  == Wasi.RIGHTS_DIRECTORY_BASE,
+            s"rights_base=${peekI64(inst, 512 + 8)} " +
+            s"(want ${Wasi.RIGHTS_DIRECTORY_BASE})")
+      check(peekI64(inst, 512 + 16) == Wasi.RIGHTS_DIRECTORY_INHERITING,
+            s"rights_inheriting=${peekI64(inst, 512 + 16)} " +
+            s"(want ${Wasi.RIGHTS_DIRECTORY_INHERITING})")
+      // The DIRECTORY mask must NOT advertise FD_READ / FD_WRITE / FD_SEEK
+      // on the directory itself — userspace uses these absences to refuse
+      // dispatching `fd_read` against a directory fd.
+      val base = peekI64(inst, 512 + 8)
+      check((base & Wasi.RIGHT_FD_READ)  == 0L, "directory must not carry FD_READ")
+      check((base & Wasi.RIGHT_FD_WRITE) == 0L, "directory must not carry FD_WRITE")
+      check((base & Wasi.RIGHT_FD_SEEK)  == 0L, "directory must not carry FD_SEEK")
     }
 
-    test("fd_fdstat_get: stdio fds report CHARACTER_DEVICE") {
+    test("fd_fdstat_get: stdio fds report CHARACTER_DEVICE + CHARACTER_DEVICE rights") {
       val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq.empty)
       for fd <- Seq(0, 1, 2) do
         callFdFdstatGet(inst, fd, 512) match
@@ -760,6 +778,18 @@ object WasiFsTests:
         check(loadByte(inst, 512 + 0) == 2,
               s"fd=$fd filetype=${loadByte(inst, 512 + 0)} " +
               s"(want CHARACTER_DEVICE=2)")
+        check(peekI64(inst, 512 + 8)  == Wasi.RIGHTS_CHARACTER_DEVICE,
+              s"fd=$fd rights_base=${peekI64(inst, 512 + 8)} " +
+              s"(want ${Wasi.RIGHTS_CHARACTER_DEVICE})")
+        check(peekI64(inst, 512 + 16) == 0L,
+              s"fd=$fd rights_inheriting=${peekI64(inst, 512 + 16)} (want 0)")
+        // Stdio is NOT seekable — wasi-libc reads the absence of FD_SEEK
+        // to skip `lseek` on stdin/stdout/stderr.
+        val base = peekI64(inst, 512 + 8)
+        check((base & Wasi.RIGHT_FD_SEEK) == 0L,
+              s"fd=$fd: CHARACTER_DEVICE must not carry FD_SEEK")
+        check((base & Wasi.RIGHT_FD_TELL) == 0L,
+              s"fd=$fd: CHARACTER_DEVICE must not carry FD_TELL")
     }
 
     test("fd_fdstat_get: EBADF on fd outside every dispatch") {
@@ -1003,6 +1033,153 @@ object WasiFsTests:
             s"file size=${bytes.length} (want 0 — OFLAGS_TRUNC zeroed it)")
     }
 
+    // ----- path_filestat_get (hardening pass) -----------------------------
+    //
+    // wasi-libc dispatches `stat(path)` / `access(path)` / `lstat(path)`
+    // through `path_filestat_get`. Output shape mirrors `fd_filestat_get`
+    // (64-byte struct), input is a path resolved against a preopen-dir fd.
+
+    test("path_filestat_get: existing file reports REGULAR_FILE + size") {
+      val files   = Map("hello.txt" -> "Hello, WASI!".getBytes("UTF-8"))
+      val preopen = Preopen.inMemory("/s", files)
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "hello.txt")
+      callPathFilestatGet(inst, fd = 3, lookupflags = 0,
+                          pathPtr = 0, pathLen = 9, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_filestat_get: $other")
+      check(loadByte(inst, 512 + 16) == 4,
+            s"filetype=${loadByte(inst, 512 + 16)} (want REGULAR_FILE=4)")
+      check(peekI64(inst, 512 + 24) == 1L,
+            s"nlink=${peekI64(inst, 512 + 24)} (want 1)")
+      check(peekI64(inst, 512 + 32) == 12L,
+            s"size=${peekI64(inst, 512 + 32)} (want 12)")
+    }
+
+    test("path_filestat_get: missing path returns ENOENT") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "absent.txt")
+      callPathFilestatGet(inst, fd = 3, lookupflags = 0,
+                          pathPtr = 0, pathLen = 10, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_filestat_get: $other")
+    }
+
+    test("path_filestat_get: named (non-capability) preopen returns ENOTCAPABLE") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      storePath(inst, 0, "x")
+      callPathFilestatGet(inst, fd = 3, lookupflags = 0,
+                          pathPtr = 0, pathLen = 1, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_filestat_get: $other")
+    }
+
+    test("path_filestat_get: EBADF on non-preopen fd") {
+      val files   = Map("hello.txt" -> "Hello".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "hello.txt")
+      // fd 4 is an opened-file fd, not a preopen — must reject.
+      storePath(inst, 0, "hello.txt")
+      callPathFilestatGet(inst, fd = 4, lookupflags = 0,
+                          pathPtr = 0, pathLen = 9, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_path_filestat_get: $other")
+      // And stdio fds aren't preopens either.
+      callPathFilestatGet(inst, fd = 1, lookupflags = 0,
+                          pathPtr = 0, pathLen = 9, buf = 512) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_path_filestat_get(fd=1): $other")
+    }
+
+    test("path_filestat_get: EFAULT when buf+64 extends past memory") {
+      val files   = Map("f" -> Array.emptyByteArray)
+      val preopen = Preopen.inMemory("/s", files)
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      callPathFilestatGet(inst, fd = 3, lookupflags = 0,
+                          pathPtr = 0, pathLen = 1, buf = 65500) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"call_path_filestat_get: $other")
+    }
+
+    test("path_filestat_get: lookupflags ignored (SYMLINK_FOLLOW absent in InMemoryFs)") {
+      val files   = Map("f" -> "x".getBytes("UTF-8"))
+      val preopen = Preopen.inMemory("/s", files)
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // Both lookupflags=0 and lookupflags=1 (SYMLINK_FOLLOW) succeed — the
+      // InMemoryFs has no symlinks so the bit is a no-op.
+      for lf <- Seq(0, 1) do
+        callPathFilestatGet(inst, fd = 3, lookupflags = lf,
+                            pathPtr = 0, pathLen = 1, buf = 512) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"lf=$lf errno=$e")
+          case other => check(false, s"call_path_filestat_get(lf=$lf): $other")
+    }
+
+    // ----- fd_sync / fd_datasync (hardening pass) -------------------------
+    //
+    // InMemoryFs has no buffered-writes layer, so both syscalls reduce to
+    // "is this fd valid?" — ESUCCESS for stdio/preopens/opened-files,
+    // EBADF for everything else.
+
+    test("fd_sync: ESUCCESS on stdio + preopen + opened file") {
+      val files   = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      // fd 4 is the just-opened regular file; fds 0/1/2 are stdio; fd 3 is /s.
+      for fd <- Seq(0, 1, 2, 3, 4) do
+        inst.invoke("call_fd_sync", Seq(I32(fd))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd errno=$e (want 0)")
+          case other => check(false, s"call_fd_sync(fd=$fd): $other")
+    }
+
+    test("fd_sync: EBADF on negative + never-opened + closed fds") {
+      val files   = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      // fd 5 is never opened — single preopen + one open = highest fd is 4.
+      for fd <- Seq(-1, 5, 99) do
+        inst.invoke("call_fd_sync", Seq(I32(fd))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EBADF, s"fd=$fd errno=$e (want EBADF)")
+          case other => check(false, s"call_fd_sync(fd=$fd): $other")
+      // Close fd 4 and confirm it goes from ESUCCESS to EBADF.
+      inst.invoke("call_fd_close", Seq(I32(4))) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"fd_close: $e")
+        case other              => check(false, s"call_fd_close: $other")
+      inst.invoke("call_fd_sync", Seq(I32(4))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"after-close errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_sync(after close): $other")
+    }
+
+    test("fd_datasync: matches fd_sync semantics") {
+      val files   = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      // Same partition as fd_sync — verifies the two syscalls behave
+      // identically (no metadata/data distinction in InMemoryFs).
+      for fd <- Seq(0, 1, 2, 3, 4) do
+        inst.invoke("call_fd_datasync", Seq(I32(fd))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd errno=$e (want 0)")
+          case other => check(false, s"call_fd_datasync(fd=$fd): $other")
+      inst.invoke("call_fd_datasync", Seq(I32(-1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"fd=-1 errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_datasync(-1): $other")
+    }
+
   // ----- helpers ----------------------------------------------------------
 
   /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
@@ -1164,6 +1341,19 @@ object WasiFsTests:
     * destination. */
   private def callFdFilestatGet(inst: ModuleInstance, fd: Int, buf: Int) =
     inst.invoke("call_fd_filestat_get", Seq(I32(fd), I32(buf)))
+
+  /** 5-arg `path_filestat_get` wrapper. Resolves `pathPtr`/`pathLen`
+    * against the preopen at `fd` and writes a 64-byte filestat at `buf`.
+    * `lookupflags` bit 0 = SYMLINK_FOLLOW (ignored in the InMemoryFs). */
+  private def callPathFilestatGet(inst:        ModuleInstance,
+                                  fd:          Int,
+                                  lookupflags: Int,
+                                  pathPtr:     Int,
+                                  pathLen:     Int,
+                                  buf:         Int) =
+    inst.invoke("call_path_filestat_get",
+                Seq(I32(fd), I32(lookupflags), I32(pathPtr),
+                    I32(pathLen), I32(buf)))
 
   /** Open a single-preopen InMemoryFs, store the path bytes at addr 0,
     * open the file via `call_path_open`, and assert the returned fd is

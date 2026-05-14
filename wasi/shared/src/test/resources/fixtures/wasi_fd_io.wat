@@ -34,6 +34,12 @@
     (func $fd_filestat_get (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_fdstat_get"
     (func $fd_fdstat_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_filestat_get"
+    (func $path_filestat_get (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_sync"
+    (func $fd_sync (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_datasync"
+    (func $fd_datasync (param i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -97,6 +103,25 @@
     local.get $fd
     local.get $buf
     call $fd_fdstat_get)
+
+  (func (export "call_path_filestat_get")
+        (param $fd i32) (param $lookupflags i32)
+        (param $path_ptr i32) (param $path_len i32)
+        (param $buf i32) (result i32)
+    local.get $fd
+    local.get $lookupflags
+    local.get $path_ptr
+    local.get $path_len
+    local.get $buf
+    call $path_filestat_get)
+
+  (func (export "call_fd_sync") (param $fd i32) (result i32)
+    local.get $fd
+    call $fd_sync)
+
+  (func (export "call_fd_datasync") (param $fd i32) (result i32)
+    local.get $fd
+    call $fd_datasync)
 
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)

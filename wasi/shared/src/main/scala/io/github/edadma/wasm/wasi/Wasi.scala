@@ -86,6 +86,99 @@ object Wasi:
     * path", ENOTCAPABLE says "you can't even ask through this preopen". */
   val ENOTCAPABLE:  Int = 76
 
+  // === WASI Preview 1 rights bits (witx-defined) ============================
+  //
+  // Each bit is a capability a wasi fd may carry. Programs query the bitmap
+  // through `fd_fdstat_get` (filling the `fs_rights_base` / `fs_rights_inheriting`
+  // u64 fields) to learn what they can do with the fd. wasi-libc gates
+  // every syscall it dispatches against the relevant bit, so getting the
+  // per-filetype masks right matters: a directory fd with `FD_READ` set
+  // would let `fd_read` succeed against the directory; a regular-file fd
+  // missing `FD_SEEK` would force wasi-libc to refuse `lseek`, etc.
+  //
+  // Bit positions follow the witx canonical order (see
+  // wasi-preview1's `rights` flags type). The individual `RIGHT_*` bits
+  // are package-private; tests and external users want the composite
+  // [[RIGHTS_CHARACTER_DEVICE]] / [[RIGHTS_DIRECTORY_BASE]] /
+  // [[RIGHTS_DIRECTORY_INHERITING]] / [[RIGHTS_REGULAR_FILE]] masks
+  // exposed below.
+
+  private[wasi] val RIGHT_FD_DATASYNC:             Long = 1L << 0
+  private[wasi] val RIGHT_FD_READ:                 Long = 1L << 1
+  private[wasi] val RIGHT_FD_SEEK:                 Long = 1L << 2
+  private[wasi] val RIGHT_FD_FDSTAT_SET_FLAGS:     Long = 1L << 3
+  private[wasi] val RIGHT_FD_SYNC:                 Long = 1L << 4
+  private[wasi] val RIGHT_FD_TELL:                 Long = 1L << 5
+  private[wasi] val RIGHT_FD_WRITE:                Long = 1L << 6
+  private[wasi] val RIGHT_FD_ADVISE:               Long = 1L << 7
+  private[wasi] val RIGHT_FD_ALLOCATE:             Long = 1L << 8
+  private[wasi] val RIGHT_PATH_CREATE_DIRECTORY:   Long = 1L << 9
+  private[wasi] val RIGHT_PATH_CREATE_FILE:        Long = 1L << 10
+  private[wasi] val RIGHT_PATH_LINK_SOURCE:        Long = 1L << 11
+  private[wasi] val RIGHT_PATH_LINK_TARGET:        Long = 1L << 12
+  private[wasi] val RIGHT_PATH_OPEN:               Long = 1L << 13
+  private[wasi] val RIGHT_FD_READDIR:              Long = 1L << 14
+  private[wasi] val RIGHT_PATH_READLINK:           Long = 1L << 15
+  private[wasi] val RIGHT_PATH_RENAME_SOURCE:      Long = 1L << 16
+  private[wasi] val RIGHT_PATH_RENAME_TARGET:      Long = 1L << 17
+  private[wasi] val RIGHT_PATH_FILESTAT_GET:       Long = 1L << 18
+  private[wasi] val RIGHT_PATH_FILESTAT_SET_SIZE:  Long = 1L << 19
+  private[wasi] val RIGHT_PATH_FILESTAT_SET_TIMES: Long = 1L << 20
+  private[wasi] val RIGHT_FD_FILESTAT_GET:         Long = 1L << 21
+  private[wasi] val RIGHT_FD_FILESTAT_SET_SIZE:    Long = 1L << 22
+  private[wasi] val RIGHT_FD_FILESTAT_SET_TIMES:   Long = 1L << 23
+  private[wasi] val RIGHT_PATH_SYMLINK:            Long = 1L << 24
+  private[wasi] val RIGHT_PATH_REMOVE_DIRECTORY:   Long = 1L << 25
+  private[wasi] val RIGHT_PATH_UNLINK_FILE:        Long = 1L << 26
+  private[wasi] val RIGHT_POLL_FD_READWRITE:       Long = 1L << 27
+  private[wasi] val RIGHT_SOCK_SHUTDOWN:           Long = 1L << 28
+  private[wasi] val RIGHT_SOCK_ACCEPT:             Long = 1L << 29
+
+  /** Rights mask for a stdio fd. Stdio is read+write but not seekable, so
+    * `FD_SEEK` / `FD_TELL` are absent. `FD_FDSTAT_SET_FLAGS` lets
+    * userspace flip `O_NONBLOCK` on stdin/stdout (wasi-libc does this
+    * during line-buffered input). `FD_FILESTAT_GET` is always on so
+    * `isatty()` checks resolve. */
+  val RIGHTS_CHARACTER_DEVICE: Long =
+    RIGHT_FD_READ | RIGHT_FD_WRITE |
+    RIGHT_FD_FDSTAT_SET_FLAGS | RIGHT_FD_FILESTAT_GET |
+    RIGHT_POLL_FD_READWRITE
+
+  /** Rights mask for a preopen directory fd's `fs_rights_base` — what the
+    * directory fd ITSELF supports. Every `path_*` op (open, create,
+    * unlink, rename, symlink, …) plus `fd_readdir`, `fd_filestat_get`,
+    * `fd_fdstat_set_flags`. Notably missing: `FD_READ` / `FD_WRITE` /
+    * `FD_SEEK` — a directory is not readable as a stream of bytes via
+    * `fd_read` (wasi has `fd_readdir` for that). */
+  val RIGHTS_DIRECTORY_BASE: Long =
+    RIGHT_FD_FDSTAT_SET_FLAGS | RIGHT_FD_FILESTAT_GET | RIGHT_FD_READDIR |
+    RIGHT_PATH_CREATE_DIRECTORY | RIGHT_PATH_CREATE_FILE |
+    RIGHT_PATH_LINK_SOURCE | RIGHT_PATH_LINK_TARGET | RIGHT_PATH_OPEN |
+    RIGHT_PATH_READLINK |
+    RIGHT_PATH_RENAME_SOURCE | RIGHT_PATH_RENAME_TARGET |
+    RIGHT_PATH_FILESTAT_GET | RIGHT_PATH_FILESTAT_SET_SIZE |
+    RIGHT_PATH_FILESTAT_SET_TIMES |
+    RIGHT_PATH_SYMLINK | RIGHT_PATH_REMOVE_DIRECTORY |
+    RIGHT_PATH_UNLINK_FILE
+
+  /** Rights mask for a regular file fd: full read/write/seek surface,
+    * filestat get+set, allocate/advise/sync. */
+  val RIGHTS_REGULAR_FILE: Long =
+    RIGHT_FD_DATASYNC | RIGHT_FD_READ | RIGHT_FD_SEEK |
+    RIGHT_FD_FDSTAT_SET_FLAGS | RIGHT_FD_SYNC | RIGHT_FD_TELL |
+    RIGHT_FD_WRITE | RIGHT_FD_ADVISE | RIGHT_FD_ALLOCATE |
+    RIGHT_FD_FILESTAT_GET | RIGHT_FD_FILESTAT_SET_SIZE |
+    RIGHT_FD_FILESTAT_SET_TIMES |
+    RIGHT_POLL_FD_READWRITE
+
+  /** Rights a preopen-directory fd advertises as inheritable to children:
+    * every fd opened relative to the directory carries rights drawn
+    * from this mask (intersected with what the program asked for in
+    * `path_open`). Union of directory + regular-file rights, since a
+    * `path_open` may yield either a directory or a regular file. */
+  val RIGHTS_DIRECTORY_INHERITING: Long =
+    RIGHTS_DIRECTORY_BASE | RIGHTS_REGULAR_FILE
+
   // === File handle abstraction (Phase 7.E.2 + 7.E.3) ========================
 
   /** An opaque handle to an opened file, returned by
@@ -193,6 +286,9 @@ object Wasi:
         "fd_prestat_get"      -> ((mem, args) => prestatGet(mem, args, ctx)),
         "fd_prestat_dir_name" -> ((mem, args) => prestatDirName(mem, args, ctx)),
         "path_open"           -> ((mem, args) => pathOpen(mem, args, ctx, fdTable)),
+        "path_filestat_get"   -> ((mem, args) => pathFilestatGet(mem, args, ctx)),
+        "fd_sync"             -> ((_,   args) => fdSync(args, ctx, fdTable)),
+        "fd_datasync"         -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -491,11 +587,15 @@ object Wasi:
     *   - else                     → EBADF
     *
     * `fs_flags` stays 0: the shim's [[FsFile]] surface has no APPEND /
-    * NONBLOCK / SYNC modes. Rights are deliberately permissive (all bits
-    * set) at this slice — `path_open` doesn't validate against rights
-    * yet, so giving wasi-libc a generous mask is consistent with the
-    * shim's actual capability. When `path_open` learns to gate rights,
-    * tighten these per-filetype too. */
+    * NONBLOCK / SYNC modes wired through yet. Rights are tightened to
+    * the per-filetype masks ([[RIGHTS_CHARACTER_DEVICE]] for stdio,
+    * [[RIGHTS_DIRECTORY_BASE]] / [[RIGHTS_DIRECTORY_INHERITING]] for
+    * preopens, [[RIGHTS_REGULAR_FILE]] for opened files) so userspace
+    * gating against bitwise-anded rights matches what the syscalls
+    * actually support. Stdio in particular advertises NO seek/tell
+    * capability — wasi-libc uses the absence of `FD_SEEK` to skip
+    * `lseek` on stdin, which a previous "full mask" let it incorrectly
+    * call. */
   private def fdFdstatGet(memory: Memory, args: Seq[Value],
                           ctx: WasiContext, fdTable: FdTable): Seq[Value] =
     args match
@@ -506,27 +606,36 @@ object Wasi:
           return Seq(I32(EFAULT))
 
         // Same EBADF-atomic discipline as fd_filestat_get: resolve the
-        // filetype before touching `buf` so a bad fd leaves the destination
-        // untouched.
+        // filetype and rights pair before touching `buf` so a bad fd
+        // leaves the destination untouched.
         var filetype: Byte = 0
+        var rights:      Long = 0L
+        var inheriting:  Long = 0L
         if fd < 0 then return Seq(I32(EBADF))
         else if fd <= 2 then
-          filetype = 2       // CHARACTER_DEVICE — stdio
+          filetype   = 2                          // CHARACTER_DEVICE — stdio
+          rights     = RIGHTS_CHARACTER_DEVICE
+          inheriting = 0L                         // stdio has no children
         else if fd - 3 < ctx.preopens.length then
-          filetype = 3       // DIRECTORY — preopen
+          filetype   = 3                          // DIRECTORY — preopen
+          rights     = RIGHTS_DIRECTORY_BASE
+          inheriting = RIGHTS_DIRECTORY_INHERITING
         else
           fdTable.lookup(fd) match
-            case Some(_) => filetype = 4   // REGULAR_FILE — opened file
-            case None    => return Seq(I32(EBADF))
+            case Some(_) =>
+              filetype   = 4                      // REGULAR_FILE — opened file
+              rights     = RIGHTS_REGULAR_FILE
+              inheriting = 0L                     // files don't open children
+            case None => return Seq(I32(EBADF))
 
         var i = 0
         while i < 24 do
           data(bufPtr + i) = 0
           i += 1
         data(bufPtr + 0) = filetype
-        // fs_flags @ 2..3 stays 0.
-        writeI64LE(data, bufPtr + 8,  -1L)   // fs_rights_base — full mask
-        writeI64LE(data, bufPtr + 16, -1L)   // fs_rights_inheriting — full mask
+        // fs_flags @ 2..3 stays 0 (per-fd state not yet tracked).
+        writeI64LE(data, bufPtr + 8,  rights)
+        writeI64LE(data, bufPtr + 16, inheriting)
         Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
@@ -735,6 +844,114 @@ object Wasi:
               fdTable.release(fd)
               Seq(I32(ESUCCESS))
             case None => Seq(I32(EBADF))
+      case _ => Seq(I32(EINVAL))
+
+  // === fd_sync / fd_datasync ================================================
+  //
+  // POSIX `fsync(2)` / `fdatasync(2)` flush buffered writes to durable
+  // storage. The InMemoryFs has no separate "buffer" — every `write`
+  // updates the live `FileCell.bytes` array immediately — so sync is a
+  // no-op success. We still validate the fd so a bug in userspace (e.g.
+  // syncing a closed fd) surfaces as EBADF rather than silently
+  // succeeding. A future host-backed FsFile impl can override these to
+  // forward to the platform's real sync syscalls.
+
+  /** `fd_sync(fd: i32) -> errno`
+    *
+    * Flush any buffered writes for `fd`. In the InMemoryFs that's a
+    * no-op (every `write` mutates the cell directly), so we return
+    * `ESUCCESS` for any valid fd. EBADF for unknown fds — same dispatch
+    * partition as `fd_close` (stdio + preopens + FdTable). */
+  private def fdSync(args: Seq[Value], ctx: WasiContext,
+                     fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd)) =>
+        if isValidFd(fd, ctx, fdTable) then Seq(I32(ESUCCESS))
+        else Seq(I32(EBADF))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_datasync(fd: i32) -> errno`
+    *
+    * POSIX `fdatasync` — flushes data without necessarily flushing
+    * metadata. In our model there's no distinction between data and
+    * metadata flushes (no atime/mtime tracking yet), so this is the
+    * same code path as `fd_sync`. */
+  private def fdDatasync(args: Seq[Value], ctx: WasiContext,
+                         fdTable: FdTable): Seq[Value] = fdSync(args, ctx, fdTable)
+
+  /** Is `fd` claimed by either stdio, a preopen, or the FdTable? Used
+    * by `fd_sync` / `fd_datasync` to partition EBADF from ESUCCESS
+    * without caring which class the fd falls into. Mirrors the dispatch
+    * tree in `fd_close`. */
+  private inline def isValidFd(fd: Int, ctx: WasiContext,
+                               fdTable: FdTable): Boolean =
+    if fd < 0 then false
+    else if fd <= 2 then true
+    else if fd - 3 < ctx.preopens.length then true
+    else fdTable.lookup(fd).isDefined
+
+  // === path_filestat_get ====================================================
+
+  /** `path_filestat_get(fd: i32, lookupflags: i32, path_ptr: i32,
+    *                    path_len: i32, buf: i32) -> errno`
+    *
+    * Mirrors `fd_filestat_get`'s output shape — writes the same 64-byte
+    * `__wasi_filestat_t` at `buf` — but resolves a path relative to a
+    * preopen `fd` rather than statting an already-open fd. wasi-libc
+    * uses this for the back end of `stat(path)` / `lstat(path)` /
+    * `access(path)` calls.
+    *
+    * Errno discipline:
+    *   - `EBADF` if `fd` isn't a preopen (the only kind of fd that
+    *     accepts path-resolved lookups in the shim).
+    *   - `EFAULT` if the path bytes or `buf+64` fall outside live
+    *     linear memory. Validated up front so a bad pointer doesn't
+    *     leave the destination half-written.
+    *   - `ENOENT` if the path doesn't exist in the preopen.
+    *   - `ENOTCAPABLE` if the preopen has no FS capability (i.e. it's
+    *     a `Preopen.named(...)` rather than an in-memory or host-backed
+    *     impl).
+    *
+    * `lookupflags` (bit 0 = SYMLINK_FOLLOW) is ignored — the InMemoryFs
+    * has no symlinks, so `stat` and `lstat` are equivalent.
+    *
+    * Implementation note: leverages [[WasiContext.Preopen.statPath]] —
+    * a path-keyed companion to `open` that returns either `Left(errno)`
+    * or `Right(size: Long)`. We need size only (filetype is always
+    * REGULAR_FILE in the InMemoryFs's flat path model). A future
+    * directory-aware impl would broaden the return to include a
+    * filetype byte. */
+  private def pathFilestatGet(memory: Memory, args: Seq[Value],
+                              ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(_lookupflags), I32(pathPtr), I32(pathLen),
+               I32(bufPtr)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathLen < 0 ||
+           pathPtr.toLong + pathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        if bufPtr < 0 || bufPtr.toLong + 64L > dataLen then
+          return Seq(I32(EFAULT))
+
+        val pathBytes = new Array[Byte](pathLen)
+        System.arraycopy(data, pathPtr, pathBytes, 0, pathLen)
+        val path = new String(pathBytes, "UTF-8")
+
+        ctx.preopens(idx).statPath(path) match
+          case Left(errno) => Seq(I32(errno))
+          case Right(size) =>
+            var i = 0
+            while i < 64 do
+              data(bufPtr + i) = 0
+              i += 1
+            data(bufPtr + 16) = 4                  // REGULAR_FILE
+            writeI64LE(data, bufPtr + 24, 1L)      // nlink
+            writeI64LE(data, bufPtr + 32, size)    // size
+            Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
   // === preopen scaffolding (Phase 7.E.1) ====================================
@@ -1054,6 +1271,19 @@ object WasiContext:
     def open(path: String, oflags: Int, fdflags: Int): Either[Int, Wasi.FsFile] =
       Left(Wasi.ENOTCAPABLE)
 
+    /** Stat a path within this preopen WITHOUT opening it. Called by
+      * `path_filestat_get`. Returns `Right(size)` for an existing file
+      * (file type is REGULAR_FILE — no directories in the flat path
+      * model yet) or `Left(errno)` on failure:
+      * `Wasi.ENOENT` for a missing path, `Wasi.ENOTCAPABLE` for a
+      * preopen with no FS capability (`Preopen.named`).
+      *
+      * Default impl returns `Left(Wasi.ENOTCAPABLE)` for consistency
+      * with [[open]] — a name-only preopen refuses path-resolved
+      * lookups the same way it refuses opens. */
+    def statPath(path: String): Either[Int, Long] =
+      Left(Wasi.ENOTCAPABLE)
+
   object Preopen:
     /** A name-only preopen: advertises the directory through the
       * prestat-walk surface but refuses to open anything inside it
@@ -1136,6 +1366,11 @@ object WasiContext:
               val cell = new FileCell(new Array[Byte](0))
               cells(path) = cell
               Right(new InMemoryFile(cell))
+
+      override def statPath(path: String): Either[Int, Long] =
+        cells.get(path) match
+          case Some(cell) => Right(cell.bytes.length.toLong)
+          case None       => Left(Wasi.ENOENT)
 
       /** Current bytes for `path` after any writes the wasi program
         * performed. `None` if no file at that key — `Some(Array.empty)`
