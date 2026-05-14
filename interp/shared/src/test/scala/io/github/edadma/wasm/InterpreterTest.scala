@@ -53,6 +53,7 @@ object InterpreterTest:
     SimdConstTests.run()
     SimdLoadStoreTests.run()
     SimdLaneTests.run()
+    SimdIntArithTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

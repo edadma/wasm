@@ -468,6 +468,16 @@ object Interpreter:
                   Left(WasmError.InvalidModule(s"truncated lane immediate at $pc"))
                 else Right(p1 + 1)
 
+              // Chunk D — integer arithmetic (all unary or binary on v128
+              // → v128, no immediate past the sub-opcode).
+              case 0x60 | 0x61 |                                                          // i8x16  abs / neg
+                   0x6E | 0x6F | 0x70 | 0x71 | 0x72 | 0x73 | 0x7B |                       // i8x16  add/sub/sat/avgr
+                   0x80 | 0x81 |                                                          // i16x8  abs / neg
+                   0x8E | 0x8F | 0x90 | 0x91 | 0x92 | 0x93 | 0x95 | 0x9B |                // i16x8  add/sub/sat/mul/avgr
+                   0xA0 | 0xA1 | 0xAE | 0xB1 | 0xB5 |                                     // i32x4  abs/neg/add/sub/mul
+                   0xC0 | 0xC1 | 0xCE | 0xD1 | 0xD5 =>                                    // i64x2  abs/neg/add/sub/mul
+                Right(p1)
+
               case _ => Left(WasmError.UnknownOpcode(0xfd))
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -2046,6 +2056,189 @@ final class Interpreter private[wasm] (
         f.pc = p1 + 1
         valueStack += V128(v)
 
+      // === Chunk D — integer arithmetic =======================================
+      //
+      // Every op is `[v128 v128] -> [v128]` (binary) or `[v128] -> [v128]`
+      // (unary). No immediates. Sub-opcodes >= 0x80 are 2-byte LEBs in the
+      // binary; the LEB decode at the top of stepFd already handles that.
+      // The shape-aware un/bin-op helpers (below, near the lane helpers)
+      // build a fresh 16-byte result; `_sat_s/_u` variants saturate at the
+      // signed/unsigned lane bounds, everything else wraps mod 2^lane_width
+      // (the `writeLaneIxx` byte truncation handles that for free).
+
+      // --- i8x16 --------------------------------------------------------------
+
+      case 0x60 =>                                                                        // i8x16.abs
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpS(a, x => if x < 0 then -x else x))
+
+      case 0x61 =>                                                                        // i8x16.neg
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpS(a, x => -x))
+
+      case 0x6E =>                                                                        // i8x16.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) => x + y))
+
+      case 0x6F =>                                                                        // i8x16.add_sat_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) =>
+          val s = x + y
+          if s > 127 then 127 else if s < -128 then -128 else s))
+
+      case 0x70 =>                                                                        // i8x16.add_sat_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpU(a, b, (x, y) =>
+          val s = x + y
+          if s > 255 then 255 else s))
+
+      case 0x71 =>                                                                        // i8x16.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) => x - y))
+
+      case 0x72 =>                                                                        // i8x16.sub_sat_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpS(a, b, (x, y) =>
+          val s = x - y
+          if s > 127 then 127 else if s < -128 then -128 else s))
+
+      case 0x73 =>                                                                        // i8x16.sub_sat_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpU(a, b, (x, y) =>
+          val s = x - y
+          if s < 0 then 0 else s))
+
+      case 0x7B =>                                                                        // i8x16.avgr_u : (a+b+1)/2 per lane
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16BinOpU(a, b, (x, y) => (x + y + 1) >>> 1))
+
+      // --- i16x8 --------------------------------------------------------------
+
+      case 0x80 =>                                                                        // i16x8.abs
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8UnOpS(a, x => if x < 0 then -x else x))
+
+      case 0x81 =>                                                                        // i16x8.neg
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8UnOpS(a, x => -x))
+
+      case 0x8E =>                                                                        // i16x8.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) => x + y))
+
+      case 0x8F =>                                                                        // i16x8.add_sat_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) =>
+          val s = x + y
+          if s > 32767 then 32767 else if s < -32768 then -32768 else s))
+
+      case 0x90 =>                                                                        // i16x8.add_sat_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpU(a, b, (x, y) =>
+          val s = x + y
+          if s > 65535 then 65535 else s))
+
+      case 0x91 =>                                                                        // i16x8.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) => x - y))
+
+      case 0x92 =>                                                                        // i16x8.sub_sat_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) =>
+          val s = x - y
+          if s > 32767 then 32767 else if s < -32768 then -32768 else s))
+
+      case 0x93 =>                                                                        // i16x8.sub_sat_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpU(a, b, (x, y) =>
+          val s = x - y
+          if s < 0 then 0 else s))
+
+      case 0x95 =>                                                                        // i16x8.mul : low 16 bits of full-width int product
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) => x * y))
+
+      case 0x9B =>                                                                        // i16x8.avgr_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpU(a, b, (x, y) => (x + y + 1) >>> 1))
+
+      // --- i32x4 --------------------------------------------------------------
+
+      case 0xA0 =>                                                                        // i32x4.abs : abs(Int.MinValue) = Int.MinValue
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, x => if x < 0 then -x else x))
+
+      case 0xA1 =>                                                                        // i32x4.neg
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4UnOp(a, x => -x))
+
+      case 0xAE =>                                                                        // i32x4.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) => x + y))
+
+      case 0xB1 =>                                                                        // i32x4.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) => x - y))
+
+      case 0xB5 =>                                                                        // i32x4.mul
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4BinOp(a, b, (x, y) => x * y))
+
+      // --- i64x2 --------------------------------------------------------------
+      //
+      // JS Long emulation cost — Scala.js represents Long as a pair of 32-bit
+      // halves, so the lane mul here is a non-trivial JS function call. Still
+      // correct; tests should pass on every backend.
+
+      case 0xC0 =>                                                                        // i64x2.abs
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, x => if x < 0L then -x else x))
+
+      case 0xC1 =>                                                                        // i64x2.neg
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2UnOp(a, x => -x))
+
+      case 0xCE =>                                                                        // i64x2.add
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2BinOp(a, b, (x, y) => x + y))
+
+      case 0xD1 =>                                                                        // i64x2.sub
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2BinOp(a, b, (x, y) => x - y))
+
+      case 0xD5 =>                                                                        // i64x2.mul
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2BinOp(a, b, (x, y) => x * y))
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -2153,6 +2346,110 @@ final class Interpreter private[wasm] (
     while k < 8 do
       v(o + k) = ((value >>> (k * 8)) & 0xffL).toByte
       k += 1
+
+  // === Chunk D — shape-aware un/bin-op helpers ============================
+  //
+  // Each helper allocates a fresh 16-byte result, reads one or two source
+  // values per lane in the requested sign-form, and writes the op's return
+  // value back with the lane-shape's writer (which truncates to the lane
+  // width — wrap mod 2^N comes for free). The `_S` / `_U` suffix only
+  // matters for i8x16 and i16x8 (where lane width is narrower than Int);
+  // i32x4 and i64x2 store the entire lane as Int / Long so no suffix.
+
+  /** Sign-extending unary op on each i8 lane. */
+  private def i8x16UnOpS(a: Array[Byte], op: Int => Int): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = op(a(i).toInt).toByte
+      i += 1
+    r
+
+  /** Sign-extending binary op on each i8 lane. */
+  private def i8x16BinOpS(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Int): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = op(a(i).toInt, b(i).toInt).toByte
+      i += 1
+    r
+
+  /** Zero-extending binary op on each i8 lane (operands 0..255). */
+  private def i8x16BinOpU(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Int): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = op(a(i) & 0xff, b(i) & 0xff).toByte
+      i += 1
+    r
+
+  /** Sign-extending unary op on each i16 lane. */
+  private def i16x8UnOpS(a: Array[Byte], op: Int => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val raw = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, op((raw << 16) >> 16))                                          // sign-extend i16 → i32
+      ln += 1
+    r
+
+  /** Sign-extending binary op on each i16 lane. */
+  private def i16x8BinOpS(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val ar = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      val br = (b(ln * 2) & 0xff) | ((b(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, op((ar << 16) >> 16, (br << 16) >> 16))
+      ln += 1
+    r
+
+  /** Zero-extending binary op on each i16 lane (operands 0..65535). */
+  private def i16x8BinOpU(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val au = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      val bu = (b(ln * 2) & 0xff) | ((b(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, op(au, bu))
+      ln += 1
+    r
+
+  /** Unary op on each i32 lane (lane already wide enough for Int). */
+  private def i32x4UnOp(a: Array[Byte], op: Int => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      writeLaneI32(r, ln, op(readLaneI32(a, ln)))
+      ln += 1
+    r
+
+  /** Binary op on each i32 lane. */
+  private def i32x4BinOp(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Int): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      writeLaneI32(r, ln, op(readLaneI32(a, ln), readLaneI32(b, ln)))
+      ln += 1
+    r
+
+  /** Unary op on each i64 lane. */
+  private def i64x2UnOp(a: Array[Byte], op: Long => Long): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      writeLaneI64(r, ln, op(readLaneI64(a, ln)))
+      ln += 1
+    r
+
+  /** Binary op on each i64 lane. */
+  private def i64x2BinOp(a: Array[Byte], b: Array[Byte], op: (Long, Long) => Long): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      writeLaneI64(r, ln, op(readLaneI64(a, ln), readLaneI64(b, ln)))
+      ln += 1
+    r
 
   /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
     * 8/width source lanes, and widen each into a `outLaneBytes`-byte
