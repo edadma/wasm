@@ -75,7 +75,15 @@ final case class DataSegment(offset: Int, bytes: Array[Byte])
   */
 final case class FuncBody(locals: Vector[ValueType], body: Array[Byte])
 
-/** A fully-parsed but not-yet-instantiated module. */
+/** A fully-parsed but not-yet-instantiated module.
+  *
+  * `startFunction` is the funcidx that section 8 (Start) requested be
+  * invoked automatically at instantiation, or `None` if the module
+  * doesn't declare one. The spec constrains the target to have
+  * signature `() -> ()`; that check happens at instantiation rather than
+  * parse time because parsing doesn't (yet) cross-validate funcidx
+  * against the resolved function table.
+  */
 final case class WasmModule(
     types: Vector[FuncType],
     imports: Vector[FuncImport],
@@ -87,6 +95,7 @@ final case class WasmModule(
     elements: Vector[ElementSegment],// active element segments — applied to `tables` at instantiation
     codes: Vector[FuncBody],
     data: Vector[DataSegment],
+    startFunction: Option[Int],      // section 8 (Start) — funcidx to invoke at instantiation
 )
 
 /** All failure modes surfaced by the public API.

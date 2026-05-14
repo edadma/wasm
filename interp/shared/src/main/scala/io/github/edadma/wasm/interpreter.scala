@@ -72,13 +72,17 @@ object Interpreter:
     *   - `endPC` = byte just past the matching `end` (used as branch target for `Block` / `If`,
     *               and as the fall-through position on normal end)
     *   - `elsePC` = byte just past the matching `else` (jumped to on a false `if` condition), or -1
-    *   - `resultArity` = 0 or 1, taken from the blocktype byte
+    *   - `paramArity` = number of values popped from the stack at block entry (always 0 for the
+    *                    MVP inline blocktypes — only the multi-value typeidx form has > 0)
+    *   - `resultArity` = number of values produced at block end / fall-through; carried across
+    *                     `br` for Block/If (loops use `paramArity` as the branch arity instead)
     */
   final case class BlockInfo(
       kind: BlockKind,
       bodyStartPC: Int,
       endPC: Int,
       elsePC: Int,
+      paramArity:  Int,
       resultArity: Int,
   )
 
@@ -113,11 +117,15 @@ object Interpreter:
     *
     * `else` is recorded as the PC of the byte right after the `else` opcode
     * (i.e., where execution resumes when the if-condition was false).
+    *
+    * `types` is threaded in so the multi-value typeidx form of blocktype can
+    * be resolved during pre-scan — the param/result arities are baked into
+    * each `BlockInfo` once and the runtime never has to decode them again.
     */
-  def computeBodyMeta(body: Array[Byte]): Either[WasmError, BodyMeta] =
+  def computeBodyMeta(body: Array[Byte], types: Vector[FuncType]): Either[WasmError, BodyMeta] =
     val out = scala.collection.mutable.HashMap.empty[Int, BlockInfo]
-    // Open block stack: (opcodePos, kind, bodyStartPC, resultArity, elsePC)
-    val stack = ArrayBuffer.empty[(Int, BlockKind, Int, Int, Int)]
+    // Open block stack: (opcodePos, kind, bodyStartPC, paramArity, resultArity, elsePC)
+    val stack = ArrayBuffer.empty[(Int, BlockKind, Int, Int, Int, Int)]
     var pc    = 0
     try
       while pc < body.length do
@@ -129,26 +137,26 @@ object Interpreter:
               case 0x03 => BlockKind.Loop
               case _    => BlockKind.If
             val startPC = pc
-            readBlocktype(body, pc + 1) match
+            readBlocktype(body, pc + 1, types) match
               case Left(e) => return Left(e)
-              case Right((arity, afterBT)) =>
-                stack += ((startPC, kind, afterBT, arity, -1))
+              case Right((BlockSig(params, results), afterBT)) =>
+                stack += ((startPC, kind, afterBT, params, results, -1))
                 pc = afterBT
           case 0x05 =>
             // `else` belongs to the topmost open If
             if stack.isEmpty then return Left(WasmError.InvalidModule("`else` outside any block"))
-            val (sPC, kind, sBody, arity, _) = stack.last
+            val (sPC, kind, sBody, params, results, _) = stack.last
             if kind != BlockKind.If then
               return Left(WasmError.InvalidModule("`else` matched a non-If block"))
-            stack(stack.size - 1) = (sPC, kind, sBody, arity, pc + 1)
+            stack(stack.size - 1) = (sPC, kind, sBody, params, results, pc + 1)
             pc += 1
           case 0x0b =>
             if stack.isEmpty then
               // outermost end — function body terminator
               pc += 1
             else
-              val (sPC, kind, sBody, arity, ePC) = stack.remove(stack.size - 1)
-              out(sPC) = BlockInfo(kind, sBody, pc + 1, ePC, arity)
+              val (sPC, kind, sBody, params, results, ePC) = stack.remove(stack.size - 1)
+              out(sPC) = BlockInfo(kind, sBody, pc + 1, ePC, params, results)
               pc += 1
           case other =>
             pc = skipImmediates(body, pc, other) match
@@ -160,19 +168,50 @@ object Interpreter:
       case _: ArrayIndexOutOfBoundsException =>
         Left(WasmError.InvalidModule("unexpected end of function body"))
 
-  /** Decode a blocktype byte (i32 / i64 / f32 / f64 result; empty for no
-    * result). Returns `Right((resultArity, posAfter))`, or `Left(InvalidModule)`
-    * for the multi-value (s33 typeidx) form the current subset doesn't model
-    * yet. With f64 supported, every scalar blocktype is now accepted. */
-  private def readBlocktype(body: Array[Byte], pos: Int): Either[WasmError, (Int, Int)] =
-    (body(pos) & 0xff) match
-      case 0x40 => Right((0, pos + 1))            // empty
-      case 0x7f => Right((1, pos + 1))            // i32 result
-      case 0x7e => Right((1, pos + 1))            // i64 result
-      case 0x7d => Right((1, pos + 1))            // f32 result
-      case 0x7c => Right((1, pos + 1))            // f64 result
-      // TODO: multi-value (s33 type index).
-      case b    => Left(WasmError.InvalidModule(s"unsupported blocktype 0x${b.toHexString}"))
+  /** Param + result arity of one structured block. Used by the pre-scan to
+    * bake a block's signature into its [[BlockInfo]] without the runtime
+    * needing to re-decode the blocktype byte on entry. */
+  final case class BlockSig(paramArity: Int, resultArity: Int)
+
+  /** Decode a blocktype, returning `(BlockSig, posAfter)`. Three encodings,
+    * disambiguated by the first byte:
+    *
+    *   - `0x40` → empty (no params, no results)
+    *   - one of `0x7F` / `0x7E` / `0x7D` / `0x7C` → no params, one result
+    *     of the named scalar type (the MVP inline form)
+    *   - anything else → a signed-LEB128 typeidx (the multi-value form);
+    *     the resulting value must be non-negative and index into `types`,
+    *     and the block's params/results are copied from that `FuncType`.
+    *
+    * The inline-byte values are chosen so they all parse as *negative*
+    * SLEB128 numbers (sign bit set on a single-byte read), which is why
+    * the typeidx form unambiguously takes the "otherwise" branch even
+    * though it overlaps the same byte space — typeidx 0 encodes as
+    * `0x00`, never as `0x40` or `0x7C..0x7F`. */
+  private def readBlocktype(body: Array[Byte], pos: Int,
+                            types: Vector[FuncType]): Either[WasmError, (BlockSig, Int)] =
+    if pos >= body.length then Left(WasmError.InvalidModule("EOF in blocktype"))
+    else (body(pos) & 0xff) match
+      case 0x40 => Right((BlockSig(0, 0), pos + 1))            // empty
+      case 0x7f => Right((BlockSig(0, 1), pos + 1))            // i32 result
+      case 0x7e => Right((BlockSig(0, 1), pos + 1))            // i64 result
+      case 0x7d => Right((BlockSig(0, 1), pos + 1))            // f32 result
+      case 0x7c => Right((BlockSig(0, 1), pos + 1))            // f64 result
+      case _ =>
+        // Multi-value form: signed LEB128 typeidx (the spec says s33;
+        // readS32 is sufficient because any plausible typeidx fits well
+        // inside i32 range). A negative value here is malformed.
+        Leb128.readS32(body, pos) match
+          case Left(e) => Left(e)
+          case Right((idx, np)) =>
+            if idx < 0 then
+              Left(WasmError.InvalidModule(s"blocktype: negative typeidx $idx"))
+            else if idx >= types.length then
+              Left(WasmError.InvalidModule(
+                s"blocktype: typeidx $idx out of range (have ${types.length} types)"))
+            else
+              val ft = types(idx)
+              Right((BlockSig(ft.params.size, ft.results.size), np))
 
   /** Advance past one full instruction (opcode + immediates). Used by the
     * pre-scanner to skip non-structural opcodes when looking for matching ends.
@@ -295,8 +334,12 @@ object Interpreter:
     val labels: ArrayBuffer[Label] = ArrayBuffer.empty[Label]
 
   /** Active structured-control entry. `branchArity` is the count of values
-    * preserved across a `br`; for `Block`/`If` it equals the block's result
-    * arity, for `Loop` it's always 0 in MVP (no loop params). */
+    * preserved across a `br`; for `Block`/`If` it equals the block's
+    * `resultArity`, for `Loop` it equals the block's `paramArity` (the
+    * loop's params are what's re-fed into the next iteration). `stackHeight`
+    * is the value-stack height *below* the block's params — so on entry,
+    * the params are above `stackHeight` and a `br` correctly trims past
+    * them before re-pushing the carry. */
   private final case class Label(
       kind: BlockKind,
       targetPC: Int,
@@ -412,24 +455,33 @@ final class Interpreter private[wasm] (
       case 0x02 | 0x03 | 0x04 =>
         val startPC = f.pc
         val info    = f.func.meta.blocks.getOrElse(startPC, fail(WasmError.InvalidModule(s"no block meta at PC $startPC")))
+        // `baseHeight` is the value-stack height below the block's params.
+        // Params stay on the stack (they're the block's input "operand
+        // frame"); the label records this base so a branch can trim past
+        // them and re-push the carry (results for Block/If, params for Loop).
+        val baseHeight = valueStack.size - info.paramArity
         op match
-          case 0x02 => // block — branch target is after end
-            f.labels += Label(BlockKind.Block, info.endPC, info.resultArity, valueStack.size)
+          case 0x02 => // block — branch target is after end; carry results on br
+            f.labels += Label(BlockKind.Block, info.endPC, info.resultArity, baseHeight)
             f.pc = info.bodyStartPC
-          case 0x03 => // loop — branch target is body start
-            f.labels += Label(BlockKind.Loop, info.bodyStartPC, 0, valueStack.size)
+          case 0x03 => // loop — branch target is body start; carry params on br
+            f.labels += Label(BlockKind.Loop, info.bodyStartPC, info.paramArity, baseHeight)
             f.pc = info.bodyStartPC
           case _    => // if
             val cond = popI32()
-            // When we take a branch we push the If label so the matching `end`
-            // (or `else` fall-through) can pop it. When the condition is false
-            // *and there is no else branch*, there's no `end` instruction in
-            // our path either — so we skip straight past it without pushing.
+            // The if's condition was popped above, so `baseHeight` computed
+            // before that pop is now stale by 1 — but we recompute against
+            // the post-pop stack to get the right base for the *body*'s
+            // operand frame. When we take a branch we push the If label so
+            // the matching `end` (or `else` fall-through) can pop it; when
+            // the condition is false and there's no else branch there's no
+            // `end` on our path, so we skip straight past it without pushing.
+            val ifBase = valueStack.size - info.paramArity
             if cond != 0 then
-              f.labels += Label(BlockKind.If, info.endPC, info.resultArity, valueStack.size)
+              f.labels += Label(BlockKind.If, info.endPC, info.resultArity, ifBase)
               f.pc = info.bodyStartPC
             else if info.elsePC >= 0 then
-              f.labels += Label(BlockKind.If, info.endPC, info.resultArity, valueStack.size)
+              f.labels += Label(BlockKind.If, info.endPC, info.resultArity, ifBase)
               f.pc = info.elsePC
             else
               f.pc = info.endPC

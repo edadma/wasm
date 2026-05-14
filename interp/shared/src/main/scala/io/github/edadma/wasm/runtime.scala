@@ -99,7 +99,7 @@ object Runtime:
       if typeIdx < 0 || typeIdx >= module.types.length then
         fail(WasmError.InvalidModule(s"function references type $typeIdx"))
       val sig = module.types(typeIdx)
-      val meta = Interpreter.computeBodyMeta(body.body) match
+      val meta = Interpreter.computeBodyMeta(body.body, module.types) match
         case Right(m) => m
         case Left(e)  => fail(e)
       funcs += Interpreter.WasmFunc(
@@ -223,6 +223,34 @@ object Runtime:
         if idx < 0 || idx >= tables.length then
           fail(WasmError.InvalidModule(s"export `$name` references invalid table $idx"))
       case _ => ()
+    }
+
+    // === Start (Section 8) =================================================
+    // Spec semantics: invoked AFTER imports + memory + data + globals +
+    // tables are in place — i.e. right here, just before the
+    // ModuleInstance becomes observable to callers. The function must
+    // have signature `() -> ()`; any other shape (or a bogus funcidx) is
+    // an `InvalidModule` at instantiation time.
+    //
+    // Side effects are real: a start function can `global.set` mutable
+    // globals, write to linear memory, even `call` exported functions
+    // through the table indirectly. Failures in the start function
+    // surface verbatim through `fail`, so the whole instantiation
+    // returns `Left(err)` to the caller — the partially-built instance
+    // is never observable.
+    module.startFunction.foreach { startIdx =>
+      if startIdx < 0 || startIdx >= funcs.size then
+        fail(WasmError.InvalidModule(s"start: invalid funcidx $startIdx"))
+      val sig = funcs(startIdx).signature
+      if sig.params.nonEmpty || sig.results.nonEmpty then
+        fail(WasmError.InvalidModule(
+          s"start: function $startIdx has signature $sig, expected () -> ()"))
+      val interp = new Interpreter(
+        funcs.toIndexedSeq, memory, globals, globalMutable, tables, module.types,
+      )
+      interp.invoke(startIdx, Seq.empty) match
+        case Right(_) => ()
+        case Left(e)  => fail(e)
     }
 
     new ModuleInstance(

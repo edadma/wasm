@@ -19,6 +19,8 @@ package io.github.edadma.wasm
   *   `ParserAndRuntimeTests`  — parser malformed, unsupported opcodes,
   *                              runtime/linking errors, env module smoke,
   *                              regressions, ModuleInstance accessors
+  *   `MultiValueAndStartTests` — Section 8 (Start) + multi-value blocks /
+  *                              loops / ifs / function signatures
   *
   * All shared state (`passed`, `failures`) and helpers (`test`, `check`,
   * `instantiate`, `callI32/64/F32/F64/V`, `expectError`, `patchByte`,
@@ -43,6 +45,7 @@ object InterpreterTest:
     MemoryTests.run()
     Leb128Tests.run()
     ParserAndRuntimeTests.run()
+    MultiValueAndStartTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

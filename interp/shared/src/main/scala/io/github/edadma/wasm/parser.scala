@@ -5,9 +5,9 @@ import scala.collection.mutable.ArrayBuffer
 /** Parser for the WebAssembly binary format (MVP subset).
   *
   * Recognised sections: Type (1), Import (2), Function (3), Table (4),
-  * Memory (5), Global (6), Export (7), Element (9), Code (10), Data (11).
-  * All other sections are skipped silently so we can be fed real-world
-  * modules that include Custom, Start, DataCount, etc. without choking.
+  * Memory (5), Global (6), Export (7), Start (8), Element (9), Code (10),
+  * Data (11). Custom (0) and DataCount (12) are skipped silently so we
+  * can be fed real-world modules that include them without choking.
   *
   * Style note: internally the parser uses a private `ParseFail` exception for
   * control flow because the section/instruction stream has many nested reads
@@ -92,6 +92,7 @@ object Parser:
     var elements  = Vector.empty[ElementSegment]
     var codes     = Vector.empty[FuncBody]
     var data      = Vector.empty[DataSegment]
+    var start     = Option.empty[Int]
 
     while c.hasMore do
       val id      = c.readByte()
@@ -107,17 +108,18 @@ object Parser:
         case 5  => memories  = parseMemorySection(c)
         case 6  => globals   = parseGlobalSection(c)
         case 7  => exports   = parseExportSection(c)
+        case 8  => start     = Some(parseStartSection(c))
         case 9  => elements  = parseElementSection(c)
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
-        case _  => () // ignore Custom (0), Start (8), DataCount (12)
+        case _  => () // ignore Custom (0), DataCount (12)
       c.pos = secEnd
 
     if codes.size != functions.size then
       fail(WasmError.InvalidModule(
         s"function/code section length mismatch: ${functions.size} types vs ${codes.size} bodies"))
 
-    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data)
+    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start)
 
   // === Type section ===
 
@@ -251,6 +253,14 @@ object Parser:
         case other => fail(WasmError.InvalidModule(s"unknown export kind 0x${other.toHexString}"))
       i += 1
     out.toVector
+
+  // === Start section ===
+
+  /** Parse Section 8: a single LEB u32 funcidx. The funcidx is validated
+    * at instantiation (against `funcs.size` and the function's signature
+    * — Start requires `() -> ()`) rather than here, because parsing
+    * doesn't have visibility into resolved imports' types. */
+  private def parseStartSection(c: Cursor): Int = c.readU32()
 
   // === Element section ===
 
