@@ -859,18 +859,42 @@ object Validator:
 
       // === SIMD prefix (0xFD) ============================================
       //
-      // Phase 8.E chunk A: only `v128.const` (sub 12) is checked. Body
-      // walker just advances past the 16-byte literal and pushes v128.
+      // Phase 8.E chunks A + B: foundations + lane-aware loads/stores.
       // Subsequent chunks will fan this out alongside the runtime
       // implementations.
       case 0xfd =>
         val sub = readU32()
         sub match
+          // --- Chunk A — foundations ----------------------------------
           case 12 =>                                                              // v128.const : 16 raw bytes
             if pc + 16 > body.length then
               fail("truncated v128.const literal")
             pc += 16
             pushVal(ValueType.V128Type)
+
+          // --- Chunk B — loads ----------------------------------------
+          //
+          // Every SIMD load: pop i32 addr, push v128. The immediate is a
+          // memarg, identical to the scalar loads in Phase 8.D.
+          case 0 |                                                                // v128.load
+               1 | 2 |                                                            // v128.load8x8_s / _u
+               3 | 4 |                                                            // v128.load16x4_s / _u
+               5 | 6 |                                                            // v128.load32x2_s / _u
+               7 | 8 | 9 | 10 |                                                   // v128.load{8,16,32,64}_splat
+               92 | 93 =>                                                         // v128.load32_zero / v128.load64_zero
+            skipMemArg("v128 load")
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+
+          // --- Chunk B — store ----------------------------------------
+          //
+          // Pops the v128 value first, then the i32 address (stack-top
+          // is the value, just like the scalar stores).
+          case 11 =>                                                              // v128.store
+            skipMemArg("v128.store")
+            popVal(ValueType.V128Type)
+            popVal(ValueType.I32Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
