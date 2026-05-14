@@ -8,11 +8,13 @@ import io.github.edadma.wasm.{HostFunc, HostModule, I32, Memory, ModuleInstance,
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.C the
-  * shim resolves nine syscalls: `fd_write`, `fd_close`, `proc_exit`,
-  * `args_sizes_get` / `args_get`, `environ_sizes_get` / `environ_get`,
-  * `clock_time_get`, and `random_get`. Phase 7.E will add the filesystem
-  * surface (`path_open` / `fd_read` / `fd_seek` / general-fd `fd_close`).
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.1 the
+  * shim resolves eleven syscalls: `fd_write`, `fd_close` (stdio-only),
+  * `proc_exit`, `args_sizes_get` / `args_get`, `environ_sizes_get` /
+  * `environ_get`, `clock_time_get`, `random_get`, `fd_prestat_get`,
+  * and `fd_prestat_dir_name`. Phase 7.E.2 will add the file-handle
+  * surface (`path_open` / `fd_read` / `fd_seek` / general-fd `fd_close`
+  * / `fd_filestat_get`).
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -56,6 +58,11 @@ object Wasi:
   /** Invalid argument — passed for shape-of-args failures (e.g. wrong arity)
     * before we surface a more-specific code. */
   val EINVAL:   Int = 28
+  /** Name too long — `fd_prestat_dir_name` was given a buffer smaller than
+    * the preopen name. wasi-libc's normal call sequence reads `name_len`
+    * from `fd_prestat_get` first, so this is a caller bug rather than a
+    * legitimate "ask the host to truncate" request. */
+  val ENAMETOOLONG: Int = 37
 
   // === proc_exit unwind exception ===========================================
 
@@ -86,15 +93,17 @@ object Wasi:
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
-        "fd_write"          -> ((mem, args) => fdWrite(mem, args, ctx)),
-        "fd_close"          -> ((_,   args) => fdClose(args)),
-        "proc_exit"         -> ((_,   args) => procExit(args)),
-        "args_sizes_get"    -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
-        "args_get"          -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
-        "environ_sizes_get" -> ((mem, args) => sizesGet(mem, args, envEntries(ctx))),
-        "environ_get"       -> ((mem, args) => entriesGet(mem, args, envEntries(ctx))),
-        "clock_time_get"    -> ((mem, args) => clockTimeGet(mem, args, ctx)),
-        "random_get"        -> ((mem, args) => randomGet(mem, args, ctx)),
+        "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx)),
+        "fd_close"            -> ((_,   args) => fdClose(args)),
+        "proc_exit"           -> ((_,   args) => procExit(args)),
+        "args_sizes_get"      -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
+        "args_get"            -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
+        "environ_sizes_get"   -> ((mem, args) => sizesGet(mem, args, envEntries(ctx))),
+        "environ_get"         -> ((mem, args) => entriesGet(mem, args, envEntries(ctx))),
+        "clock_time_get"      -> ((mem, args) => clockTimeGet(mem, args, ctx)),
+        "random_get"          -> ((mem, args) => randomGet(mem, args, ctx)),
+        "fd_prestat_get"      -> ((mem, args) => prestatGet(mem, args, ctx)),
+        "fd_prestat_dir_name" -> ((mem, args) => prestatDirName(mem, args, ctx)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -366,6 +375,92 @@ object Wasi:
         else Seq(I32(EBADF))
       case _ => Seq(I32(EINVAL))
 
+  // === preopen scaffolding (Phase 7.E.1) ====================================
+  //
+  // wasi-libc walks fd 3 upward at startup, asking `fd_prestat_get` for
+  // each, until the host returns EBADF. Each surviving fd is then
+  // queried with `fd_prestat_dir_name` to learn the directory's
+  // wasi-visible name; userspace builds a name→fd map and resolves all
+  // relative paths through it. 7.E.1 ships just this introspection
+  // surface — Phase 7.E.2 extends [[WasiContext.Preopen]] with
+  // `open(path, ...)` and adds `path_open` / `fd_read` / `fd_seek` /
+  // general-fd `fd_close`.
+  //
+  // The fd→preopen map is the index `fd - 3` into `ctx.preopens`: the
+  // first preopen lives at fd 3, the second at fd 4, etc. No mutable
+  // fd table is required at this slice because preopens are static for
+  // the lifetime of a `WasiContext`.
+
+  /** `fd_prestat_get(fd: i32, buf: i32) -> errno`
+    *
+    * Writes the 8-byte `prestat` struct at `buf`:
+    *
+    *   offset 0       : u8  tag (always 0 = `dir`; the only currently
+    *                          defined preopentype variant)
+    *   offset 1 .. 3  : u8  reserved padding (must be zero)
+    *   offset 4 .. 7  : u32 `pr_name_len` in little-endian — number of
+    *                        UTF-8 bytes in the directory's name
+    *
+    * The struct is a tagged union under the wasi witx; reserved padding
+    * matters because a future variant may pack additional fields after
+    * the tag, so we explicitly zero bytes 1..3 rather than leaving
+    * whatever the program last wrote there.
+    *
+    * Errno discipline: EFAULT if `buf+8` is out of bounds; EBADF if
+    * `fd < 3` or `fd - 3 >= ctx.preopens.length`. On EBADF/EFAULT no
+    * bytes are written. */
+  private def prestatGet(memory: Memory, args: Seq[Value],
+                         ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(buf)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if buf < 0 || buf.toLong + 8L > dataLen then
+          return Seq(I32(EFAULT))
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        val nameBytes = ctx.preopens(idx).name.getBytes("UTF-8")
+        data(buf    ) = 0   // tag = 0 (dir)
+        data(buf + 1) = 0   // reserved
+        data(buf + 2) = 0
+        data(buf + 3) = 0
+        writeI32LE(data, buf + 4, nameBytes.length)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_prestat_dir_name(fd: i32, path_ptr: i32, path_len: i32) -> errno`
+    *
+    * Writes exactly `path_len` UTF-8 bytes of the preopen's directory
+    * name at `path_ptr`. The wasi-libc call sequence reads `pr_name_len`
+    * from [[prestatGet]] and allocates a buffer of exactly that size,
+    * so a `path_len` that doesn't match the name length means caller
+    * bug rather than a legitimate truncation request — we return
+    * `ENAMETOOLONG` rather than silently writing a partial name. This
+    * matches wasmtime and uvwasi (wasmer truncates silently — we
+    * deliberately don't).
+    *
+    * Order of checks: EBADF (we need the preopen to know `nameBytes`)
+    * → ENAMETOOLONG (`path_len < nameBytes.length`) → EFAULT (memory
+    * range). On any non-success errno no bytes are written. */
+  private def prestatDirName(memory: Memory, args: Seq[Value],
+                             ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(pathPtr), I32(pathLen)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        val nameBytes = ctx.preopens(idx).name.getBytes("UTF-8")
+        if pathLen < nameBytes.length then
+          return Seq(I32(ENAMETOOLONG))
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathPtr.toLong + pathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        System.arraycopy(nameBytes, 0, data, pathPtr, nameBytes.length)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
   /** `proc_exit(rval: i32) -> noreturn`
     *
     * The unwind that lets a wasi program signal its exit code. Throws
@@ -429,24 +524,58 @@ end Wasi
   * memory and accepts injected `Clock` / `random` for deterministic
   * runs.
   *
-  * @param args   Argv as seen by the wasi program.
-  * @param envs   Environment entries as `(NAME, value)` pairs.
-  * @param stdout Byte writer for fd 1.
-  * @param stderr Byte writer for fd 2.
-  * @param clock  Realtime + monotonic clock sources (nanoseconds).
-  * @param random `n => Array[Byte]` of length `n` that fills
-  *               `random_get` buffers.
+  * @param args     Argv as seen by the wasi program.
+  * @param envs     Environment entries as `(NAME, value)` pairs.
+  * @param stdout   Byte writer for fd 1.
+  * @param stderr   Byte writer for fd 2.
+  * @param clock    Realtime + monotonic clock sources (nanoseconds).
+  * @param random   `n => Array[Byte]` of length `n` that fills
+  *                 `random_get` buffers.
+  * @param preopens Preopened directories the wasi program inherits.
+  *                 The i-th preopen is exposed at fd `3 + i`. Default
+  *                 is empty — userspace then sees just stdin/stdout/
+  *                 stderr and any `path_open` of a relative path fails.
   */
 final case class WasiContext(
-    args:   Seq[String]             = Seq.empty,
-    envs:   Seq[(String, String)]   = Seq.empty,
-    stdout: Int => Unit             = WasiContext.defaultStdout,
-    stderr: Int => Unit             = WasiContext.defaultStderr,
-    clock:  WasiContext.Clock       = WasiContext.systemClock,
-    random: Int => Array[Byte]      = WasiContext.defaultRandom,
+    args:     Seq[String]                  = Seq.empty,
+    envs:     Seq[(String, String)]        = Seq.empty,
+    stdout:   Int => Unit                  = WasiContext.defaultStdout,
+    stderr:   Int => Unit                  = WasiContext.defaultStderr,
+    clock:    WasiContext.Clock            = WasiContext.systemClock,
+    random:   Int => Array[Byte]           = WasiContext.defaultRandom,
+    preopens: Seq[WasiContext.Preopen]     = Seq.empty,
 )
 
 object WasiContext:
+
+  /** A preopened directory exposed to the wasi program. wasi-libc walks
+    * fds 3, 4, … at startup, asking `fd_prestat_get` for each, and
+    * stops when the host returns EBADF; it then builds a name→fd map
+    * from `fd_prestat_dir_name` and resolves all relative paths
+    * through it. The wasi-visible directory `name` is what userspace
+    * matches against.
+    *
+    * Phase 7.E.1 ships just the name surface — the `Preopen` trait is
+    * deliberately minimal so the prestat-walk syscalls can land
+    * standalone. Phase 7.E.2 will extend this with `open(path, ...)`
+    * returning an `FsFile` handle, at which point `path_open`,
+    * `fd_read`, `fd_seek`, and general-fd `fd_close` arrive together
+    * with the in-memory `Fs` impl tests need.
+    *
+    * `name` is interpreted as UTF-8 — `fd_prestat_get`'s `pr_name_len`
+    * and `fd_prestat_dir_name`'s output buffer both deal in bytes,
+    * not chars, so non-ASCII preopen names cross the host/wasm
+    * boundary without surprise. */
+  trait Preopen:
+    def name: String
+
+  object Preopen:
+    /** A trivial preopen carrying just a wasi-visible directory name.
+      * Useful at Phase 7.E.1, where no FS operations exist yet — once
+      * 7.E.2 lands `path_open` the trait gains additional methods and
+      * tests will reach for richer factories. */
+    def named(n: String): Preopen = new Preopen:
+      val name: String = n
 
   /** A pair of clocks — wall clock and a non-decreasing monotonic source.
     * Both surfaced as nanoseconds because that's the wasi-preview1 ABI
@@ -499,30 +628,34 @@ object WasiContext:
     * decoded strings; the `.context` field is the `WasiContext` you
     * pass to [[Wasi.preview1]]. Tests use this to assert on the
     * program's output without touching the real stdout/stderr; the
-    * `clock` / `random` overrides let them assert on deterministic
-    * clock + random reads as well. */
-  def collecting(args:   Seq[String]              = Seq.empty,
-                 envs:   Seq[(String, String)]    = Seq.empty,
-                 clock:  Clock                    = systemClock,
-                 random: Int => Array[Byte]       = defaultRandom): Collecting =
-    new Collecting(args, envs, clock, random)
+    * `clock` / `random` / `preopens` overrides let them assert on
+    * deterministic clock, random, and filesystem-introspection reads
+    * as well. */
+  def collecting(args:     Seq[String]              = Seq.empty,
+                 envs:     Seq[(String, String)]    = Seq.empty,
+                 clock:    Clock                    = systemClock,
+                 random:   Int => Array[Byte]       = defaultRandom,
+                 preopens: Seq[Preopen]             = Seq.empty): Collecting =
+    new Collecting(args, envs, clock, random, preopens)
 
   /** Captures stdout/stderr bytes from a wasi program. Threading-wise
     * this is single-threaded — the interpreter is single-threaded, so
     * we don't synchronize the underlying buffers. */
-  final class Collecting private[wasi] (args:   Seq[String],
-                                        envs:   Seq[(String, String)],
-                                        clock:  Clock,
-                                        random: Int => Array[Byte]):
+  final class Collecting private[wasi] (args:     Seq[String],
+                                        envs:     Seq[(String, String)],
+                                        clock:    Clock,
+                                        random:   Int => Array[Byte],
+                                        preopens: Seq[Preopen]):
     private val stdoutBuf = ArrayBuffer.empty[Byte]
     private val stderrBuf = ArrayBuffer.empty[Byte]
     val context: WasiContext = WasiContext(
-      args   = args,
-      envs   = envs,
-      stdout = b => stdoutBuf += b.toByte,
-      stderr = b => stderrBuf += b.toByte,
-      clock  = clock,
-      random = random,
+      args     = args,
+      envs     = envs,
+      stdout   = b => stdoutBuf += b.toByte,
+      stderr   = b => stderrBuf += b.toByte,
+      clock    = clock,
+      random   = random,
+      preopens = preopens,
     )
     def stdoutBytes:  Array[Byte] = stdoutBuf.toArray
     def stderrBytes:  Array[Byte] = stderrBuf.toArray

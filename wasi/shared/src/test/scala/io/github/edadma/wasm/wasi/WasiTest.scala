@@ -12,6 +12,9 @@ package io.github.edadma.wasm.wasi
   *   `WasiFdTests`        — fd_write, fd_close, proc_exit, Wasi.run misc
   *   `WasiArgsTests`      — args_*, environ_*
   *   `WasiClockTests`     — clock_time_get, random_get
+  *   `WasiFsTests`        — fd_prestat_get, fd_prestat_dir_name
+  *                          (Phase 7.E.1 — file-handle syscalls land in
+  *                          Phase 7.E.2)
   *   `WasiRealRustTests`  — end-to-end smoke against a rustc-built
   *                          wasm32-wasip1 hello world (Phase 7.D)
   *
@@ -29,6 +32,7 @@ object WasiTest:
     WasiFdTests.run()
     WasiArgsTests.run()
     WasiClockTests.run()
+    WasiFsTests.run()
     WasiRealRustTests.run()
 
     println()
