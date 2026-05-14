@@ -1286,6 +1286,159 @@ object WasiFsTests:
         case other => check(false, s"call_path_unlink_file(fd=1): $other")
     }
 
+    // ----- FDFLAGS_APPEND + fd_fdstat_set_flags (hardening pass) ----------
+    //
+    // APPEND (FDFLAGS bit 0) means "every write seeks to end first". A
+    // freshly opened APPEND-fd writes to offset 0 the first time (file
+    // is empty), then to file.size on subsequent writes. fd_fdstat_set_flags
+    // lets userspace flip the bit on an already-open fd.
+
+    test("path_open: FDFLAGS_APPEND seeds the fd's fs_flags + writes seek to end") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("log" -> "hello".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // Open the existing file with FDFLAGS_APPEND = 0x01.
+      val fd = openWithAppend(inst, "log")
+      // fd_fdstat_get reports the APPEND bit at byte 2.
+      callFdFdstatGet(inst, fd, 512) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"fdstat: $e")
+        case other              => check(false, s"call_fd_fdstat_get: $other")
+      check(loadByte(inst, 512 + 2) == 0x01,
+            s"fs_flags[lo]=${loadByte(inst, 512 + 2)} (want APPEND=1)")
+      // Plant " world" at 768, write via single iovec — cursor was 0,
+      // APPEND moves it to 5 (file size) first.
+      val payload = " world".getBytes("UTF-8")
+      storeBytes(inst, 768, payload)
+      storeI32(inst, 256, 768)               // iov.buf
+      storeI32(inst, 260, payload.length)    // iov.len
+      callFdWrite(inst, fd, iovs = 256, iovsLen = 1, nwrittenOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"fd_write: $e")
+        case other              => check(false, s"call_fd_write: $other")
+      // File should now be "hello world" — the seek-to-end happened
+      // before the write, so the original "hello" survived.
+      val bytes = preopen.bytesOf("log").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "hello world",
+            s"file bytes='${new String(bytes, "UTF-8")}' (want 'hello world')")
+    }
+
+    test("FDFLAGS_APPEND ignores prior fd_seek (every write rewinds to end)") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("log" -> "ABC".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithAppend(inst, "log")
+      // Seek to 0 — under non-APPEND semantics, a subsequent write would
+      // overwrite from byte 0. Under APPEND, the seek is effectively
+      // discarded by the next write.
+      callFdSeek(inst, fd, offset = 0L, whence = 0, newOffsetOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"seek: $e")
+        case other              => check(false, s"call_fd_seek: $other")
+      storeBytes(inst, 768, "DEF".getBytes("UTF-8"))
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 3)
+      callFdWrite(inst, fd, iovs = 256, iovsLen = 1, nwrittenOut = 324) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"write: $e")
+        case other              => check(false, s"call_fd_write: $other")
+      val bytes = preopen.bytesOf("log").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "ABCDEF",
+            s"file='${new String(bytes, "UTF-8")}' (want 'ABCDEF')")
+    }
+
+    test("fd_fdstat_set_flags: turning APPEND on changes write semantics") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("log" -> "AB".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // Open without APPEND; cursor is 0.
+      storePath(inst, 0, "log")
+      val fd = openWithFlags(inst, "log", oflags = 0)
+      // Flip APPEND on via fd_fdstat_set_flags.
+      inst.invoke("call_fd_fdstat_set_flags",
+                  Seq(I32(fd), I32(Wasi.FDFLAGS_APPEND))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"set_flags errno=$e")
+        case other => check(false, s"call_fd_fdstat_set_flags: $other")
+      // fd_fdstat_get reflects the new flag.
+      callFdFdstatGet(inst, fd, 512) match
+        case Right(Seq(I32(_))) => ()
+        case other              => check(false, s"fdstat: $other")
+      check(loadByte(inst, 512 + 2) == 0x01,
+            s"fs_flags after set=${loadByte(inst, 512 + 2)} (want APPEND)")
+      // Now write — cursor was at 0, APPEND seeks to 2 first.
+      storeBytes(inst, 768, "C".getBytes("UTF-8"))
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 1)
+      callFdWrite(inst, fd, iovs = 256, iovsLen = 1, nwrittenOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"write: $e")
+        case other              => check(false, s"call_fd_write: $other")
+      val bytes = preopen.bytesOf("log").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "ABC",
+            s"file='${new String(bytes, "UTF-8")}' (want 'ABC' — APPEND took effect)")
+    }
+
+    test("fd_fdstat_set_flags: NONBLOCK/DSYNC/RSYNC/SYNC round-trip through fdstat") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes("UTF-8")), "f")
+      // NONBLOCK = 0x04, DSYNC = 0x02, RSYNC = 0x08, SYNC = 0x10.
+      // Combined = 0x1E. None has a behavioural effect in our shim but
+      // they must round-trip through fdstat for userspace inspection.
+      val flags = 0x1E
+      inst.invoke("call_fd_fdstat_set_flags",
+                  Seq(I32(4), I32(flags))) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"set: $e")
+        case other              => check(false, s"set_flags: $other")
+      callFdFdstatGet(inst, 4, 512) match
+        case Right(Seq(I32(_))) => ()
+        case other              => check(false, s"fdstat: $other")
+      // fs_flags is u16 LE at byte 2. Read both bytes back.
+      val lo = loadByte(inst, 512 + 2)
+      val hi = loadByte(inst, 512 + 3)
+      val readBack = lo | (hi << 8)
+      check(readBack == flags,
+            s"round-trip flags=$readBack (want $flags)")
+    }
+
+    test("fd_fdstat_set_flags: stdio fds accept any flags as a no-op success") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq.empty)
+      // wasi-libc flips NONBLOCK on stdin during line-buffered input.
+      for fd <- Seq(0, 1, 2) do
+        inst.invoke("call_fd_fdstat_set_flags",
+                    Seq(I32(fd), I32(Wasi.FDFLAGS_NONBLOCK))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd errno=$e")
+          case other => check(false, s"set_flags(fd=$fd): $other")
+      // The stored flags don't actually update (stdio has no per-fd
+      // state); fdstat keeps reporting 0.
+      callFdFdstatGet(inst, 0, 512) match
+        case Right(Seq(I32(_))) => ()
+        case other              => check(false, s"fdstat: $other")
+      check(loadByte(inst, 512 + 2) == 0,
+            s"stdio fs_flags after set still 0")
+    }
+
+    test("fd_fdstat_set_flags: preopen-dir + unknown fd return EBADF") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      // Preopen-dir fd doesn't carry per-fd flags in this model.
+      inst.invoke("call_fd_fdstat_set_flags",
+                  Seq(I32(3), I32(Wasi.FDFLAGS_APPEND))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"preopen errno=$e (want EBADF)")
+        case other => check(false, s"set_flags(fd=3): $other")
+      // Never-opened fd.
+      inst.invoke("call_fd_fdstat_set_flags",
+                  Seq(I32(99), I32(0))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"unknown errno=$e (want EBADF)")
+        case other => check(false, s"set_flags(fd=99): $other")
+      // Negative fd.
+      inst.invoke("call_fd_fdstat_set_flags",
+                  Seq(I32(-1), I32(0))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"negative errno=$e (want EBADF)")
+        case other => check(false, s"set_flags(fd=-1): $other")
+    }
+
     test("path_unlink_file: open handle survives unlink (POSIX inode semantics)") {
       // Open a file, unlink it, then read from the still-open handle.
       // The handle keeps its own FileCell reference, so the bytes are
@@ -1400,6 +1553,22 @@ object WasiFsTests:
                           nwrittenOut:  Int) =
     inst.invoke("call_fd_write",
                 Seq(I32(fd), I32(iovs), I32(iovsLen), I32(nwrittenOut)))
+
+  /** Open `pathKey` against the single-preopen fixture with
+    * `FDFLAGS_APPEND` set in the fdflags arg. Plant the path bytes at
+    * addr 0, return the allocated fd. Used by APPEND regression tests
+    * as common boilerplate. The instance must already have been
+    * instantiated with a single in-memory preopen. */
+  private def openWithAppend(inst: ModuleInstance, pathKey: String): Int =
+    storePath(inst, 0, pathKey)
+    callPathOpenFlags(inst, dirfd = 3, pathPtr = 0,
+                      pathLen = pathKey.getBytes("UTF-8").length,
+                      oflags  = 0,
+                      fdflags = Wasi.FDFLAGS_APPEND,
+                      openedFdOut = 64) match
+      case Right(Seq(I32(e))) if e == Wasi.ESUCCESS => ()
+      case other => throw new AssertionError(s"openWithAppend: $other")
+    peekI32(inst, 64)
 
   /** Open `pathKey` against the single-preopen fixture with the given
     * `oflags`, plant the path bytes at addr 0, and return the freshly

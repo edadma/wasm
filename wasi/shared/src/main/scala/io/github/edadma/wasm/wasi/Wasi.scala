@@ -280,6 +280,7 @@ object Wasi:
         "fd_seek"             -> ((mem, args) => fdSeek(mem, args, ctx, fdTable)),
         "fd_filestat_get"     -> ((mem, args) => fdFilestatGet(mem, args, ctx, fdTable)),
         "fd_fdstat_get"       -> ((mem, args) => fdFdstatGet(mem, args, ctx, fdTable)),
+        "fd_fdstat_set_flags" -> ((_,   args) => fdFdstatSetFlags(args, ctx, fdTable)),
         "proc_exit"           -> ((_,   args) => procExit(args)),
         "args_sizes_get"      -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
         "args_get"            -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
@@ -348,8 +349,16 @@ object Wasi:
           case 1 => Some(ctx.stdout)
           case 2 => Some(ctx.stderr)
           case _ => None
-        val file: Option[FsFile] = lookupFile(fd, ctx, fdTable)
+        val entry: Option[FdEntry] = lookupFileEntry(fd, ctx, fdTable)
+        val file:  Option[FsFile]  = entry.map(_.file)
         if stdio.isEmpty && file.isEmpty then return Seq(I32(EBADF))
+
+        // APPEND semantics: before the very first iovec lands, seek to
+        // end-of-file. POSIX `O_APPEND` is per-write atomic (the seek
+        // and the write together can't be interleaved by another
+        // writer) — single-threaded host satisfies that trivially.
+        for e <- entry if (e.fdflags & FDFLAGS_APPEND) != 0 do
+          e.file.seek(e.file.size)
 
         // Chase through `memory.data` once — the interpreter can't
         // grow memory while a host call is in flight (no wasm code
@@ -422,6 +431,12 @@ object Wasi:
   private inline def lookupFile(fd: Int, ctx: WasiContext,
                                 fdTable: FdTable): Option[FsFile] =
     if fd < 3 + ctx.preopens.length then None else fdTable.lookup(fd)
+
+  /** Same dispatch as [[lookupFile]] but returns the full [[FdEntry]]
+    * so callers can read the per-fd flags (APPEND etc.). */
+  private inline def lookupFileEntry(fd: Int, ctx: WasiContext,
+                                     fdTable: FdTable): Option[FdEntry] =
+    if fd < 3 + ctx.preopens.length then None else fdTable.lookupEntry(fd)
 
   /** `fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> errno`
     *
@@ -611,11 +626,12 @@ object Wasi:
           return Seq(I32(EFAULT))
 
         // Same EBADF-atomic discipline as fd_filestat_get: resolve the
-        // filetype and rights pair before touching `buf` so a bad fd
-        // leaves the destination untouched.
-        var filetype: Byte = 0
-        var rights:      Long = 0L
-        var inheriting:  Long = 0L
+        // filetype, rights, and fs_flags before touching `buf` so a bad
+        // fd leaves the destination untouched.
+        var filetype:   Byte = 0
+        var rights:     Long = 0L
+        var inheriting: Long = 0L
+        var fsFlags:    Int  = 0
         if fd < 0 then return Seq(I32(EBADF))
         else if fd <= 2 then
           filetype   = 2                          // CHARACTER_DEVICE — stdio
@@ -626,11 +642,12 @@ object Wasi:
           rights     = RIGHTS_DIRECTORY_BASE
           inheriting = RIGHTS_DIRECTORY_INHERITING
         else
-          fdTable.lookup(fd) match
-            case Some(_) =>
+          fdTable.lookupEntry(fd) match
+            case Some(entry) =>
               filetype   = 4                      // REGULAR_FILE — opened file
               rights     = RIGHTS_REGULAR_FILE
               inheriting = 0L                     // files don't open children
+              fsFlags    = entry.fdflags
             case None => return Seq(I32(EBADF))
 
         var i = 0
@@ -638,10 +655,48 @@ object Wasi:
           data(bufPtr + i) = 0
           i += 1
         data(bufPtr + 0) = filetype
-        // fs_flags @ 2..3 stays 0 (per-fd state not yet tracked).
+        // fs_flags @ 2..3 — per-fd flags (APPEND/DSYNC/NONBLOCK/RSYNC/SYNC).
+        // The high byte is currently always 0 (all defined bits live in
+        // the low 5).
+        data(bufPtr + 2) = (fsFlags & 0xff).toByte
+        data(bufPtr + 3) = ((fsFlags >>> 8) & 0xff).toByte
         writeI64LE(data, bufPtr + 8,  rights)
         writeI64LE(data, bufPtr + 16, inheriting)
         Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_fdstat_set_flags(fd: i32, flags: i32) -> errno`
+    *
+    * Update the per-fd `fdflags` bitmap. Only [[FDFLAGS_APPEND]]
+    * currently has a behavioural effect (next write seeks to end
+    * first); the other defined bits are stored and round-trip through
+    * `fd_fdstat_get`.
+    *
+    * fd dispatch:
+    *   - `fd 0/1/2` — accepted as a no-op success. wasi-libc flips
+    *     `O_NONBLOCK` on stdio during line-buffered input; our shim
+    *     has no blocking model so silently accepting is the right
+    *     answer. Userspace can re-read the flags via `fd_fdstat_get`
+    *     and will see them unchanged (still 0).
+    *   - preopen-dir fds → EBADF (directories don't carry per-fd
+    *     flags in our model; a future hardening pass could broaden).
+    *   - FdTable entries → update `entry.fdflags`. Any bits not
+    *     defined by wasi-preview1 are silently kept (we don't reject
+    *     them — uvwasi does the same).
+    *   - unknown fd → EBADF. */
+  private def fdFdstatSetFlags(args: Seq[Value], ctx: WasiContext,
+                               fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(flags)) =>
+        if fd < 0 then Seq(I32(EBADF))
+        else if fd <= 2 then Seq(I32(ESUCCESS))
+        else if fd - 3 < ctx.preopens.length then Seq(I32(EBADF))
+        else
+          fdTable.lookupEntry(fd) match
+            case Some(entry) =>
+              entry.fdflags = flags
+              Seq(I32(ESUCCESS))
+            case None => Seq(I32(EBADF))
       case _ => Seq(I32(EINVAL))
 
   // === args + environ (Phase 7.B) ===========================================
@@ -1137,46 +1192,82 @@ object Wasi:
 
         ctx.preopens(idx).open(path, oflags, fdflags) match
           case Right(file) =>
-            val fd = fdTable.alloc(file)
+            // Stash the caller-requested fdflags on the fd table entry.
+            // APPEND (bit 0) is what enforces "every write seeks to end
+            // first" in fd_write; the other bits are accepted but
+            // currently inert.
+            val fd = fdTable.alloc(file, fdflags)
             writeI32LE(data, openedFdOut, fd)
             Seq(I32(ESUCCESS))
           case Left(errno) => Seq(I32(errno))
 
       case _ => Seq(I32(EINVAL))
 
+  /** Per-fd entry in the [[FdTable]]: the open file handle plus the
+    * `fdflags` bitmap (APPEND / NONBLOCK / SYNC). `fdflags` is `var`
+    * so `fd_fdstat_set_flags` can update it without reallocating the
+    * slot. Only [[FDFLAGS_APPEND]] currently has a behavioural effect
+    * in the shim — APPEND seeks to end before every write — but the
+    * other bits are stored and reported back through `fd_fdstat_get`
+    * for userspace round-tripping. */
+  private[wasi] final class FdEntry(val file: FsFile, var fdflags: Int)
+
+  // === FDFLAGS bits (wasi-preview1) =========================================
+  //
+  // Each bit is a per-fd flag controlling read/write semantics.
+  // wasi-libc translates POSIX O_APPEND / O_NONBLOCK / O_DSYNC / O_RSYNC
+  // / O_SYNC into these. Only APPEND has an enforced behaviour today:
+  // a write through an APPEND-flagged fd unconditionally seeks to end
+  // first. NONBLOCK / DSYNC / RSYNC / SYNC are accepted, stored, and
+  // round-tripped through `fd_fdstat_get`, but have no other effect
+  // (InMemoryFs has no buffering, no blocking, no separate sync layer).
+
+  /** Bit 0: every write seeks to end-of-file first. */
+  private[wasi] val FDFLAGS_APPEND:   Int = 1 << 0
+  private[wasi] val FDFLAGS_DSYNC:    Int = 1 << 1
+  private[wasi] val FDFLAGS_NONBLOCK: Int = 1 << 2
+  private[wasi] val FDFLAGS_RSYNC:    Int = 1 << 3
+  private[wasi] val FDFLAGS_SYNC:     Int = 1 << 4
+
   /** Per-instantiation table of opened-file fds. Allocates monotonically
     * from `3 + preopens.length` and reuses the smallest free slot after
     * a `release`. Not thread-safe — the interpreter is single-threaded,
     * and host calls run synchronously on the same thread, so a mutable
-    * `ArrayBuffer[Option[FsFile]]` is the right shape.
+    * `ArrayBuffer[Option[FdEntry]]` is the right shape.
     *
-    * Slot semantics: `None` = free, `Some(file)` = owned. We don't track
-    * a separate "high-water mark" because growing the buffer is O(1)
-    * amortised and the array stays small in practice (a typical wasi
-    * program holds a handful of fds, not thousands). */
+    * Slot semantics: `None` = free, `Some(entry)` = owned. We don't
+    * track a separate "high-water mark" because growing the buffer is
+    * O(1) amortised and the array stays small in practice (a typical
+    * wasi program holds a handful of fds, not thousands). */
   private final class FdTable(preopenCount: Int):
     import scala.collection.mutable.ArrayBuffer
-    private val baseFd: Int                    = 3 + preopenCount
-    private val slots:  ArrayBuffer[Option[FsFile]] = ArrayBuffer.empty
+    private val baseFd: Int                       = 3 + preopenCount
+    private val slots:  ArrayBuffer[Option[FdEntry]] = ArrayBuffer.empty
 
-    /** Allocate a new fd backed by `file`. Returns the smallest free fd
-      * at or above `baseFd`. Grows the table by one slot if every
-      * existing slot is occupied. */
-    def alloc(file: FsFile): Int =
+    /** Allocate a new fd backed by `file` with initial `fdflags`.
+      * Returns the smallest free fd at or above `baseFd`. Grows the
+      * table by one slot if every existing slot is occupied. */
+    def alloc(file: FsFile, fdflags: Int = 0): Int =
+      val entry = new FdEntry(file, fdflags)
       var i = 0
       while i < slots.length do
         if slots(i).isEmpty then
-          slots(i) = Some(file)
+          slots(i) = Some(entry)
           return baseFd + i
         i += 1
-      slots += Some(file)
+      slots += Some(entry)
       baseFd + slots.length - 1
 
-    /** Look up the [[FsFile]] for `fd`. `None` for any fd below `baseFd`,
-      * above the high-water mark, or in a released slot. */
-    def lookup(fd: Int): Option[FsFile] =
+    /** Look up the [[FdEntry]] for `fd`. `None` for any fd below
+      * `baseFd`, above the high-water mark, or in a released slot. */
+    def lookupEntry(fd: Int): Option[FdEntry] =
       val i = fd - baseFd
       if i >= 0 && i < slots.length then slots(i) else None
+
+    /** Look up the [[FsFile]] for `fd` — convenience wrapper around
+      * [[lookupEntry]] that drops the flags. Kept for callers that
+      * don't care about the per-fd state. */
+    def lookup(fd: Int): Option[FsFile] = lookupEntry(fd).map(_.file)
 
     /** Release a fd's slot. `true` if it was actually occupied, `false`
       * if `fd` was out of range or already released. */

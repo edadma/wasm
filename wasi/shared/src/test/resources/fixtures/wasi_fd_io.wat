@@ -34,6 +34,8 @@
     (func $fd_filestat_get (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_fdstat_get"
     (func $fd_fdstat_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_fdstat_set_flags"
+    (func $fd_fdstat_set_flags (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_filestat_get"
     (func $path_filestat_get (param i32 i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_sync"
@@ -105,6 +107,12 @@
     local.get $fd
     local.get $buf
     call $fd_fdstat_get)
+
+  (func (export "call_fd_fdstat_set_flags")
+        (param $fd i32) (param $flags i32) (result i32)
+    local.get $fd
+    local.get $flags
+    call $fd_fdstat_set_flags)
 
   (func (export "call_path_filestat_get")
         (param $fd i32) (param $lookupflags i32)
