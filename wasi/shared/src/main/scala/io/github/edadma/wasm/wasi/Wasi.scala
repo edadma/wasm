@@ -8,13 +8,13 @@ import io.github.edadma.wasm.{HostFunc, HostModule, I32, Memory, ModuleInstance,
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.1 the
-  * shim resolves eleven syscalls: `fd_write`, `fd_close` (stdio-only),
-  * `proc_exit`, `args_sizes_get` / `args_get`, `environ_sizes_get` /
-  * `environ_get`, `clock_time_get`, `random_get`, `fd_prestat_get`,
-  * and `fd_prestat_dir_name`. Phase 7.E.2 will add the file-handle
-  * surface (`path_open` / `fd_read` / `fd_seek` / general-fd `fd_close`
-  * / `fd_filestat_get`).
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.2 the
+  * shim resolves twelve syscalls: `fd_write`, `fd_close` (full table —
+  * stdio, preopens, opened-file fds), `proc_exit`, `args_sizes_get` /
+  * `args_get`, `environ_sizes_get` / `environ_get`, `clock_time_get`,
+  * `random_get`, `fd_prestat_get`, `fd_prestat_dir_name`, and
+  * `path_open`. Phase 7.E.3 will land the read/seek/stat trio
+  * (`fd_read` / `fd_seek` / `fd_filestat_get`).
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -63,6 +63,36 @@ object Wasi:
     * from `fd_prestat_get` first, so this is a caller bug rather than a
     * legitimate "ask the host to truncate" request. */
   val ENAMETOOLONG: Int = 37
+  /** No such file or directory — `path_open`'s preopen-resolved lookup
+    * didn't find the path in its FS. The conventional return when a
+    * user-typed path doesn't exist. */
+  val ENOENT:       Int = 44
+  /** Capability insufficient — the preopen advertises its name but has no
+    * FS capability behind it ([[WasiContext.Preopen.named]]). A program
+    * asking to `path_open` through it gets this errno rather than
+    * `ENOENT`, because the distinction matters: ENOENT says "no such
+    * path", ENOTCAPABLE says "you can't even ask through this preopen". */
+  val ENOTCAPABLE:  Int = 76
+
+  // === File handle abstraction (Phase 7.E.2) ================================
+
+  /** An opaque handle to an opened file, returned by
+    * [[WasiContext.Preopen.open]] and stored in the per-instantiation fd
+    * table that `Wasi.preview1` allocates.
+    *
+    * Phase 7.E.2 ships only `close()` — the lifecycle hook. Phase 7.E.3
+    * extends the trait with `read` / `seek` / `size` for `fd_read`,
+    * `fd_seek`, and `fd_filestat_get`. Splitting the surface keeps each
+    * sub-phase's diff focused, and the 7.E.2 InMemoryFs impl already
+    * carries the bytes it would need to satisfy the 7.E.3 methods. */
+  trait FsFile:
+    /** Release any host resources backing this handle. For the in-memory
+      * test impl this is a no-op. Real-FS impls (a future
+      * `java.nio.file`-backed `Preopen`) close their underlying handle
+      * here. Return type is `Unit` for the slim 7.E.2 surface — real-FS
+      * impls that surface close errors can refactor to
+      * `Either[Int, Unit]` later. */
+    def close(): Unit
 
   // === proc_exit unwind exception ===========================================
 
@@ -90,11 +120,18 @@ object Wasi:
     * sees, etc. The default writes to `System.out` / `System.err`; tests
     * almost always want [[WasiContext.collecting]] instead. */
   def preview1(ctx: WasiContext = WasiContext.default): HostModule =
+    // One fd table per HostModule (i.e. per instantiation). Lives in this
+    // closure rather than on `WasiContext` so the context stays purely
+    // descriptive (consistent with `Clock` and `random` being injection
+    // points rather than mutable state). Each `Wasi.preview1(ctx)` call
+    // gets its own fresh table; sharing a `WasiContext` across multiple
+    // instantiations therefore gives each instance an isolated fd space.
+    val fdTable = new FdTable(ctx.preopens.length)
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
         "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx)),
-        "fd_close"            -> ((_,   args) => fdClose(args)),
+        "fd_close"            -> ((_,   args) => fdClose(args, ctx, fdTable)),
         "proc_exit"           -> ((_,   args) => procExit(args)),
         "args_sizes_get"      -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
         "args_get"            -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
@@ -104,6 +141,7 @@ object Wasi:
         "random_get"          -> ((mem, args) => randomGet(mem, args, ctx)),
         "fd_prestat_get"      -> ((mem, args) => prestatGet(mem, args, ctx)),
         "fd_prestat_dir_name" -> ((mem, args) => prestatDirName(mem, args, ctx)),
+        "path_open"           -> ((mem, args) => pathOpen(mem, args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -364,15 +402,37 @@ object Wasi:
 
   /** `fd_close(fd: i32) -> errno`
     *
-    * For fd 0 / 1 / 2 (stdin / stdout / stderr) return ESUCCESS — userspace
-    * stdio closes are benign and a wasi program that religiously closes all
-    * three on shutdown shouldn't break on our shim. fd >= 3 or fd < 0
-    * returns EBADF: we don't surface fs-level fds until Phase 7.E. */
-  private def fdClose(args: Seq[Value]): Seq[Value] =
+    * Releases a file descriptor. The fd space is partitioned three ways:
+    *
+    *   - **fd 0 / 1 / 2** (stdin / stdout / stderr) — `ESUCCESS` no-op.
+    *     Userspace stdio closes are benign; a wasi program that closes
+    *     all three on shutdown shouldn't break on us.
+    *   - **fd 3 .. 3 + N − 1** (preopens, where N = `ctx.preopens.length`)
+    *     — `ESUCCESS` no-op. The preopen stays addressable for any later
+    *     `fd_prestat_get` / `path_open` call. POSIX semantics say closing
+    *     a valid fd succeeds; preopens are static for the lifetime of
+    *     this `WasiContext` so we don't actually release anything.
+    *   - **fd ≥ 3 + N** (path_open results) — looked up in [[FdTable]].
+    *     A hit calls the [[FsFile]]'s `close()`, releases the slot, and
+    *     returns `ESUCCESS`. A miss (already-closed or never-opened fd)
+    *     returns `EBADF`.
+    *
+    * Negative fds and any non-(i32) arg shape return `EBADF` / `EINVAL`
+    * respectively. */
+  private def fdClose(args: Seq[Value], ctx: WasiContext,
+                      fdTable: FdTable): Seq[Value] =
     args match
       case Seq(I32(fd)) =>
-        if fd == 0 || fd == 1 || fd == 2 then Seq(I32(ESUCCESS))
-        else Seq(I32(EBADF))
+        if fd < 0 then Seq(I32(EBADF))
+        else if fd <= 2 then Seq(I32(ESUCCESS))
+        else if fd - 3 < ctx.preopens.length then Seq(I32(ESUCCESS))
+        else
+          fdTable.lookup(fd) match
+            case Some(file) =>
+              file.close()
+              fdTable.release(fd)
+              Seq(I32(ESUCCESS))
+            case None => Seq(I32(EBADF))
       case _ => Seq(I32(EINVAL))
 
   // === preopen scaffolding (Phase 7.E.1) ====================================
@@ -460,6 +520,109 @@ object Wasi:
         System.arraycopy(nameBytes, 0, data, pathPtr, nameBytes.length)
         Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
+
+  // === path_open + fd table (Phase 7.E.2) ===================================
+  //
+  // `path_open` resolves a path relative to a preopen and allocates a new
+  // fd backed by an [[FsFile]]. The fd table lives in the closure that
+  // `Wasi.preview1` builds (one table per HostModule, i.e. per
+  // instantiation). Allocation policy is smallest-free, matching what
+  // POSIX programs expect — `open` always returns the smallest unused
+  // descriptor.
+
+  /** `path_open(dirfd, dirflags, path_ptr, path_len, oflags, rights_base,
+    *           rights_inheriting, fdflags, opened_fd_out) -> errno`
+    *
+    * Nine args. The first is the directory fd to resolve against, which
+    * for 7.E.2 must be a preopen (`3 .. 3 + N − 1`). `dirflags` is the
+    * lookup-flag bitmask (bit 0 = SYMLINK_FOLLOW) and is ignored at this
+    * slice — the InMemoryFs has no symlinks. The two rights i64s are
+    * ignored too: real-fs impls in 7.E.3+ can enforce them, but at this
+    * slice the test harness has no notion of capability erosion.
+    *
+    * Errno order: EBADF when `dirfd` isn't a preopen (we need this
+    * before validating memory because we can't dispatch a bad dirfd
+    * anywhere); EFAULT when the path bytes or the `opened_fd_out`
+    * output i32 fall outside linear memory; then the per-preopen `open`
+    * result (typically `Right(file)` → ESUCCESS + write fd, or
+    * `Left(errno)` for ENOENT / ENOTCAPABLE / …).
+    *
+    * Paths are decoded as UTF-8. Empty paths are passed through to the
+    * preopen impl, which is expected to return ENOENT (no such file)
+    * rather than special-casing — keeps the test surface honest. */
+  private def pathOpen(memory: Memory, args: Seq[Value],
+                       ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(dirfd), I32(_dirflags), I32(pathPtr), I32(pathLen),
+               I32(oflags), _, _ /* rights i64s, ignored */, I32(fdflags),
+               I32(openedFdOut)) =>
+        val idx = dirfd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathLen < 0 ||
+           pathPtr.toLong + pathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        if openedFdOut < 0 || openedFdOut.toLong + 4L > dataLen then
+          return Seq(I32(EFAULT))
+
+        val pathBytes = new Array[Byte](pathLen)
+        System.arraycopy(data, pathPtr, pathBytes, 0, pathLen)
+        val path = new String(pathBytes, "UTF-8")
+
+        ctx.preopens(idx).open(path, oflags, fdflags) match
+          case Right(file) =>
+            val fd = fdTable.alloc(file)
+            writeI32LE(data, openedFdOut, fd)
+            Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+
+      case _ => Seq(I32(EINVAL))
+
+  /** Per-instantiation table of opened-file fds. Allocates monotonically
+    * from `3 + preopens.length` and reuses the smallest free slot after
+    * a `release`. Not thread-safe — the interpreter is single-threaded,
+    * and host calls run synchronously on the same thread, so a mutable
+    * `ArrayBuffer[Option[FsFile]]` is the right shape.
+    *
+    * Slot semantics: `None` = free, `Some(file)` = owned. We don't track
+    * a separate "high-water mark" because growing the buffer is O(1)
+    * amortised and the array stays small in practice (a typical wasi
+    * program holds a handful of fds, not thousands). */
+  private final class FdTable(preopenCount: Int):
+    import scala.collection.mutable.ArrayBuffer
+    private val baseFd: Int                    = 3 + preopenCount
+    private val slots:  ArrayBuffer[Option[FsFile]] = ArrayBuffer.empty
+
+    /** Allocate a new fd backed by `file`. Returns the smallest free fd
+      * at or above `baseFd`. Grows the table by one slot if every
+      * existing slot is occupied. */
+    def alloc(file: FsFile): Int =
+      var i = 0
+      while i < slots.length do
+        if slots(i).isEmpty then
+          slots(i) = Some(file)
+          return baseFd + i
+        i += 1
+      slots += Some(file)
+      baseFd + slots.length - 1
+
+    /** Look up the [[FsFile]] for `fd`. `None` for any fd below `baseFd`,
+      * above the high-water mark, or in a released slot. */
+    def lookup(fd: Int): Option[FsFile] =
+      val i = fd - baseFd
+      if i >= 0 && i < slots.length then slots(i) else None
+
+    /** Release a fd's slot. `true` if it was actually occupied, `false`
+      * if `fd` was out of range or already released. */
+    def release(fd: Int): Boolean =
+      val i = fd - baseFd
+      if i >= 0 && i < slots.length && slots(i).nonEmpty then
+        slots(i) = None
+        true
+      else false
 
   /** `proc_exit(rval: i32) -> noreturn`
     *
@@ -555,12 +718,12 @@ object WasiContext:
     * through it. The wasi-visible directory `name` is what userspace
     * matches against.
     *
-    * Phase 7.E.1 ships just the name surface — the `Preopen` trait is
-    * deliberately minimal so the prestat-walk syscalls can land
-    * standalone. Phase 7.E.2 will extend this with `open(path, ...)`
-    * returning an `FsFile` handle, at which point `path_open`,
-    * `fd_read`, `fd_seek`, and general-fd `fd_close` arrive together
-    * with the in-memory `Fs` impl tests need.
+    * Phase 7.E.2 extends the trait with [[open]], which `path_open`
+    * dispatches to. The default impl returns `Left(Wasi.ENOTCAPABLE)`,
+    * so the [[named]] factory keeps working as a "name-only" preopen
+    * (advertises a directory, refuses to open anything inside it). The
+    * [[inMemory]] factory returns a Preopen backed by an in-memory
+    * `Map[String, Array[Byte]]`, which is what tests use.
     *
     * `name` is interpreted as UTF-8 — `fd_prestat_get`'s `pr_name_len`
     * and `fd_prestat_dir_name`'s output buffer both deal in bytes,
@@ -569,13 +732,65 @@ object WasiContext:
   trait Preopen:
     def name: String
 
+    /** Open a path relative to this preopen and return an [[Wasi.FsFile]]
+      * handle, or a wasi errno on failure. Called from `path_open` after
+      * argument validation (the preopen never needs to bounds-check
+      * pointers — that's done before dispatch).
+      *
+      * `oflags` and `fdflags` are passed through verbatim. Read-only
+      * impls like [[inMemory]] ignore them; future write-capable impls
+      * will act on `OFLAGS_CREAT` (1), `OFLAGS_DIRECTORY` (2),
+      * `OFLAGS_EXCL` (4), `OFLAGS_TRUNC` (8), and the `FDFLAGS_*` bits.
+      *
+      * The default impl returns `Left(Wasi.ENOTCAPABLE)`: the preopen
+      * advertises its name through the prestat-walk surface but has no
+      * FS capability behind it. This is what [[named]] inherits — a
+      * test that constructs `Preopen.named("/sandbox")` and then tries
+      * to `path_open` against fd 3 gets ENOTCAPABLE rather than ENOENT,
+      * because the distinction matters (ENOENT says "no such path",
+      * ENOTCAPABLE says "you can't even ask through this preopen"). */
+    def open(path: String, oflags: Int, fdflags: Int): Either[Int, Wasi.FsFile] =
+      Left(Wasi.ENOTCAPABLE)
+
   object Preopen:
-    /** A trivial preopen carrying just a wasi-visible directory name.
-      * Useful at Phase 7.E.1, where no FS operations exist yet — once
-      * 7.E.2 lands `path_open` the trait gains additional methods and
-      * tests will reach for richer factories. */
+    /** A name-only preopen: advertises the directory through the
+      * prestat-walk surface but refuses to open anything inside it
+      * (inherits the default `open` impl, which returns
+      * `Left(Wasi.ENOTCAPABLE)`). Useful for tests that exercise the
+      * 7.E.1 prestat surface in isolation. */
     def named(n: String): Preopen = new Preopen:
       val name: String = n
+
+    /** A preopen backed by an in-memory `Map[String, Array[Byte]]`.
+      * `open(path)` returns the file's bytes wrapped in an `InMemoryFile`
+      * on hit, `Left(Wasi.ENOENT)` on miss. Read-only — `oflags` and
+      * `fdflags` are ignored. This is the test harness Phase 7.E.2 was
+      * designed around; Phase 7.E.4's real-rustc file-reader smoke test
+      * will populate one with the file the Rust program reads.
+      *
+      * Paths are matched verbatim against the map's keys — no
+      * canonicalisation, no `.`/`..` resolution, no leading-slash
+      * normalisation. Tests construct keys to match exactly what
+      * wasi-libc's `__wasilibc_find_relpath` strips a preopen path
+      * down to (e.g. `hello.txt`, not `/sandbox/hello.txt`, when the
+      * preopen is `/sandbox`). */
+    def inMemory(n: String, files: Map[String, Array[Byte]]): Preopen =
+      new Preopen:
+        val name: String = n
+        override def open(path: String,
+                          oflags: Int,
+                          fdflags: Int): Either[Int, Wasi.FsFile] =
+          files.get(path) match
+            case Some(bytes) => Right(new InMemoryFile(bytes))
+            case None        => Left(Wasi.ENOENT)
+
+    /** Read-only in-memory [[Wasi.FsFile]] impl for [[inMemory]].
+      * `close()` is a no-op — there's no host resource to release.
+      * Phase 7.E.3 will reach into `bytes` for `fd_read` / `fd_seek` /
+      * `fd_filestat_get` via methods added to the [[Wasi.FsFile]]
+      * trait at that slice. */
+    private final class InMemoryFile(val bytes: Array[Byte]) extends Wasi.FsFile:
+      def close(): Unit = ()
 
   /** A pair of clocks — wall clock and a non-decreasing monotonic source.
     * Both surfaced as nanoseconds because that's the wasi-preview1 ABI

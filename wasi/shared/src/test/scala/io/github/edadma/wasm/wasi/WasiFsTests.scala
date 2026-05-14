@@ -1,26 +1,32 @@
 package io.github.edadma.wasm.wasi
 
-import io.github.edadma.wasm.I32
+import io.github.edadma.wasm.{I32, I64, ModuleInstance}
 
 import WasiTestSupport.{check, instantiate, test}
 
-/** Phase 7.E.1 — preopen-walk syscalls (`fd_prestat_get` and
-  * `fd_prestat_dir_name`).
+/** Filesystem-syscall tests — currently covering Phases 7.E.1 + 7.E.2:
   *
-  * These are the two functions wasi-libc reaches for at program startup
-  * (before any `path_open` call): it walks fds 3, 4, … asking for each
-  * one's `prestat`, stops when the host returns EBADF, and builds an
-  * internal map of preopen-name → fd that all later relative-path
-  * lookups resolve through.
+  *   - **7.E.1** wired the preopen-walk syscalls (`fd_prestat_get` and
+  *     `fd_prestat_dir_name`), the two functions wasi-libc reaches for at
+  *     program startup (before any `path_open` call): it walks fds 3, 4,
+  *     …, stops when the host returns EBADF, and builds an internal
+  *     map of preopen-name → fd that all later relative-path lookups
+  *     resolve through.
   *
-  * 7.E.1's scope is intentionally narrow — the shim reports the preopen
-  * *shape* but no FS-handle operations exist yet. The fixture
-  * (`wasi_prestat.wat`) is a passthrough exposing both syscalls plus
-  * `load_byte` / `load_i32` peek helpers, and tests inject preopens
-  * via the `preopens` parameter on [[WasiTestSupport.instantiate]] /
-  * [[WasiContext.collecting]]. Phase 7.E.2 will extend
-  * [[WasiContext.Preopen]] with `open(path, ...)` and the rest of the
-  * file-handle surface arrives.
+  *   - **7.E.2** added the file-handle surface — `path_open` plus a
+  *     general-fd `fd_close` that extends the 7.C stdio-only version to
+  *     consult an [[Wasi.FdTable]] for fds beyond the preopen range. The
+  *     [[WasiContext.Preopen]] trait grew an `open(path, oflags, fdflags)`
+  *     method; the default impl returns `Left(Wasi.ENOTCAPABLE)`, and
+  *     [[WasiContext.Preopen.inMemory]] is the read-only test-harness
+  *     impl backed by a `Map[String, Array[Byte]]`. Two new fixtures
+  *     drive the surface: `wasi_prestat.wat` (7.E.1, peek-only) and
+  *     `wasi_path_open.wat` (7.E.2, adds `call_path_open` /
+  *     `call_fd_close` / `store_byte`).
+  *
+  * Phase 7.E.3 will add `fd_read` / `fd_seek` / `fd_filestat_get` on top
+  * of the same [[Wasi.FsFile]] handle (extending its trait with the
+  * methods those syscalls need).
   */
 object WasiFsTests:
 
@@ -186,5 +192,209 @@ object WasiFsTests:
           check(errno == Wasi.EFAULT, s"errno=$errno (want EFAULT)")
         case other => check(false, s"call_prestat_dir_name: $other")
     }
+
+    // ===== path_open + general-fd fd_close (7.E.2) ========================
+    //
+    // Path-bytes-in-linear-memory pattern: each test calls `storePath` to
+    // poke the UTF-8 bytes of a relative path into memory at a chosen
+    // address, then invokes `call_path_open` with that (ptr, len) pair.
+    // The opened-fd output address is also caller-chosen — `load_i32`
+    // reads back what the shim planted there.
+
+    test("path_open: opens an existing file in InMemoryFs and returns 3+N") {
+      // Single preopen at fd 3 → baseFd for opened files is 4.
+      val files = Map("hello.txt" -> "Hi".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      val pathAddr   = 0
+      val outFdAddr  = 64
+      storePath(inst, pathAddr, "hello.txt")
+      callPathOpen(inst, dirfd = 3, pathPtr = pathAddr,
+                   pathLen = 9, openedFdOut = outFdAddr) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want 0)")
+        case other => check(false, s"call_path_open: $other")
+      inst.invoke("load_i32", Seq(I32(outFdAddr))) match
+        case Right(Seq(I32(fd))) =>
+          check(fd == 4, s"opened fd=$fd (want 4 = 3 + preopens.length)")
+        case other => check(false, s"load_i32: $other")
+    }
+
+    test("path_open: ENOENT when file is not in the InMemoryFs map") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", Map.empty)))
+      storePath(inst, 0, "missing")
+      callPathOpen(inst, dirfd = 3, pathPtr = 0,
+                   pathLen = 7, openedFdOut = 64) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ENOENT,
+                s"errno=$errno (want ENOENT=${Wasi.ENOENT})")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: ENOTCAPABLE when preopen has no fs (Preopen.named)") {
+      // `Preopen.named` inherits the trait's default `open`, which returns
+      // Left(ENOTCAPABLE) — the preopen advertises its name but can't
+      // open anything inside it.
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.named("/s")))
+      storePath(inst, 0, "anything")
+      callPathOpen(inst, dirfd = 3, pathPtr = 0,
+                   pathLen = 8, openedFdOut = 64) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ENOTCAPABLE,
+                s"errno=$errno (want ENOTCAPABLE=${Wasi.ENOTCAPABLE})")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: EBADF when dirfd is not a preopen") {
+      val files = Map("h" -> "x".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      storePath(inst, 0, "h")
+      // fd 5 is past the one preopen; fd 2 (stderr) is not a preopen; fd 0
+      // is below the preopen base — all three must produce EBADF.
+      for badFd <- Seq(0, 2, 5) do
+        callPathOpen(inst, dirfd = badFd, pathPtr = 0,
+                     pathLen = 1, openedFdOut = 64) match
+          case Right(Seq(I32(errno))) =>
+            check(errno == Wasi.EBADF,
+                  s"dirfd=$badFd errno=$errno (want EBADF)")
+          case other => check(false, s"call_path_open(dirfd=$badFd): $other")
+    }
+
+    test("path_open: EFAULT when path_ptr+path_len extends past memory") {
+      val files = Map("h" -> "x".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      // 1 page = 65536 bytes; ptr=65530 + len=10 → end 65540 > 65536.
+      callPathOpen(inst, dirfd = 3, pathPtr = 65530,
+                   pathLen = 10, openedFdOut = 64) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.EFAULT, s"errno=$errno (want EFAULT)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: EFAULT when opened_fd_out has no room for a 4-byte i32") {
+      val files = Map("h" -> "x".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      storePath(inst, 0, "h")
+      // Buffer end at 65536; openedFdOut=65535 leaves 1 byte — short of 4.
+      callPathOpen(inst, dirfd = 3, pathPtr = 0,
+                   pathLen = 1, openedFdOut = 65535) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.EFAULT, s"errno=$errno (want EFAULT)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: smallest-free fd reuse after close") {
+      // POSIX semantics: open returns the smallest unused fd. After
+      // opening two files (fds 4 and 5), closing fd 4 should make a
+      // subsequent open reuse fd 4 rather than monotonically increment.
+      val files = Map("a" -> "1".getBytes("UTF-8"),
+                      "b" -> "2".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      val out = 64
+      storePath(inst, 0, "a")
+      callPathOpen(inst, 3, 0, 1, out)
+      val fdA = peekI32(inst, out)
+      check(fdA == 4, s"first open fd=$fdA (want 4)")
+
+      storePath(inst, 0, "b")
+      callPathOpen(inst, 3, 0, 1, out)
+      val fdB = peekI32(inst, out)
+      check(fdB == 5, s"second open fd=$fdB (want 5)")
+
+      inst.invoke("call_fd_close", Seq(I32(fdA))) match
+        case Right(Seq(I32(e))) => check(e == 0, s"close(4) errno=$e")
+        case other              => check(false, s"call_fd_close: $other")
+
+      storePath(inst, 0, "a")
+      callPathOpen(inst, 3, 0, 1, out)
+      val fdAagain = peekI32(inst, out)
+      check(fdAagain == 4,
+            s"reopen fd=$fdAagain (want 4 — smallest free, not 6)")
+    }
+
+    test("fd_close: opened-file fd closes once, EBADF on second close") {
+      val files = Map("a" -> "1".getBytes("UTF-8"))
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.inMemory("/s", files)))
+      storePath(inst, 0, "a")
+      callPathOpen(inst, 3, 0, 1, 64)
+      val fd = peekI32(inst, 64)
+      check(fd == 4, s"opened fd=$fd")
+      inst.invoke("call_fd_close", Seq(I32(fd))) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"first close errno=$e")
+        case other              => check(false, s"call_fd_close: $other")
+      inst.invoke("call_fd_close", Seq(I32(fd))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"second close errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_close: $other")
+    }
+
+    test("fd_close: preopen fd is a benign no-op (ESUCCESS)") {
+      // POSIX: closing a valid fd succeeds. Preopens are static for the
+      // lifetime of the WasiContext, so the shim returns ESUCCESS without
+      // actually invalidating anything.
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq(Preopen.named("/x")))
+      inst.invoke("call_fd_close", Seq(I32(3))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"close(preopen fd 3) errno=$e (want 0)")
+        case other => check(false, s"call_fd_close: $other")
+    }
+
+    test("fd_close: EBADF on a high fd that was never opened") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
+                                  preopens = Seq.empty)
+      inst.invoke("call_fd_close", Seq(I32(100))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"close(100) errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_close: $other")
+    }
+
+  // ----- helpers ----------------------------------------------------------
+
+  /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
+    * via the fixture's `store_byte` export. Tests use this to plant a
+    * path before invoking `call_path_open`. */
+  private def storePath(inst: ModuleInstance, addr: Int, path: String): Unit =
+    val bytes = path.getBytes("UTF-8")
+    var i = 0
+    while i < bytes.length do
+      inst.invoke("store_byte", Seq(I32(addr + i), I32(bytes(i) & 0xff))) match
+        case Right(_) => ()
+        case other    => throw new AssertionError(s"store_byte($i): $other")
+      i += 1
+
+  /** Wrap the 9-arg path_open call with the defaults most tests want
+    * (zero `dirflags` / `oflags` / `fdflags` / rights). */
+  private def callPathOpen(inst: ModuleInstance,
+                           dirfd:       Int,
+                           pathPtr:     Int,
+                           pathLen:     Int,
+                           openedFdOut: Int) =
+    inst.invoke("call_path_open", Seq(
+      I32(dirfd),       // dirfd
+      I32(0),           // dirflags
+      I32(pathPtr),     // path_ptr
+      I32(pathLen),     // path_len
+      I32(0),           // oflags
+      I64(0L),          // fs_rights_base
+      I64(0L),          // fs_rights_inheriting
+      I32(0),           // fdflags
+      I32(openedFdOut), // opened_fd_out
+    ))
+
+  /** Read back a little-endian i32 at `addr` via the fixture's
+    * `load_i32` helper. Throws on a non-i32 return so the test fails
+    * with a useful message rather than a `MatchError`. */
+  private def peekI32(inst: ModuleInstance, addr: Int): Int =
+    inst.invoke("load_i32", Seq(I32(addr))) match
+      case Right(Seq(I32(v))) => v
+      case other              => throw new AssertionError(s"load_i32($addr): $other")
 
 end WasiFsTests
