@@ -8,11 +8,11 @@ import io.github.edadma.wasm.{HostFunc, HostModule, I32, Memory, ModuleInstance,
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Phase 7.A ships two
-  * syscalls — [[Wasi.preview1]] returns a `HostModule` with `fd_write`
-  * and `proc_exit`; subsequent phases (7.B–7.E) add `args_*`,
-  * `environ_*`, `clock_time_get`, `random_get`, `fd_close`, and real
-  * filesystem access.
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.C the
+  * shim resolves nine syscalls: `fd_write`, `fd_close`, `proc_exit`,
+  * `args_sizes_get` / `args_get`, `environ_sizes_get` / `environ_get`,
+  * `clock_time_get`, and `random_get`. Phase 7.E will add the filesystem
+  * surface (`path_open` / `fd_read` / `fd_seek` / general-fd `fd_close`).
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -86,12 +86,15 @@ object Wasi:
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
-        "fd_write"         -> ((mem, args) => fdWrite(mem, args, ctx)),
-        "proc_exit"        -> ((_,   args) => procExit(args)),
-        "args_sizes_get"   -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
-        "args_get"         -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
-        "environ_sizes_get"-> ((mem, args) => sizesGet(mem, args, envEntries(ctx))),
-        "environ_get"      -> ((mem, args) => entriesGet(mem, args, envEntries(ctx))),
+        "fd_write"          -> ((mem, args) => fdWrite(mem, args, ctx)),
+        "fd_close"          -> ((_,   args) => fdClose(args)),
+        "proc_exit"         -> ((_,   args) => procExit(args)),
+        "args_sizes_get"    -> ((mem, args) => sizesGet(mem, args, argEntries(ctx))),
+        "args_get"          -> ((mem, args) => entriesGet(mem, args, argEntries(ctx))),
+        "environ_sizes_get" -> ((mem, args) => sizesGet(mem, args, envEntries(ctx))),
+        "environ_get"       -> ((mem, args) => entriesGet(mem, args, envEntries(ctx))),
+        "clock_time_get"    -> ((mem, args) => clockTimeGet(mem, args, ctx)),
+        "random_get"        -> ((mem, args) => randomGet(mem, args, ctx)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -284,6 +287,85 @@ object Wasi:
   private inline def fits4(ptr: Int, dataLen: Int): Boolean =
     ptr >= 0 && ptr.toLong + 4L <= dataLen
 
+  // === clock_time_get + random_get + fd_close (Phase 7.C) ===================
+  //
+  // Three small slow-path syscalls that round out the "basic POSIX program
+  // doesn't crash on startup" surface. The pattern from 7.A/7.B holds: each
+  // syscall validates pointer bounds with Long arithmetic before touching
+  // memory, returns a wasi errno, and never throws on a malformed call.
+
+  /** `clock_time_get(clock_id: i32, precision: i64, time_ptr: i32) -> errno`
+    *
+    * Writes a 64-bit little-endian nanosecond timestamp at `time_ptr`.
+    * `precision` is advisory — the wasi spec lets the host round to
+    * whatever resolution its clock provides, and we ignore the field.
+    *
+    * Clock ids:
+    *   - 0 = realtime  — wall clock since UNIX epoch
+    *   - 1 = monotonic — arbitrary epoch, non-decreasing
+    *   - 2 = process_cputime_id — folded to monotonic
+    *   - 3 = thread_cputime_id  — folded to monotonic
+    *   - else → EINVAL
+    *
+    * Folding 2/3 to monotonic is intentional. The JVM exposes per-thread
+    * CPU time via `ManagementFactory.getThreadMXBean`, but Scala.js and
+    * Scala Native don't have a portable equivalent. Returning monotonic
+    * matches what most wasi shims do for portability and keeps every
+    * backend behaving identically. Programs that absolutely need CPU
+    * time can plug a different `WasiContext.Clock` in. */
+  private def clockTimeGet(memory: Memory, args: Seq[Value],
+                           ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(clockId), _ /* precision i64, ignored */, I32(timePtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if timePtr < 0 || timePtr.toLong + 8L > dataLen then
+          return Seq(I32(EFAULT))
+        val nanos: Long = clockId match
+          case 0     => ctx.clock.realtimeNanos()
+          case 1     => ctx.clock.monotonicNanos()
+          case 2 | 3 => ctx.clock.monotonicNanos()
+          case _     => return Seq(I32(EINVAL))
+        writeI64LE(data, timePtr, nanos)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `random_get(buf: i32, buf_len: i32) -> errno`
+    *
+    * Fill `buf_len` bytes at `buf` with random data drawn from
+    * `ctx.random`. The default source is `scala.util.Random` — not
+    * cryptographic; callers needing real entropy plug a different
+    * closure in. `buf_len == 0` is a no-op success.
+    *
+    * Bounds-check `buf + buf_len` with Long arithmetic so a wrap-around
+    * can't sneak past. */
+  private def randomGet(memory: Memory, args: Seq[Value],
+                        ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(buf), I32(bufLen)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if buf < 0 || bufLen < 0 || buf.toLong + bufLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        if bufLen > 0 then
+          val bytes = ctx.random(bufLen)
+          System.arraycopy(bytes, 0, data, buf, bufLen)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_close(fd: i32) -> errno`
+    *
+    * For fd 0 / 1 / 2 (stdin / stdout / stderr) return ESUCCESS — userspace
+    * stdio closes are benign and a wasi program that religiously closes all
+    * three on shutdown shouldn't break on our shim. fd >= 3 or fd < 0
+    * returns EBADF: we don't surface fs-level fds until Phase 7.E. */
+  private def fdClose(args: Seq[Value]): Seq[Value] =
+    args match
+      case Seq(I32(fd)) =>
+        if fd == 0 || fd == 1 || fd == 2 then Seq(I32(ESUCCESS))
+        else Seq(I32(EBADF))
+      case _ => Seq(I32(EINVAL))
+
   /** `proc_exit(rval: i32) -> noreturn`
     *
     * The unwind that lets a wasi program signal its exit code. Throws
@@ -320,33 +402,81 @@ object Wasi:
     data(offset + 2) = ((v >>> 16) & 0xff).toByte
     data(offset + 3) = ((v >>> 24) & 0xff).toByte
 
+  private inline def writeI64LE(data: Array[Byte], offset: Int, v: Long): Unit =
+    data(offset    ) =  (v         & 0xffL).toByte
+    data(offset + 1) = ((v >>>  8) & 0xffL).toByte
+    data(offset + 2) = ((v >>> 16) & 0xffL).toByte
+    data(offset + 3) = ((v >>> 24) & 0xffL).toByte
+    data(offset + 4) = ((v >>> 32) & 0xffL).toByte
+    data(offset + 5) = ((v >>> 40) & 0xffL).toByte
+    data(offset + 6) = ((v >>> 48) & 0xffL).toByte
+    data(offset + 7) = ((v >>> 56) & 0xffL).toByte
+
 end Wasi
 
 /** Side-effecting context for a WASI program: where its stdout / stderr
-  * bytes land, what its `args` and `environ` look like, and (later
-  * phases) its clock + random sources.
+  * bytes land, what its `args` and `environ` look like, what its clock
+  * sources read, and how `random_get` is fulfilled.
   *
-  * `args` and `envs` are advertised through `args_*` / `environ_*` —
-  * Phase 7.B wires them. Phase 7.A only reads `stdout` and `stderr`,
-  * but the data class is final-cased now so subsequent phases don't
-  * break the binary surface. The defaults write each byte to the
-  * process's real stdout / stderr; tests almost always want
-  * [[WasiContext.collecting]] instead.
+  * `args` and `envs` are advertised through `args_*` / `environ_*`
+  * (Phase 7.B). `clock` powers `clock_time_get`, `random` powers
+  * `random_get` (Phase 7.C). The defaults write each byte to the
+  * process's real stdout / stderr, fold realtime/monotonic clocks onto
+  * `System.currentTimeMillis * 1e6` and `System.nanoTime` respectively
+  * (all three backends support both), and draw bytes from a process-
+  * local `scala.util.Random`. Tests almost always want
+  * [[WasiContext.collecting]] instead, which captures stdout/stderr to
+  * memory and accepts injected `Clock` / `random` for deterministic
+  * runs.
   *
-  * @param args  Argv as seen by the wasi program. Phase 7.B-only.
-  * @param envs  Environment entries as `(NAME, value)` pairs. Phase
-  *              7.B-only.
+  * @param args   Argv as seen by the wasi program.
+  * @param envs   Environment entries as `(NAME, value)` pairs.
   * @param stdout Byte writer for fd 1.
   * @param stderr Byte writer for fd 2.
+  * @param clock  Realtime + monotonic clock sources (nanoseconds).
+  * @param random `n => Array[Byte]` of length `n` that fills
+  *               `random_get` buffers.
   */
 final case class WasiContext(
-    args:   Seq[String]         = Seq.empty,
-    envs:   Seq[(String, String)] = Seq.empty,
-    stdout: Int => Unit         = WasiContext.defaultStdout,
-    stderr: Int => Unit         = WasiContext.defaultStderr,
+    args:   Seq[String]             = Seq.empty,
+    envs:   Seq[(String, String)]   = Seq.empty,
+    stdout: Int => Unit             = WasiContext.defaultStdout,
+    stderr: Int => Unit             = WasiContext.defaultStderr,
+    clock:  WasiContext.Clock       = WasiContext.systemClock,
+    random: Int => Array[Byte]      = WasiContext.defaultRandom,
 )
 
 object WasiContext:
+
+  /** A pair of clocks — wall clock and a non-decreasing monotonic source.
+    * Both surfaced as nanoseconds because that's the wasi-preview1 ABI
+    * shape. Tests inject a deterministic impl; the default uses
+    * `System.currentTimeMillis * 1e6` and `System.nanoTime`, both of
+    * which Scala.js (`Date.now` / `performance.now`) and Scala Native
+    * support — so the shim stays cross-platform without conditional
+    * code. */
+  trait Clock:
+    def realtimeNanos():  Long
+    def monotonicNanos(): Long
+
+  /** Default `Clock` — `System.currentTimeMillis() * 1_000_000` for
+    * realtime, `System.nanoTime()` for monotonic. The realtime read
+    * loses sub-millisecond resolution; in practice that's fine because
+    * the wasi `precision` arg is advisory and most programs only read
+    * realtime for "what time is it" not "how long did this take". */
+  val systemClock: Clock = new Clock:
+    def realtimeNanos():  Long = System.currentTimeMillis() * 1_000_000L
+    def monotonicNanos(): Long = System.nanoTime()
+
+  /** Default `random_get` source: a process-local `scala.util.Random`.
+    * Not cryptographically strong; programs that need real entropy
+    * plug a different closure in via the `random` constructor param.
+    * Tests inject a fixed-seed Random (or a stub returning a known
+    * byte string) for deterministic assertions. */
+  def defaultRandom(n: Int): Array[Byte] =
+    val out = new Array[Byte](n)
+    scala.util.Random.nextBytes(out)
+    out
 
   /** Default stdout sink — writes each byte to the JVM's `System.out`.
     * Behaviour on Scala.js / Native is "what `System.out.write(int)`
@@ -368,15 +498,22 @@ object WasiContext:
     * a [[Collecting]] that exposes the captured byte arrays + UTF-8
     * decoded strings; the `.context` field is the `WasiContext` you
     * pass to [[Wasi.preview1]]. Tests use this to assert on the
-    * program's output without touching the real stdout/stderr. */
-  def collecting(args: Seq[String] = Seq.empty,
-                 envs: Seq[(String, String)] = Seq.empty): Collecting =
-    new Collecting(args, envs)
+    * program's output without touching the real stdout/stderr; the
+    * `clock` / `random` overrides let them assert on deterministic
+    * clock + random reads as well. */
+  def collecting(args:   Seq[String]              = Seq.empty,
+                 envs:   Seq[(String, String)]    = Seq.empty,
+                 clock:  Clock                    = systemClock,
+                 random: Int => Array[Byte]       = defaultRandom): Collecting =
+    new Collecting(args, envs, clock, random)
 
   /** Captures stdout/stderr bytes from a wasi program. Threading-wise
     * this is single-threaded — the interpreter is single-threaded, so
     * we don't synchronize the underlying buffers. */
-  final class Collecting private[wasi] (args: Seq[String], envs: Seq[(String, String)]):
+  final class Collecting private[wasi] (args:   Seq[String],
+                                        envs:   Seq[(String, String)],
+                                        clock:  Clock,
+                                        random: Int => Array[Byte]):
     private val stdoutBuf = ArrayBuffer.empty[Byte]
     private val stderrBuf = ArrayBuffer.empty[Byte]
     val context: WasiContext = WasiContext(
@@ -384,6 +521,8 @@ object WasiContext:
       envs   = envs,
       stdout = b => stdoutBuf += b.toByte,
       stderr = b => stderrBuf += b.toByte,
+      clock  = clock,
+      random = random,
     )
     def stdoutBytes:  Array[Byte] = stdoutBuf.toArray
     def stderrBytes:  Array[Byte] = stderrBuf.toArray
