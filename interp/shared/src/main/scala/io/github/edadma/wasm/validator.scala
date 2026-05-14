@@ -257,6 +257,7 @@ object Validator:
       case ValueType.F64Type       => "f64"
       case ValueType.FuncRefType   => "funcref"
       case ValueType.ExternRefType => "externref"
+      case ValueType.V128Type      => "v128"
 
     // --- operand stack ----
 
@@ -856,6 +857,23 @@ object Validator:
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfc))
 
+      // === SIMD prefix (0xFD) ============================================
+      //
+      // Phase 8.E chunk A: only `v128.const` (sub 12) is checked. Body
+      // walker just advances past the 16-byte literal and pushes v128.
+      // Subsequent chunks will fan this out alongside the runtime
+      // implementations.
+      case 0xfd =>
+        val sub = readU32()
+        sub match
+          case 12 =>                                                              // v128.const : 16 raw bytes
+            if pc + 16 > body.length then
+              fail("truncated v128.const literal")
+            pc += 16
+            pushVal(ValueType.V128Type)
+          case _ =>
+            throw new ValFail(WasmError.UnknownOpcode(0xfd))
+
       // === unhandled ===================================================
 
       case other => throw new ValFail(WasmError.UnknownOpcode(other))
@@ -913,6 +931,8 @@ object Validator:
         // and `(block (result externref))` are both legal.
         case 0x70 => FuncType(Vector.empty, Vector(ValueType.FuncRefType))
         case 0x6f => FuncType(Vector.empty, Vector(ValueType.ExternRefType))
+        // Phase 8.E: v128-valued blocktypes — `(block (result v128))`.
+        case 0x7b => FuncType(Vector.empty, Vector(ValueType.V128Type))
         case _    =>
           Leb128.readS32(body, pos) match
             case Right((idx, _)) if idx >= 0 && idx < types.length =>

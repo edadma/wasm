@@ -161,6 +161,10 @@ object Parser:
       // value types.
       case 0x70 => ValueType.FuncRefType
       case 0x6f => ValueType.ExternRefType
+      // SIMD proposal (Phase 8.E): v128 is a first-class valtype with wire
+      // byte 0x7B. Legal anywhere the scalar types are — params, results,
+      // locals, globals, blocktypes.
+      case 0x7b => ValueType.V128Type
       case b    => fail(WasmError.InvalidModule(s"unknown valtype 0x${b.toHexString}"))
 
   /** Read a [[RefType]] byte (0x70 funcref / 0x6F externref). Used by
@@ -539,6 +543,7 @@ object Parser:
           case ValueType.F64Type       => "f64.const"
           case ValueType.FuncRefType   => "ref.null func / ref.func funcidx"
           case ValueType.ExternRefType => "ref.null extern"
+          case ValueType.V128Type      => "v128.const"
         fail(WasmError.InvalidModule(
           s"expected $expected_mnemonic in const expr, got 0x${other.toHexString}"))
     val end = c.readByte()
