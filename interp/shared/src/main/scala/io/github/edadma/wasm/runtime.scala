@@ -75,6 +75,19 @@ object Runtime:
   private def fail(err: WasmError): Nothing = throw new InstFail(err)
 
   private def build(module: WasmModule, hostModules: Seq[HostModule]): ModuleInstance =
+    // === Phase 6: validate every function body up front =====================
+    // A passing validation means: every value-stack pop sees the right
+    // type, every br lands on a real label, every block exits with the
+    // right result arity, every funcidx/typeidx/tableidx/local/global
+    // index is in range. The interpreter's runtime TypeMismatch / range
+    // checks become assertions of validator invariants rather than
+    // recoverable errors. Bad code surfaces here with a precise
+    // diagnostic (function index + byte offset + expected-vs-found)
+    // — exactly what a handwritten code generator needs during bring-up.
+    Validator.validate(module) match
+      case Right(()) => ()
+      case Left(e)   => fail(e)
+
     val hosts: Map[String, Map[String, HostFunc]] =
       hostModules.iterator.map(m => m.name -> m.functions).toMap
 

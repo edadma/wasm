@@ -16,6 +16,7 @@ object ParserAndRuntimeTests:
     parserMalformed()
     unsupportedOpcodes()
     runtimeErrors()
+    validatorNegatives()
     envModule()
     regressions()
 
@@ -269,24 +270,24 @@ object ParserAndRuntimeTests:
         case other => check(false, s"expected InvalidModule(type), got $other")
     }
 
-    test("runtime: call with out-of-range function index returns InvalidModule") {
+    test("validator: call with out-of-range function index returns InvalidModule") {
+      // Phase 6: caught at instantiate by the validator (was a dispatch-time
+      // trap before). The validator names the function and byte offset.
       val src    = Fixtures.factorial
       val callIx = src.indexOf(0x10.toByte)
       check(callIx > 0, "call opcode not found")
       val bad  = patchByte(src, callIx + 1, 0x09)
-      val inst = instantiate(bad)
-      expectError(inst, "fact", Seq(I32(5))) {
+      expectInstantiateError(bad) {
         case WasmError.InvalidModule(msg) => msg.contains("function index")
       }
     }
 
-    test("runtime: branch index out of range returns InvalidModule") {
+    test("validator: branch index out of range returns InvalidModule") {
       val src     = Fixtures.br_block
       val brIfIdx = src.indexOf(0x0d.toByte)
       check(brIfIdx > 0, "br_if opcode not found")
       val bad  = patchByte(src, brIfIdx + 1, 0x09)
-      val inst = instantiate(bad)
-      expectError(inst, "test_br", Seq(I32(1))) {
+      expectInstantiateError(bad) {
         case WasmError.InvalidModule(msg) => msg.contains("branch index")
       }
     }
@@ -312,41 +313,36 @@ object ParserAndRuntimeTests:
       check(callI32(inst, "select", Int.MinValue) == 99, "sel=Int.MinValue → default")
     }
 
-    test("runtime: local.get with out-of-range index returns InvalidModule") {
+    test("validator: local.get with out-of-range index returns InvalidModule") {
       val src      = Fixtures.locals
       val localGet = src.indexOf(0x20.toByte)
       check(localGet > 0, "local.get not found")
       val bad  = patchByte(src, localGet + 1, 0x09)
-      val inst = instantiate(bad)
-      expectError(inst, "test_locals", Seq(I32(1), I32(2))) {
+      expectInstantiateError(bad) {
         case WasmError.InvalidModule(msg) => msg.contains("local.get")
       }
     }
 
-    test("runtime: global.get with out-of-range index returns InvalidModule") {
+    test("validator: global.get with out-of-range index returns InvalidModule") {
       // globals_basic.wasm has two globals (counter at 0, seed at 1). Find the
       // first `global.get` opcode and patch its index byte to a high value.
       val src        = Fixtures.globals_basic
       val globalGet  = src.indexOf(0x23.toByte)
       check(globalGet > 0, "global.get opcode not found")
       val bad  = patchByte(src, globalGet + 1, 0x09)
-      val inst = instantiate(bad)
-      // The patched function may be any of the getters — every entry point
-      // either reads the patched op directly or traps the same way through it.
-      inst.invoke("get_count", Seq.empty) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("global.get"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(global.get …), got $other")
+      expectInstantiateError(bad) {
+        case WasmError.InvalidModule(msg) => msg.contains("global.get")
+      }
     }
 
-    test("runtime: global.set with out-of-range index returns InvalidModule") {
+    test("validator: global.set with out-of-range index returns InvalidModule") {
       val src        = Fixtures.globals_basic
       val globalSet  = src.indexOf(0x24.toByte)
       check(globalSet > 0, "global.set opcode not found")
       val bad  = patchByte(src, globalSet + 1, 0x09)
-      val inst = instantiate(bad)
-      inst.invoke("bump", Seq.empty) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("global.set"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(global.set …), got $other")
+      expectInstantiateError(bad) {
+        case WasmError.InvalidModule(msg) => msg.contains("global.set")
+      }
     }
 
     test("parser: section 6 with init-expr not matching declared type returns InvalidModule") {
@@ -387,6 +383,170 @@ object ParserAndRuntimeTests:
       runRight(inst.invoke("empty")) match
         case Seq() => ()
         case other => check(false, s"expected empty Seq, got $other")
+    }
+
+  // === Phase 6: validator negative tests ==================================
+  //
+  // Hand-craft (or patch-derive) modules that should be REJECTED by the
+  // validator at instantiate. Every test asserts the error is
+  // `InvalidModule` with a diagnostic containing the function index, byte
+  // offset, and where applicable an expected-vs-found stack type — the
+  // shape a handwritten code generator most wants to see during bring-up.
+  //
+  // Hand-crafted module layout (helpers in `TestSupport`):
+  //   Header(8) + sections.
+  // For these tiny modules, sections are: Type, Function, Code. No
+  // exports — the validator runs at instantiate, before any function
+  // would be invoked, so exports aren't required.
+
+  private def validatorNegatives(): Unit =
+
+    // --- Type mismatch via opcode patch ----------------------------------
+
+    test("validator: type mismatch — i32.add patched to f32.add fails type-check") {
+      // Stack has two i32s (from i32.const ...); patching the add opcode
+      // from i32.add (0x6A) to f32.add (0x92) means the validator pops
+      // two f32 — first pop sees i32 → type mismatch with a clear
+      // expected/got diagnostic.
+      val src = Fixtures.arith
+      val idx = src.indexOf(0x6a.toByte)
+      check(idx > 0, "i32.add (0x6A) not found in arith fixture")
+      val bad = patchByte(src, idx, 0x92)
+      expectInstantiateError(bad) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("type mismatch") &&
+          msg.contains("f32") &&
+          msg.contains("i32")
+      }
+    }
+
+    // --- Function-result arity mismatch (hand-crafted) ------------------
+
+    test("validator: () -> i32 function with empty body fails end-of-function check") {
+      // type:    () -> i32
+      // body:    [no locals] end
+      // Validator: function frame's endTypes = [i32], stack is empty at
+      // outer end → "end of Function: stack height 0, expected 0" with
+      // the popVal underflow surfacing first as the type-mismatch on i32.
+      val mod = Header ++ b(
+        // Section 1 (Type): 1 type, () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // Section 3 (Function): 1 fn, typeidx 0
+        0x03, 0x02, 0x01, 0x00,
+        // Section 10 (Code): 1 code, body size 2: 0 locals + end
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("function 0") && msg.contains("operand stack underflow")
+      }
+    }
+
+    test("validator: () -> () with leftover stack value fails extra-values check") {
+      // Body pushes an i32 but the function declares no result —
+      // validator catches: "end of Function: stack height 1, expected 0".
+      val mod = Header ++ b(
+        // Type: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        // Body: 0 locals; i32.const 0; end (body size = 4)
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0b,
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("function 0") &&
+          msg.contains("end of Function") &&
+          msg.contains("extra values")
+      }
+    }
+
+    // --- Wrong-type local.set (hand-crafted) ----------------------------
+
+    test("validator: local.set 0 with type i32 fed an f32 value fails") {
+      // 1 declared local of type i32; body pushes an f32 then sets local 0.
+      // Validator: local.set expects i32, popVal sees f32 → mismatch.
+      val mod = Header ++ b(
+        // Type: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        // Code: body size 11 = 3 (locals decl: 1 group of 1 i32) +
+        //                       5 (f32.const = 1 + 4 raw bytes) +
+        //                       2 (local.set 0) + 1 (end)
+        0x0a, 0x0d, 0x01,
+        0x0b,                                    // body size
+        0x01, 0x01, 0x7f,                        // locals: 1 i32
+        0x43, 0x00, 0x00, 0x00, 0x00,            // f32.const 0.0
+        0x21, 0x00,                              // local.set 0
+        0x0b,                                    // end
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("type mismatch") &&
+          msg.contains("i32") &&
+          msg.contains("f32")
+      }
+    }
+
+    // --- br with wrong arity (hand-crafted) -----------------------------
+
+    test("validator: br to (result i32) block with empty stack fails arity check") {
+      // Block declares (result i32) — branchArity = 1. The br 0 fires
+      // with no value on the stack → popVal underflow at the br's
+      // implicit value-pop.
+      val mod = Header ++ b(
+        // Type: () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        0x03, 0x02, 0x01, 0x00,
+        // Body: 0 locals; block (result i32); br 0; end; end
+        0x0a, 0x09, 0x01,
+        0x07,                                    // body size
+        0x00,                                    // 0 locals
+        0x02, 0x7f,                              // block (result i32)
+        0x0c, 0x00,                              // br 0
+        0x0b,                                    // block end
+        0x0b,                                    // function end
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("function 0") &&
+          msg.contains("operand stack underflow")
+      }
+    }
+
+    // --- Truncated body (hand-crafted) ----------------------------------
+
+    test("validator: function body missing the outer `end` fails") {
+      // Body length 1 just has the locals-count byte (0x00) — no end
+      // byte. Validator walks, runs out of bytes before popping the
+      // implicit Function frame → "missing function-body end".
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x0a, 0x03, 0x01, 0x01, 0x00,
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("function 0") &&
+          msg.contains("missing function-body end")
+      }
+    }
+
+    // --- Diagnostic shape -----------------------------------------------
+
+    test("validator: diagnostics name the function index AND byte offset") {
+      // Sanity: confirm the prefix is the format a backend can grep on.
+      // We reuse the empty-body test above; the diagnostic always
+      // starts with `function <N>: byte offset 0x<hex>:`.
+      val mod = Header ++ b(
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        0x03, 0x02, 0x01, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+      )
+      Runtime.instantiate(mod, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.startsWith("function 0: byte offset 0x"),
+                s"diagnostic prefix: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
     }
 
   // === EnvModule.default smoke test =======================================

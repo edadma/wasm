@@ -1,0 +1,692 @@
+package io.github.edadma.wasm
+
+import scala.collection.mutable.ArrayBuffer
+
+/** Module validator — Phase 6.
+  *
+  * Walks every defined function body once, before any instruction is
+  * interpreted, and performs the WebAssembly spec's static checks:
+  *
+  *   - abstract operand-stack typing — every opcode pops its declared
+  *     operand types and pushes its declared results; a mismatch is
+  *     `InvalidModule` with a "expected X, got Y" diagnostic;
+  *   - control-flow well-formedness — block/loop/if open frames, the
+  *     matching `end` pops them, and the function body's outer `end`
+  *     pops the implicit function frame;
+  *   - label arity matching — `br` / `br_if` / `br_table` validate
+  *     against the target frame's label types (results for block/if,
+  *     params for loop — loops re-feed their params on `br`);
+  *   - stack polymorphism — after a `br` / `return` / `unreachable`
+  *     the rest of the block is "unreachable"; pops in that region
+  *     synthesise the expected type rather than erroring.
+  *
+  * On success the runtime can safely assume that every value-stack
+  * pop sees the right type, every `br` lands on a real label, every
+  * block exits with the right result arity. The interpreter's
+  * defensive `TypeMismatch` checks become assertions of validator
+  * invariants rather than recoverable runtime errors.
+  *
+  * Diagnostics name the function index (using the wasm-wide funcidx
+  * space — imports first, then defined functions), the byte offset
+  * of the failing instruction within the function body, and where
+  * available the expected vs found stack type. Useful for handwritten
+  * code generators iterating on bring-up: the spec's "the module is
+  * invalid" needs to point at a specific line of generated emit code.
+  */
+object Validator:
+
+  // === Abstract operand stack =============================================
+
+  /** Abstract value on the operand stack. `Unknown` is the polymorphic
+    * placeholder produced after a `br` / `return` / `unreachable`: a
+    * subsequent pop will silently consume it and return whatever type
+    * the consumer expected. This is how the spec models "any code
+    * after a guaranteed branch is well-typed for any future use". */
+  enum AbsValue:
+    case Known(t: ValueType)
+    case Unknown
+
+  /** One frame on the control stack. `startTypes` are the values
+    * present at frame entry (block params — pushed on the operand
+    * stack as part of opening the frame); `endTypes` are what must
+    * be on the stack when the frame closes (block results).
+    * `baseHeight` is the operand-stack height at the moment the
+    * frame opened, so the frame's operand window starts at index
+    * `baseHeight + startTypes.size`. `unreachable` flips to true
+    * after `br` / `return` / `unreachable` inside this frame. */
+  final case class CtrlFrame(
+      kind:        CtrlKind,
+      startTypes:  Vector[ValueType],
+      endTypes:    Vector[ValueType],
+      baseHeight:  Int,
+      var unreachable: Boolean = false,
+  )
+
+  enum CtrlKind:
+    case Function, Block, Loop, If, Else
+
+  // === Public API =========================================================
+
+  private final class ValFail(val err: WasmError)
+      extends RuntimeException(null, null, false, false)
+
+  /** Validate every defined function body in `module`. Returns
+    * `Right(())` on success, or `Left(InvalidModule(...))` with a
+    * diagnostic message naming the offending function index and
+    * byte offset. */
+  def validate(module: WasmModule): Either[WasmError, Unit] =
+    try
+      // Module-level typeidx checks first: every import's and every
+      // defined function's typeidx must be in range. Defining functions
+      // also get their bodies walked below; imports have no body so the
+      // typeidx check is the only validation they need here.
+      var im = 0
+      while im < module.imports.length do
+        val imp = module.imports(im)
+        if imp.typeIdx < 0 || imp.typeIdx >= module.types.length then
+          throw new ValFail(WasmError.InvalidModule(
+            s"import ${imp.module}.${imp.name}: type index ${imp.typeIdx} out of range"))
+        im += 1
+      val funcSigs   = collectFuncSigs(module)
+      val globalSigs = module.globals.map(g => (g.valueType, g.mutable))
+      var i = 0
+      while i < module.codes.length do
+        val typeIdx = module.functions(i)
+        val funcIdx = module.imports.length + i
+        if typeIdx < 0 || typeIdx >= module.types.length then
+          throw new ValFail(WasmError.InvalidModule(
+            s"function $funcIdx: type index $typeIdx out of range"))
+        validateFunction(
+          funcIdx     = funcIdx,
+          sig         = module.types(typeIdx),
+          declared    = module.codes(i).locals,
+          body        = module.codes(i).body,
+          funcSigs    = funcSigs,
+          globalSigs  = globalSigs,
+          types       = module.types,
+          tableCount  = module.tables.length,
+          memoryCount = module.memories.length,
+        )
+        i += 1
+      Right(())
+    catch case e: ValFail => Left(e.err)
+
+  // === Per-module helpers =================================================
+
+  /** Build the unified function-signature index — imports first, then
+    * defined functions. Same order the interpreter uses internally so
+    * `call funcidx` immediates resolve consistently. */
+  private def collectFuncSigs(module: WasmModule): Vector[FuncType] =
+    val out = ArrayBuffer.empty[FuncType]
+    module.imports.foreach { imp =>
+      // Tolerate out-of-range typeidxs here — Runtime.build surfaces
+      // them as a clearer InvalidModule. Using an empty type prevents
+      // a NoSuchElementException during validation.
+      if imp.typeIdx >= 0 && imp.typeIdx < module.types.length then
+        out += module.types(imp.typeIdx)
+      else
+        out += FuncType(Vector.empty, Vector.empty)
+    }
+    module.functions.foreach { typeIdx =>
+      if typeIdx >= 0 && typeIdx < module.types.length then
+        out += module.types(typeIdx)
+      else
+        out += FuncType(Vector.empty, Vector.empty)
+    }
+    out.toVector
+
+  // === Per-function validation ============================================
+
+  /** Validate one function body. Opens an implicit `Function` control
+    * frame whose `endTypes` are the function's declared results; the
+    * outer body-end (0x0B) pops that frame, ensuring the function's
+    * results are on the stack at exit. */
+  private def validateFunction(
+      funcIdx:    Int,
+      sig:        FuncType,
+      declared:   Vector[ValueType],
+      body:       Array[Byte],
+      funcSigs:   Vector[FuncType],
+      globalSigs: Vector[(ValueType, Boolean)],
+      types:      Vector[FuncType],
+      tableCount: Int,
+      memoryCount: Int,
+  ): Unit =
+    val state = new State(
+      funcIdx     = funcIdx,
+      funcResults = sig.results,
+      locals      = sig.params ++ declared,
+      funcSigs    = funcSigs,
+      globalSigs  = globalSigs,
+      types       = types,
+      tableCount  = tableCount,
+      memoryCount = memoryCount,
+      body        = body,
+    )
+    state.pushCtrl(CtrlKind.Function, Vector.empty, sig.results)
+    state.walk()
+    // After the outer end is consumed, ctrlStack must be empty and pc
+    // at the end of the body. `walk` already enforces this.
+
+  /** Per-function validator state. Mutable because the algorithm is
+    * structurally iterative; immutable would be possible but make the
+    * operand/ctrl stacks much noisier. */
+  private final class State(
+      val funcIdx:     Int,
+      val funcResults: Vector[ValueType],
+      val locals:      Vector[ValueType],
+      val funcSigs:    Vector[FuncType],
+      val globalSigs:  Vector[(ValueType, Boolean)],
+      val types:       Vector[FuncType],
+      val tableCount:  Int,
+      val memoryCount: Int,
+      val body:        Array[Byte],
+  ):
+    val operandStack: ArrayBuffer[AbsValue]  = ArrayBuffer.empty
+    val ctrlStack:    ArrayBuffer[CtrlFrame] = ArrayBuffer.empty
+    var pc:   Int = 0
+    var opPC: Int = 0   // PC of the instruction currently being validated
+
+    // --- diagnostics ----
+
+    def fail(msg: String): Nothing =
+      throw new ValFail(WasmError.InvalidModule(
+        s"function $funcIdx: byte offset 0x${opPC.toHexString}: $msg"))
+
+    def typeName(t: ValueType): String = t match
+      case ValueType.I32Type => "i32"
+      case ValueType.I64Type => "i64"
+      case ValueType.F32Type => "f32"
+      case ValueType.F64Type => "f64"
+
+    // --- operand stack ----
+
+    def pushVal(v: AbsValue): Unit = operandStack += v
+    def pushVal(t: ValueType): Unit = pushVal(AbsValue.Known(t))
+
+    def pushVals(ts: Vector[ValueType]): Unit =
+      var i = 0
+      while i < ts.length do
+        pushVal(ts(i))
+        i += 1
+
+    /** Pop one value off the operand stack. If the topmost control
+      * frame is unreachable and the stack is at the frame's base
+      * height, return `Unknown` (polymorphic): the validator pretends
+      * the dead code produced whatever value the consumer needs.
+      * Otherwise pop a real value, or error on underflow. */
+    def popVal(): AbsValue =
+      val frame = topFrame
+      if operandStack.size == frame.baseHeight then
+        if frame.unreachable then AbsValue.Unknown
+        else fail("operand stack underflow")
+      else if operandStack.size < frame.baseHeight then
+        fail("operand stack underflow (below frame base)")
+      else
+        operandStack.remove(operandStack.size - 1)
+
+    /** Pop one value and check it matches `expected`. `Unknown`
+      * matches any expected type (synthesises it for diagnostics). */
+    def popVal(expected: ValueType): AbsValue =
+      val v = popVal()
+      v match
+        case AbsValue.Unknown   => AbsValue.Known(expected)
+        case AbsValue.Known(t)  =>
+          if t != expected then
+            fail(s"type mismatch: expected ${typeName(expected)}, got ${typeName(t)}")
+          v
+
+    /** Pop a vector of values in REVERSE order so the bottom of
+      * `ts` matches the top of the stack — consumer semantics. */
+    def popVals(ts: Vector[ValueType]): Unit =
+      var i = ts.length - 1
+      while i >= 0 do
+        popVal(ts(i))
+        i -= 1
+
+    // --- control stack ----
+
+    def topFrame: CtrlFrame =
+      if ctrlStack.isEmpty then fail("control stack underflow")
+      else ctrlStack.last
+
+    def pushCtrl(kind: CtrlKind, startTypes: Vector[ValueType],
+                 endTypes: Vector[ValueType]): Unit =
+      val frame = CtrlFrame(kind, startTypes, endTypes, operandStack.size)
+      ctrlStack += frame
+      pushVals(startTypes)
+
+    def popCtrl(): CtrlFrame =
+      if ctrlStack.isEmpty then
+        fail("end without matching block/loop/if/function")
+      val frame = ctrlStack.last
+      popVals(frame.endTypes)
+      if operandStack.size != frame.baseHeight then
+        fail(s"end of ${frame.kind}: stack height ${operandStack.size}, expected ${frame.baseHeight} (extra values on stack)")
+      ctrlStack.remove(ctrlStack.size - 1)
+      frame
+
+    def unreachable(): Unit =
+      val frame = topFrame
+      while operandStack.size > frame.baseHeight do
+        operandStack.remove(operandStack.size - 1)
+      frame.unreachable = true
+
+    /** Label-types of a control frame — what `br N` to it carries.
+      * For `Loop`, branches re-enter the loop body with its params
+      * fresh on the stack; for everything else, branches exit the
+      * frame with its results. */
+    def labelTypes(frame: CtrlFrame): Vector[ValueType] =
+      if frame.kind == CtrlKind.Loop then frame.startTypes else frame.endTypes
+
+    def labelFrame(n: Int): CtrlFrame =
+      if n < 0 || n >= ctrlStack.length then
+        fail(s"branch index $n out of range (have ${ctrlStack.length} labels)")
+      ctrlStack(ctrlStack.length - 1 - n)
+
+    // --- LEB / immediate readers ----
+    //
+    // The validator never advances `pc` past a malformed immediate
+    // without erroring first — each helper fails atomically. opPC
+    // (the start of the current instruction) is preserved so any
+    // failure points at the offending opcode, not at the immediate.
+
+    def readU32(): Int =
+      Leb128.readU32(body, pc) match
+        case Right((v, np)) => pc = np; v
+        case Left(e)        => throw new ValFail(e)
+
+    def readS32(): Int =
+      Leb128.readS32(body, pc) match
+        case Right((v, np)) => pc = np; v
+        case Left(e)        => throw new ValFail(e)
+
+    def readS64(): Long =
+      Leb128.readS64(body, pc) match
+        case Right((v, np)) => pc = np; v
+        case Left(e)        => throw new ValFail(e)
+
+    /** Skip `n` raw bytes; used by `f32.const` (4 bytes) and
+      * `f64.const` (8 bytes). */
+    def skipRaw(n: Int): Unit =
+      if pc + n > body.length then fail(s"truncated immediate of $n bytes")
+      pc += n
+
+    /** Consume an `align` + `offset` LEB pair (every memory op). The
+      * values are ignored by the type-check (alignment is dynamic,
+      * offset doesn't affect typing) — we only need to advance pc. */
+    def skipMemArg(): Unit =
+      readU32(); readU32()
+      ()
+
+    /** Consume one reserved byte (memory.size / memory.grow).
+      * Non-zero indicates multi-memory, which the MVP doesn't model. */
+    def skipReservedByte(label: String): Unit =
+      if pc >= body.length then fail(s"truncated $label reserved byte")
+      val b = body(pc) & 0xff
+      if b != 0 then fail(s"$label: non-zero reserved byte 0x${b.toHexString}")
+      pc += 1
+
+    // --- walker ----
+
+    /** Walk the function body, dispatching each opcode to its
+      * type-check. The walker assumes the implicit `Function` ctrl
+      * frame has been pushed by the caller; when the outer `end`
+      * pops it the loop exits. */
+    def walk(): Unit =
+      while ctrlStack.nonEmpty do
+        if pc >= body.length then
+          fail("missing function-body end")
+        opPC = pc
+        val op = body(pc) & 0xff
+        pc += 1
+        dispatch(op)
+      // After the function frame has been popped, `pc` should equal
+      // body.length (the outer end byte was the last byte). Any extra
+      // bytes after the function-level `end` are spec-malformed.
+      if pc != body.length then
+        opPC = pc
+        fail(s"${body.length - pc} extra bytes after function-body end")
+
+    /** Dispatch one opcode. Mirrors `Interpreter.step` and
+      * `skipImmediates` opcode-for-opcode, replacing concrete execution
+      * with type-check (pop expected types, push declared results).
+      * Any opcode not enumerated here surfaces as `UnknownOpcode`
+      * — the same error variant the interpreter uses, so a fresh
+      * opcode addition fails loudly here too. */
+    def dispatch(op: Int): Unit = op match
+
+      // === control flow =================================================
+
+      case 0x00 => unreachable()                                                // unreachable
+      case 0x01 => ()                                                           // nop
+      case 0x02 | 0x03 | 0x04 =>                                                // block / loop / if
+        val (sig, np) = Interpreter.readBlocktype(body, pc, types) match
+          case Right(t) => t
+          case Left(e)  => throw new ValFail(e)
+        pc = np
+        val ft = resolveBlockSig(sig)
+        op match
+          case 0x02 =>
+            popVals(ft.params)
+            pushCtrl(CtrlKind.Block, ft.params, ft.results)
+          case 0x03 =>
+            popVals(ft.params)
+            pushCtrl(CtrlKind.Loop, ft.params, ft.results)
+          case _ =>
+            popVal(ValueType.I32Type)
+            popVals(ft.params)
+            pushCtrl(CtrlKind.If, ft.params, ft.results)
+      case 0x05 =>                                                              // else
+        val frame = popCtrl()
+        if frame.kind != CtrlKind.If then
+          fail(s"else matched a non-if frame: ${frame.kind}")
+        pushCtrl(CtrlKind.Else, frame.startTypes, frame.endTypes)
+      case 0x0b =>                                                              // end
+        val frame = popCtrl()
+        pushVals(frame.endTypes)
+      case 0x0c =>                                                              // br N
+        val n = readU32()
+        val frame = labelFrame(n)
+        popVals(labelTypes(frame))
+        unreachable()
+      case 0x0d =>                                                              // br_if N
+        val n = readU32()
+        popVal(ValueType.I32Type)
+        val frame = labelFrame(n)
+        popVals(labelTypes(frame))
+        pushVals(labelTypes(frame))
+      case 0x0e =>                                                              // br_table targets default
+        val count = readU32()
+        if count < 0 then fail(s"br_table: negative vec count $count")
+        val targets = new Array[Int](count)
+        var i = 0
+        while i < count do { targets(i) = readU32(); i += 1 }
+        val dflt = readU32()
+        popVal(ValueType.I32Type)
+        val dframe = labelFrame(dflt)
+        val arity  = labelTypes(dframe).length
+        // Spec: every target label must have the *same* arity. We
+        // approximate the spec's "consistent type sequence" by arity
+        // only (the surface here doesn't track all permitted subtype
+        // relaxations); strict type equality of the individual
+        // entries is implied by every-target popVals(labelTypes).
+        i = 0
+        while i < count do
+          val lt = labelTypes(labelFrame(targets(i)))
+          if lt.length != arity then
+            fail(s"br_table: target $i has arity ${lt.length}, default has $arity")
+          // Validate types are poppable (without consuming — push back).
+          popVals(lt)
+          pushVals(lt)
+          i += 1
+        popVals(labelTypes(dframe))
+        unreachable()
+      case 0x0f =>                                                              // return
+        popVals(funcResults)
+        unreachable()
+      case 0x10 =>                                                              // call funcidx
+        val idx = readU32()
+        if idx < 0 || idx >= funcSigs.length then
+          fail(s"call: function index $idx out of range (have ${funcSigs.length})")
+        val sig = funcSigs(idx)
+        popVals(sig.params)
+        pushVals(sig.results)
+      case 0x11 =>                                                              // call_indirect typeidx tableidx
+        val typeIdx  = readU32()
+        val tableIdx = readU32()
+        if typeIdx < 0 || typeIdx >= types.length then
+          fail(s"call_indirect: type index $typeIdx out of range")
+        if tableIdx < 0 || tableIdx >= tableCount then
+          fail(s"call_indirect: table index $tableIdx out of range (have $tableCount tables)")
+        val sig = types(typeIdx)
+        popVal(ValueType.I32Type)                                               // slot index
+        popVals(sig.params)
+        pushVals(sig.results)
+
+      // === parametric ==================================================
+
+      case 0x1a => popVal()                                                     // drop
+      case 0x1b =>                                                              // select (polymorphic)
+        popVal(ValueType.I32Type)
+        val t1 = popVal()
+        val t2 = popVal()
+        // Both operands must have the same type. With Unknown, pick the
+        // other operand's type (or Unknown if both polymorphic).
+        (t1, t2) match
+          case (AbsValue.Known(a), AbsValue.Known(b)) =>
+            if a != b then
+              fail(s"select: operand type mismatch (${typeName(a)} vs ${typeName(b)})")
+            pushVal(a)
+          case (AbsValue.Known(a), AbsValue.Unknown) => pushVal(a)
+          case (AbsValue.Unknown, AbsValue.Known(b)) => pushVal(b)
+          case (AbsValue.Unknown, AbsValue.Unknown)  => pushVal(AbsValue.Unknown)
+
+      // === variables ===================================================
+
+      case 0x20 =>                                                              // local.get N
+        val idx = readU32()
+        if idx < 0 || idx >= locals.length then
+          fail(s"local.get $idx out of range (have ${locals.length} locals)")
+        pushVal(locals(idx))
+      case 0x21 =>                                                              // local.set N
+        val idx = readU32()
+        if idx < 0 || idx >= locals.length then
+          fail(s"local.set $idx out of range (have ${locals.length} locals)")
+        popVal(locals(idx))
+      case 0x22 =>                                                              // local.tee N
+        val idx = readU32()
+        if idx < 0 || idx >= locals.length then
+          fail(s"local.tee $idx out of range (have ${locals.length} locals)")
+        popVal(locals(idx))
+        pushVal(locals(idx))
+      case 0x23 =>                                                              // global.get N
+        val idx = readU32()
+        if idx < 0 || idx >= globalSigs.length then
+          fail(s"global.get $idx out of range (have ${globalSigs.length} globals)")
+        pushVal(globalSigs(idx)._1)
+      case 0x24 =>                                                              // global.set N
+        val idx = readU32()
+        if idx < 0 || idx >= globalSigs.length then
+          fail(s"global.set $idx out of range (have ${globalSigs.length} globals)")
+        if !globalSigs(idx)._2 then
+          fail(s"global.set on immutable global $idx")
+        popVal(globalSigs(idx)._1)
+
+      // === memory loads / stores =======================================
+
+      case 0x28 => memLoad(ValueType.I32Type)                                   // i32.load
+      case 0x29 => memLoad(ValueType.I64Type)                                   // i64.load
+      case 0x2a => memLoad(ValueType.F32Type)                                   // f32.load
+      case 0x2b => memLoad(ValueType.F64Type)                                   // f64.load
+      case 0x2c | 0x2d | 0x2e | 0x2f =>                                         // i32.load{8,16}_{s,u}
+        memLoad(ValueType.I32Type)
+      case 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 =>                           // i64.load{8,16,32}_{s,u}
+        memLoad(ValueType.I64Type)
+      case 0x36 => memStore(ValueType.I32Type)                                  // i32.store
+      case 0x37 => memStore(ValueType.I64Type)                                  // i64.store
+      case 0x38 => memStore(ValueType.F32Type)                                  // f32.store
+      case 0x39 => memStore(ValueType.F64Type)                                  // f64.store
+      case 0x3a | 0x3b => memStore(ValueType.I32Type)                           // i32.store{8,16}
+      case 0x3c | 0x3d | 0x3e => memStore(ValueType.I64Type)                    // i64.store{8,16,32}
+
+      case 0x3f =>                                                              // memory.size
+        requireMemory("memory.size")
+        skipReservedByte("memory.size")
+        pushVal(ValueType.I32Type)
+      case 0x40 =>                                                              // memory.grow
+        requireMemory("memory.grow")
+        skipReservedByte("memory.grow")
+        popVal(ValueType.I32Type)
+        pushVal(ValueType.I32Type)
+
+      // === const ========================================================
+
+      case 0x41 => readS32();         pushVal(ValueType.I32Type)                // i32.const
+      case 0x42 => readS64();         pushVal(ValueType.I64Type)                // i64.const
+      case 0x43 => skipRaw(4);        pushVal(ValueType.F32Type)                // f32.const
+      case 0x44 => skipRaw(8);        pushVal(ValueType.F64Type)                // f64.const
+
+      // === i32 numeric ===================================================
+
+      case 0x45 => unop(ValueType.I32Type, ValueType.I32Type)                   // i32.eqz
+      case 0x46 | 0x47 | 0x48 | 0x49 | 0x4a | 0x4b |
+           0x4c | 0x4d | 0x4e | 0x4f =>                                          // i32.eq..ge_u → i32 i32 -> i32
+        binop(ValueType.I32Type, ValueType.I32Type, ValueType.I32Type)
+      case 0x67 | 0x68 | 0x69 =>                                                 // i32.clz / ctz / popcnt
+        unop(ValueType.I32Type, ValueType.I32Type)
+      case 0x6a | 0x6b | 0x6c | 0x6d | 0x6e | 0x6f | 0x70 |
+           0x71 | 0x72 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 =>              // i32.add..rotr
+        binop(ValueType.I32Type, ValueType.I32Type, ValueType.I32Type)
+
+      // === i64 numeric ===================================================
+
+      case 0x50 => unop(ValueType.I64Type, ValueType.I32Type)                   // i64.eqz → i32
+      case 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 |
+           0x57 | 0x58 | 0x59 | 0x5a =>                                          // i64.eq..ge_u → i64 i64 -> i32
+        binop(ValueType.I64Type, ValueType.I64Type, ValueType.I32Type)
+      case 0x79 | 0x7a | 0x7b =>                                                 // i64.clz / ctz / popcnt
+        unop(ValueType.I64Type, ValueType.I64Type)
+      case 0x7c | 0x7d | 0x7e | 0x7f | 0x80 | 0x81 | 0x82 |
+           0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88 | 0x89 | 0x8a =>              // i64.add..rotr
+        binop(ValueType.I64Type, ValueType.I64Type, ValueType.I64Type)
+
+      // === f32 numeric ===================================================
+
+      case 0x5b | 0x5c | 0x5d | 0x5e | 0x5f | 0x60 =>                            // f32.eq..ge → f32 f32 -> i32
+        binop(ValueType.F32Type, ValueType.F32Type, ValueType.I32Type)
+      case 0x8b | 0x8c | 0x8d | 0x8e | 0x8f | 0x90 | 0x91 =>                     // f32 abs..sqrt
+        unop(ValueType.F32Type, ValueType.F32Type)
+      case 0x92 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 | 0x98 =>                     // f32 add..copysign
+        binop(ValueType.F32Type, ValueType.F32Type, ValueType.F32Type)
+
+      // === f64 numeric ===================================================
+
+      case 0x61 | 0x62 | 0x63 | 0x64 | 0x65 | 0x66 =>                            // f64.eq..ge → f64 f64 -> i32
+        binop(ValueType.F64Type, ValueType.F64Type, ValueType.I32Type)
+      case 0x99 | 0x9a | 0x9b | 0x9c | 0x9d | 0x9e | 0x9f =>                     // f64 abs..sqrt
+        unop(ValueType.F64Type, ValueType.F64Type)
+      case 0xa0 | 0xa1 | 0xa2 | 0xa3 | 0xa4 | 0xa5 | 0xa6 =>                     // f64 add..copysign
+        binop(ValueType.F64Type, ValueType.F64Type, ValueType.F64Type)
+
+      // === conversions ===================================================
+
+      case 0xa7 => unop(ValueType.I64Type, ValueType.I32Type)                   // i32.wrap_i64
+      case 0xa8 | 0xa9 => unop(ValueType.F32Type, ValueType.I32Type)            // i32.trunc_f32_{s,u}
+      case 0xaa | 0xab => unop(ValueType.F64Type, ValueType.I32Type)            // i32.trunc_f64_{s,u}
+      case 0xac | 0xad => unop(ValueType.I32Type, ValueType.I64Type)            // i64.extend_i32_{s,u}
+      case 0xae | 0xaf => unop(ValueType.F32Type, ValueType.I64Type)            // i64.trunc_f32_{s,u}
+      case 0xb0 | 0xb1 => unop(ValueType.F64Type, ValueType.I64Type)            // i64.trunc_f64_{s,u}
+      case 0xb2 | 0xb3 => unop(ValueType.I32Type, ValueType.F32Type)            // f32.convert_i32_{s,u}
+      case 0xb4 | 0xb5 => unop(ValueType.I64Type, ValueType.F32Type)            // f32.convert_i64_{s,u}
+      case 0xb6 => unop(ValueType.F64Type, ValueType.F32Type)                   // f32.demote_f64
+      case 0xb7 | 0xb8 => unop(ValueType.I32Type, ValueType.F64Type)            // f64.convert_i32_{s,u}
+      case 0xb9 | 0xba => unop(ValueType.I64Type, ValueType.F64Type)            // f64.convert_i64_{s,u}
+      case 0xbb => unop(ValueType.F32Type, ValueType.F64Type)                   // f64.promote_f32
+      case 0xbc => unop(ValueType.F32Type, ValueType.I32Type)                   // i32.reinterpret_f32
+      case 0xbd => unop(ValueType.F64Type, ValueType.I64Type)                   // i64.reinterpret_f64
+      case 0xbe => unop(ValueType.I32Type, ValueType.F32Type)                   // f32.reinterpret_i32
+      case 0xbf => unop(ValueType.I64Type, ValueType.F64Type)                   // f64.reinterpret_i64
+
+      // === sign-extension proposal =======================================
+
+      case 0xc0 | 0xc1 => unop(ValueType.I32Type, ValueType.I32Type)            // i32.extend8_s / 16_s
+      case 0xc2 | 0xc3 | 0xc4 => unop(ValueType.I64Type, ValueType.I64Type)     // i64.extend8_s / 16_s / 32_s
+
+      // === bulk memory subset (0xFC) =====================================
+
+      case 0xfc =>
+        val sub = readU32()
+        sub match
+          case 10 =>                                                            // memory.copy
+            requireMemory("memory.copy")
+            if pc + 2 > body.length then
+              fail("truncated memory.copy reserved bytes")
+            val a = body(pc) & 0xff
+            val b = body(pc + 1) & 0xff
+            if a != 0 || b != 0 then
+              fail(s"memory.copy: non-zero reserved bytes 0x${a.toHexString} 0x${b.toHexString}")
+            pc += 2
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.I32Type)                                           // src
+            popVal(ValueType.I32Type)                                           // dst
+          case 11 =>                                                            // memory.fill
+            requireMemory("memory.fill")
+            if pc + 1 > body.length then
+              fail("truncated memory.fill reserved byte")
+            val r = body(pc) & 0xff
+            if r != 0 then
+              fail(s"memory.fill: non-zero reserved byte 0x${r.toHexString}")
+            pc += 1
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.I32Type)                                           // value
+            popVal(ValueType.I32Type)                                           // dst
+          case _ =>
+            throw new ValFail(WasmError.UnknownOpcode(0xfc))
+
+      // === unhandled ===================================================
+
+      case other => throw new ValFail(WasmError.UnknownOpcode(other))
+
+    // --- typing-rule shortcuts ----
+
+    /** popVal(in); pushVal(out) — every unary form. */
+    def unop(in: ValueType, out: ValueType): Unit =
+      popVal(in)
+      pushVal(out)
+
+    /** popVal(b); popVal(a); pushVal(out) — every binary form. Pops in
+      * reverse order because the bottom operand is deeper on the
+      * stack. */
+    def binop(a: ValueType, b: ValueType, out: ValueType): Unit =
+      popVal(b)
+      popVal(a)
+      pushVal(out)
+
+    /** Walk a memory load: addr=i32 → result type. Memory must exist. */
+    def memLoad(out: ValueType): Unit =
+      requireMemory("memory load")
+      skipMemArg()
+      popVal(ValueType.I32Type)
+      pushVal(out)
+
+    /** Walk a memory store: addr=i32, value=t. Memory must exist. */
+    def memStore(t: ValueType): Unit =
+      requireMemory("memory store")
+      skipMemArg()
+      popVal(t)
+      popVal(ValueType.I32Type)
+
+    /** Resolve a [[Interpreter.BlockSig]] (arity-only) into a full
+      * `FuncType` so we can pop+push the actual types. For the inline
+      * blocktype forms the arity tells us everything: empty (0,0) is
+      * `FuncType([], [])`; single-result (0,1) types arrive ambiguous
+      * — we re-decode the byte to pick the type. Multi-value
+      * blocktypes (`paramArity > 0` or `resultArity > 1`) cache the
+      * original typeidx via a second decode pass on the same offset. */
+    def resolveBlockSig(sig: Interpreter.BlockSig): FuncType =
+      // The blocktype byte sat at `opPC + 1`. Re-decode to get the
+      // actual types. (Cheap — one byte, occasionally a few-byte SLEB.)
+      val pos = opPC + 1
+      val b = body(pos) & 0xff
+      b match
+        case 0x40 => FuncType(Vector.empty, Vector.empty)
+        case 0x7f => FuncType(Vector.empty, Vector(ValueType.I32Type))
+        case 0x7e => FuncType(Vector.empty, Vector(ValueType.I64Type))
+        case 0x7d => FuncType(Vector.empty, Vector(ValueType.F32Type))
+        case 0x7c => FuncType(Vector.empty, Vector(ValueType.F64Type))
+        case _    =>
+          Leb128.readS32(body, pos) match
+            case Right((idx, _)) if idx >= 0 && idx < types.length =>
+              types(idx)
+            case _ =>
+              // The first decode in `dispatch` already validated this;
+              // if we get here something is structurally wrong.
+              fail("blocktype: internal error resolving signature")
+
+    /** Memory ops require at least one declared memory in the module. */
+    def requireMemory(label: String): Unit =
+      if memoryCount == 0 then
+        fail(s"$label: module has no memory")
+
+end Validator

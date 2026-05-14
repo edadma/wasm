@@ -187,9 +187,14 @@ object Interpreter:
     * SLEB128 numbers (sign bit set on a single-byte read), which is why
     * the typeidx form unambiguously takes the "otherwise" branch even
     * though it overlaps the same byte space — typeidx 0 encodes as
-    * `0x00`, never as `0x40` or `0x7C..0x7F`. */
-  private def readBlocktype(body: Array[Byte], pos: Int,
-                            types: Vector[FuncType]): Either[WasmError, (BlockSig, Int)] =
+    * `0x00`, never as `0x40` or `0x7C..0x7F`.
+    *
+    * Package-private (`private[wasm]`) so [[Validator]] can share the
+    * decode: validation needs the resolved `FuncType` to type-check the
+    * block's params + results, and re-implementing this disambiguation
+    * would invite a parser/validator drift on future blocktype additions. */
+  private[wasm] def readBlocktype(body: Array[Byte], pos: Int,
+                                  types: Vector[FuncType]): Either[WasmError, (BlockSig, Int)] =
     if pos >= body.length then Left(WasmError.InvalidModule("EOF in blocktype"))
     else (body(pos) & 0xff) match
       case 0x40 => Right((BlockSig(0, 0), pos + 1))            // empty

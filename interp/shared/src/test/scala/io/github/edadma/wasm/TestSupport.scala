@@ -96,6 +96,20 @@ object TestSupport:
         if matcher.isDefinedAt(err) then check(matcher(err), s"$name unexpected error: $err")
         else check(false, s"$name unexpected error: $err")
 
+  /** Static-error variant of [[expectError]] — surfaced at instantiation
+    * by the Phase 6 validator, not by invocation. Use this for tests
+    * that hand a malformed binary to `Runtime.instantiate` and expect
+    * a specific `WasmError` shape back. */
+  def expectInstantiateError(
+      bytes: Array[Byte],
+      env:   HostModule = EnvModule.default,
+  )(matcher: PartialFunction[WasmError, Boolean]): Unit =
+    Runtime.instantiate(bytes, Seq(env)) match
+      case Right(_)  => check(false, "expected instantiation error, got Right(_)")
+      case Left(err) =>
+        if matcher.isDefinedAt(err) then check(matcher(err), s"unexpected error: $err")
+        else check(false, s"unexpected error: $err")
+
   // === Binary-patching helpers ============================================
 
   /** Replace one byte of a fixture copy. */

@@ -108,14 +108,13 @@ object GlobalsTests:
       check(callF64(inst, "get_f64") == Double.NegativeInfinity, "f64 -Inf survives")
     }
 
-    test("globals: set on immutable global traps with InvalidModule(\"immutable\")") {
-      val inst = instantiate(Fixtures.globals_immutable_trap)
-      // Reading the const still works.
-      check(callI32(inst, "get_k") == 99, "immutable global readable")
-      // Writing traps with a recognisable message.
-      expectError(inst, "try_overwrite", Seq(I32(0))) {
+    test("globals: set on immutable global rejected at validation with InvalidModule(\"immutable\")") {
+      // Phase 6: a `global.set` against an immutable global is statically
+      // ill-typed (it violates the global's mutability bit). The validator
+      // surfaces it at instantiate, before any function gets a chance to
+      // run. (Pre-Phase-6 this surfaced as a dispatch-time trap; either
+      // way the module is rejected — the new shape just rejects earlier.)
+      expectInstantiateError(Fixtures.globals_immutable_trap) {
         case WasmError.InvalidModule(m) => m.contains("immutable")
       }
-      // And the value should still be 99 — the trap fires before mutation.
-      check(callI32(inst, "get_k") == 99, "value unchanged after failed write")
     }
