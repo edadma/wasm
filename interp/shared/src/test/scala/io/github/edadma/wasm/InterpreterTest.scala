@@ -56,6 +56,7 @@ object InterpreterTest:
     SimdIntArithTests.run()
     SimdShiftMinMaxTests.run()
     SimdFloatArithTests.run()
+    SimdBitwiseReductionsTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

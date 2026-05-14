@@ -1018,6 +1018,29 @@ object Validator:
                0xF4 | 0xF5 | 0xF6 | 0xF7 =>                                       // f64x2 min/max/pmin/pmax
             binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
 
+          // --- Chunk G.1 — bitwise + reductions -------------------------
+          //
+          // Bitwise: `not` is unary; `and`/`andnot`/`or`/`xor` are binary;
+          // `bitselect` is the only ternary SIMD op (3 v128 operands,
+          // 1 v128 result). Reductions all produce a single i32 from a
+          // v128 — `any_true` ignores lane shape; `all_true` / `bitmask`
+          // are shape-aware (the per-lane reading lives in stepFd, not
+          // here — the validator only enforces the stack shape).
+
+          case 0x4D =>                                                            // v128.not
+            unop(ValueType.V128Type, ValueType.V128Type)
+
+          case 0x4E | 0x4F | 0x50 | 0x51 =>                                       // and / andnot / or / xor
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
+          case 0x52 =>                                                            // v128.bitselect
+            ternop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
+          case 0x53 |                                                             // v128.any_true
+               0x63 | 0x83 | 0xA3 | 0xC3 |                                        // *.all_true
+               0x64 | 0x84 | 0xA4 | 0xC4 =>                                       // *.bitmask
+            unop(ValueType.V128Type, ValueType.I32Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
@@ -1036,6 +1059,14 @@ object Validator:
       * reverse order because the bottom operand is deeper on the
       * stack. */
     def binop(a: ValueType, b: ValueType, out: ValueType): Unit =
+      popVal(b)
+      popVal(a)
+      pushVal(out)
+
+    /** popVal(c); popVal(b); popVal(a); pushVal(out) — only used by
+      * `v128.bitselect` so far. Same reverse-order rule as binop. */
+    def ternop(a: ValueType, b: ValueType, c: ValueType, out: ValueType): Unit =
+      popVal(c)
       popVal(b)
       popVal(a)
       pushVal(out)

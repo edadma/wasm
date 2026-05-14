@@ -14,12 +14,12 @@ The `interp` and `wasi` libraries are designed to publish to Maven Central as `i
 git clone https://github.com/edadma/wasm.git
 cd wasm
 sbt test                                              # whole tree, all backends
-sbt 'interpJVM/Test/run'                              # 443 interpreter tests, JVM
+sbt 'interpJVM/Test/run'                              # 467 interpreter tests, JVM
 sbt 'wasiJVM/Test/run'                                # 157 WASI tests, JVM
 sbt 'cliJVM/Test/run'                                 # 9 CLI tests
 ```
 
-The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **609 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
+The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **633 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
 
 ## Linking against a local checkout
 
