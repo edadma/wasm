@@ -965,6 +965,24 @@ object Validator:
           case 32 => simdReplace("f32x4.replace_lane",  4, ValueType.F32Type)
           case 34 => simdReplace("f64x2.replace_lane",  2, ValueType.F64Type)
 
+          // --- Chunk D — integer arithmetic ---------------------------
+          //
+          // Two typing rules cover all 29 ops: unary v128 → v128 (abs,
+          // neg) and binary (v128, v128) → v128 (everything else,
+          // including saturating + mul + avgr_u).
+
+          case 0x60 | 0x61 |                                                      // i8x16 abs/neg
+               0x80 | 0x81 |                                                      // i16x8 abs/neg
+               0xA0 | 0xA1 |                                                      // i32x4 abs/neg
+               0xC0 | 0xC1 =>                                                     // i64x2 abs/neg
+            unop(ValueType.V128Type, ValueType.V128Type)
+
+          case 0x6E | 0x6F | 0x70 | 0x71 | 0x72 | 0x73 | 0x7B |                   // i8x16
+               0x8E | 0x8F | 0x90 | 0x91 | 0x92 | 0x93 | 0x95 | 0x9B |            // i16x8
+               0xAE | 0xB1 | 0xB5 |                                               // i32x4
+               0xCE | 0xD1 | 0xD5 =>                                              // i64x2
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 

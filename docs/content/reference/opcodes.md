@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, and C are shipped.** Chunks D..I add integer and float arithmetic, comparisons, conversions, and the special dot/lane mem ops.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, and D are shipped.** Chunks E..I add shifts + min/max, float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
 
 ### Foundations (Chunk A — done)
 
@@ -148,6 +148,31 @@ Every "build / inspect / rearrange a v128 lane-by-lane" surface lives here. Lane
 
 `extract_lane` / `replace_lane` carry a 1-byte lane immediate after the sub-opcode; `i8x16.shuffle` carries a 16-byte laneidx vector. `splat` and `swizzle` have no immediate beyond the sub-opcode.
 
+### Integer arithmetic (Chunk D — done)
+
+Lane-wise integer arithmetic across every integer shape. Plain `add` / `sub` / `mul` wrap modulo 2^lane_width; `_sat_s` / `_sat_u` clamp at the signed / unsigned bounds; `avgr_u` is the rounding unsigned average `(a + b + 1) / 2`. No `i8x16.mul` in the spec, no saturating variants past `i16x8`, no `avgr_u` past `i16x8`. All ops have no immediate.
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `i8x16.abs` | `0x60` | `abs(MinValue)` wraps to `MinValue` (overflow mod 2^8). |
+| `i8x16.neg` | `0x61` | `neg(MinValue)` wraps likewise. |
+| `i8x16.add` | `0x6E` | Wraps mod 256 per lane. |
+| `i8x16.add_sat_s` / `_u` | `0x6F` / `0x70` | Clamps to `[-128, 127]` / `[0, 255]`. |
+| `i8x16.sub` | `0x71` | Wraps mod 256. |
+| `i8x16.sub_sat_s` / `_u` | `0x72` / `0x73` | Clamps to the signed / unsigned lane bounds. |
+| `i8x16.avgr_u` | `0x7B` | `(a + b + 1) / 2` per lane (rounds up). |
+| `i16x8.abs` / `neg` | `0x80` / `0x81` | Same shape as `i8x16`. |
+| `i16x8.add` / `add_sat_s` / `add_sat_u` | `0x8E` / `0x8F` / `0x90` | Wrap / clamp to `[-32768, 32767]` / `[0, 65535]`. |
+| `i16x8.sub` / `sub_sat_s` / `sub_sat_u` | `0x91` / `0x92` / `0x93` | Wrap / clamp. |
+| `i16x8.mul` | `0x95` | Low 16 bits of the full-width product. |
+| `i16x8.avgr_u` | `0x9B` | `(a + b + 1) / 2` per lane unsigned. |
+| `i32x4.abs` / `neg` | `0xA0` / `0xA1` | `abs(Int.MinValue)` wraps. |
+| `i32x4.add` / `sub` / `mul` | `0xAE` / `0xB1` / `0xB5` | Wrap mod 2^32; `mul` is the low 32 bits. |
+| `i64x2.abs` / `neg` | `0xC0` / `0xC1` | `abs(Long.MinValue)` wraps. |
+| `i64x2.add` / `sub` / `mul` | `0xCE` / `0xD1` / `0xD5` | Wrap mod 2^64. |
+
+Sub-opcodes ≥ `0x80` encode as 2-byte LEBs in the binary; `wat2wasm` emits the right shape, and the dispatch's LEB decoder handles either width transparently.
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -163,7 +188,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | integer + float arithmetic, shifts + min/max, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks D..I) |
+| SIMD remainder | shifts + min/max, float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks E..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
