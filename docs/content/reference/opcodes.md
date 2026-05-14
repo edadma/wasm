@@ -4,7 +4,7 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal and a bulk-memory subset, with `trunc_sat_*` (non-trapping float-to-int) added in Phase 8.A. That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end.
+The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, and non-trapping float-to-int (`trunc_sat_*`). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
 ## Numeric (full MVP, all four scalar types)
 
@@ -47,7 +47,20 @@ Multi-value blocks, loops, and ifs are supported — block parameters get re-fed
 
 - **Load/store** — every width variant: `i32.load`, `i32.load8_s`/`_u`, `i32.load16_s`/`_u`, `i64.load`, `i64.load8_s`/…/`load32_s`/`_u`, `f32.load`, `f64.load`, plus all matching stores.
 - **Sizing** — `memory.size` and `memory.grow`. The optional `max` from section 5 is honoured: `grow` past it returns `-1` rather than expanding.
-- **Bulk-memory subset** — `memory.copy` (sub-opcode `0x0A` under `0xFC`) and `memory.fill` (sub-opcode `0x0B`).
+- **Bulk-memory** — the full proposal, all seven ops under the `0xFC` prefix:
+    - `memory.copy` (sub `0x0A`), `memory.fill` (sub `0x0B`) — Phase 7.B.
+    - `memory.init` (sub `0x08`), `data.drop` (sub `0x09`) — Phase 8.B.
+    - `table.init` (sub `0x0C`), `elem.drop` (sub `0x0D`), `table.copy` (sub `0x0E`) — Phase 8.B.
+
+  `memory.init` / `table.init` copy from passive data / element segments;
+  `data.drop` / `elem.drop` mark a segment as zero-length (idempotent).
+  Active segments are still initialised at instantiation and then marked
+  dropped automatically — subsequent `*.init` with `n > 0` traps, matching
+  wasmtime / V8 / wabt semantics.
+
+### Passive vs active data + element segments
+
+Section 11 (data) and section 9 (element) now carry sealed-trait segment kinds. Active segments behave as before (copied at instantiation). Passive segments stay addressable by `dataidx` / `elemidx` until the matching `.drop`. Declarative element segments parse cleanly but are no-ops at runtime — they pre-declare funcrefs for `ref.func`, which arrives in Phase 8.C. Element-expression-bearing element segments (flags 4..7) are still rejected at parse time and land with reference types.
 
 ## Tables + functions
 
@@ -59,14 +72,13 @@ Section 4 + Section 9 funcref tables. `call_indirect` does a signature check at 
 
 ## What isn't implemented yet
 
-The Phase-8 menu after `trunc_sat`:
+The Phase-8 menu after `trunc_sat` + bulk-memory remainder:
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| Bulk-memory remainder | `memory.init`, `data.drop`, `table.copy`, `table.init`, `elem.drop` | not yet |
-| Reference types | `externref`, `ref.is_null`, `ref.func` | not yet |
-| Multi-memory | `memory.copy` with two memory indices, `memory.size` / `grow` with a non-zero memory index | not yet |
-| SIMD (v128) | every `v128.*` opcode, `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | not yet |
+| Reference types | `ref.null`, `ref.is_null`, `ref.func`, `externref`, `table.get`/`table.set`/`table.size`/`table.grow`/`table.fill` | not yet (8.C) |
+| Multi-memory | every memory opcode with a non-zero memory index | not yet (8.D) |
+| SIMD (v128) | every `v128.*` opcode, `i8x16.*`, `i16x8.*`, `i32x4.*`, `i64x2.*`, `f32x4.*`, `f64x2.*` | not yet (8.E) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
@@ -92,6 +104,7 @@ Every imported module runs through a separate validator before any code executes
 | Start    | 8  | Function index run at instantiate time |
 | Element  | 9  | Funcref table initializers |
 | Code     | 10 | Function bodies |
-| Data     | 11 | Linear-memory initializers |
+| Data     | 11 | Linear-memory initializers (active + passive) |
+| DataCount | 12 | u32 = number of data segments; required when a function uses `memory.init` or `data.drop` |
 
 Custom sections are skipped harmlessly.
