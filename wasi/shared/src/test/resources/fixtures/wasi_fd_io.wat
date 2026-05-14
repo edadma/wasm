@@ -44,6 +44,10 @@
     (func $fd_datasync (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_unlink_file"
     (func $path_unlink_file (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_create_directory"
+    (func $path_create_directory (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_readdir"
+    (func $fd_readdir (param i32 i32 i32 i64 i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -140,6 +144,24 @@
     local.get $path_ptr
     local.get $path_len
     call $path_unlink_file)
+
+  (func (export "call_path_create_directory")
+        (param $fd i32) (param $path_ptr i32) (param $path_len i32)
+        (result i32)
+    local.get $fd
+    local.get $path_ptr
+    local.get $path_len
+    call $path_create_directory)
+
+  (func (export "call_fd_readdir")
+        (param $fd i32) (param $buf i32) (param $buf_len i32)
+        (param $cookie i64) (param $bufused_out i32) (result i32)
+    local.get $fd
+    local.get $buf
+    local.get $buf_len
+    local.get $cookie
+    local.get $bufused_out
+    call $fd_readdir)
 
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)

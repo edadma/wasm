@@ -83,6 +83,16 @@ object Wasi:
     * asked to create a file that already exists. EXCL is the way
     * userspace asks for "atomic create" semantics. */
   val EEXIST:       Int = 20
+  /** Is a directory — `path_open` (with or without OFLAGS_DIRECTORY) was
+    * asked to open a path that resolves to a directory through the
+    * regular-file path. The InMemoryFs doesn't yet support opening
+    * directory fds beyond preopens, so any path_open on a DirEntry
+    * surfaces this. */
+  val EISDIR:       Int = 31
+  /** Not a directory — `OFLAGS_DIRECTORY` set on `path_open` but the
+    * path resolves to a regular file; also any syscall that requires
+    * a directory fd but received a regular-file fd. */
+  val ENOTDIR:      Int = 54
   /** Capability insufficient — the preopen advertises its name but has no
     * FS capability behind it ([[WasiContext.Preopen.named]]). A program
     * asking to `path_open` through it gets this errno rather than
@@ -291,10 +301,12 @@ object Wasi:
         "fd_prestat_get"      -> ((mem, args) => prestatGet(mem, args, ctx)),
         "fd_prestat_dir_name" -> ((mem, args) => prestatDirName(mem, args, ctx)),
         "path_open"           -> ((mem, args) => pathOpen(mem, args, ctx, fdTable)),
-        "path_filestat_get"   -> ((mem, args) => pathFilestatGet(mem, args, ctx)),
-        "path_unlink_file"    -> ((mem, args) => pathUnlinkFile(mem, args, ctx)),
-        "fd_sync"             -> ((_,   args) => fdSync(args, ctx, fdTable)),
-        "fd_datasync"         -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
+        "path_filestat_get"     -> ((mem, args) => pathFilestatGet(mem, args, ctx)),
+        "path_unlink_file"      -> ((mem, args) => pathUnlinkFile(mem, args, ctx)),
+        "path_create_directory" -> ((mem, args) => pathCreateDirectory(mem, args, ctx)),
+        "fd_readdir"            -> ((mem, args) => fdReaddir(mem, args, ctx, fdTable)),
+        "fd_sync"               -> ((_,   args) => fdSync(args, ctx, fdTable)),
+        "fd_datasync"           -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -1008,11 +1020,28 @@ object Wasi:
             while i < 64 do
               data(bufPtr + i) = 0
               i += 1
-            data(bufPtr + 16) = 4                  // REGULAR_FILE
+            // Filetype: ask the preopen — InMemoryPreopen knows whether
+            // the path is a FileEntry or DirEntry. Default-trait preopens
+            // can't reach this branch (statPath would have returned
+            // ENOTCAPABLE).
+            val ft: Byte = filetypeFor(ctx.preopens(idx), path)
+            data(bufPtr + 16) = ft
             writeI64LE(data, bufPtr + 24, 1L)      // nlink
             writeI64LE(data, bufPtr + 32, size)    // size
             Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
+
+  /** Resolve a preopen's filetype byte for `path`. Falls back to
+    * REGULAR_FILE (4) for preopens that don't override `filetypeOf`
+    * (i.e. anything other than [[WasiContext.Preopen.InMemoryPreopen]])
+    * — those preopens can only resolve files via `statPath` anyway,
+    * so the fallback is honest. */
+  private inline def filetypeFor(preopen: WasiContext.Preopen,
+                                 path:    String): Byte =
+    preopen match
+      case imp: WasiContext.Preopen.InMemoryPreopen =>
+        imp.filetypeOf(path).getOrElse(4: Byte)
+      case _ => 4: Byte
 
   // === path_unlink_file =====================================================
 
@@ -1052,6 +1081,199 @@ object Wasi:
           case Right(_)    => Seq(I32(ESUCCESS))
           case Left(errno) => Seq(I32(errno))
       case _ => Seq(I32(EINVAL))
+
+  // === path_create_directory ================================================
+
+  /** `path_create_directory(fd: i32, path_ptr: i32, path_len: i32) -> errno`
+    *
+    * Add a directory entry at `path` (resolved against the preopen
+    * directory `fd`). Returns `ESUCCESS` on success, `EEXIST` if a
+    * file or directory already exists at that path, `ENOTCAPABLE` for
+    * a non-capability preopen, `EBADF` if `fd` isn't a preopen, or
+    * `EFAULT` on a bad path pointer.
+    *
+    * The flat-path model means a created directory has no "children"
+    * yet — entries created at unrelated paths don't automatically nest
+    * inside it. `fd_readdir` lists every entry in the preopen
+    * regardless. */
+  private def pathCreateDirectory(memory: Memory, args: Seq[Value],
+                                  ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(pathPtr), I32(pathLen)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathLen < 0 ||
+           pathPtr.toLong + pathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        val pathBytes = new Array[Byte](pathLen)
+        System.arraycopy(data, pathPtr, pathBytes, 0, pathLen)
+        val path = new String(pathBytes, "UTF-8")
+        ctx.preopens(idx).mkdir(path) match
+          case Right(_)    => Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  // === fd_readdir ===========================================================
+
+  /** Size of a serialised wasi `__wasi_dirent_t` header (everything
+    * except the name bytes that follow). Layout:
+    *
+    *   off  0 : u64 d_next   (cookie of NEXT entry)
+    *   off  8 : u64 d_ino    (inode — index in our flat model)
+    *   off 16 : u32 d_namlen (length of the name bytes that follow)
+    *   off 20 : u8  d_type   (filetype)
+    *   off 21 : padding (3 bytes; matches uvwasi's 24-byte header)
+    *
+    * Followed immediately by `d_namlen` UTF-8 bytes of the entry name
+    * (NOT NUL-terminated). The next dirent header starts at
+    * `header + namlen`. uvwasi+wasmtime both use this layout. */
+  private final val DIRENT_HEADER_SIZE: Int = 24
+
+  /** `fd_readdir(fd: i32, buf: i32, buf_len: i32, cookie: i64,
+    *             bufused_out: i32) -> errno`
+    *
+    * Stream directory entries into `buf` up to `buf_len` bytes. Each
+    * entry is a 24-byte header followed by `d_namlen` bytes of name.
+    * `cookie` is a u64 stream position: 0 starts at the first entry;
+    * a non-zero cookie picks up at the entry whose `d_next` was that
+    * value. The host writes the total bytes consumed at `bufused_out`.
+    *
+    * When the buffer fills mid-entry, the host writes as much of the
+    * header+name as fits and stops; userspace re-invokes with the
+    * cookie of the last fully-written entry. When the stream is
+    * exhausted, `bufused < buf_len` signals end-of-stream — userspace
+    * keeps calling with the highest cookie it saw until the host
+    * returns a partial buffer.
+    *
+    * fd dispatch:
+    *   - `fd 0/1/2` (stdio) → ENOTDIR
+    *   - `fd 3 .. 3+N-1` (preopens) → list entries via preopen.readdir
+    *   - `fd ≥ 3+N` (opened files) → ENOTDIR (no dir-fds in FdTable
+    *     beyond preopens at this slice)
+    *   - else → EBADF
+    *
+    * Errno discipline: EFAULT if `buf+buf_len` or `bufused_out+4` fall
+    * outside live memory; ENOTDIR for a non-directory fd; EBADF for an
+    * unknown fd. */
+  private def fdReaddir(memory: Memory, args: Seq[Value],
+                        ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(bufPtr), I32(bufLen), I64(cookie), I32(bufusedPtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+        if bufPtr     < 0 || bufLen < 0 ||
+           bufPtr.toLong + bufLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        if bufusedPtr < 0 || bufusedPtr.toLong + 4L > dataLen then
+          return Seq(I32(EFAULT))
+
+        // fd dispatch.
+        if fd < 0 then return Seq(I32(EBADF))
+        if fd <= 2 then return Seq(I32(ENOTDIR))
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          // Past the preopen range — FdTable opened-file fds are not
+          // directories (only preopen-dirs are listable in this slice).
+          if fdTable.lookup(fd).isDefined then return Seq(I32(ENOTDIR))
+          else return Seq(I32(EBADF))
+
+        // Collect the entry list. cookie==0 starts at the first entry;
+        // cookie==k starts at the (k+1)th entry (the entry whose d_next
+        // is k+1 was the last one fully written by the previous call).
+        // We use index-as-cookie for simplicity; entries are 1-indexed
+        // in the cookie space to leave 0 reserved for "start".
+        val entries = ctx.preopens(idx).readdir
+        var written = 0
+        var i       = cookie.toInt
+        var stopped = false
+        while !stopped && i < entries.length do
+          val (name, ft, ino) = entries(i)
+          val nameBytes = name.getBytes("UTF-8")
+          val namlen    = nameBytes.length
+          val totalSize = DIRENT_HEADER_SIZE + namlen
+          val remaining = bufLen - written
+          if remaining <= 0 then
+            stopped = true
+          else
+            // Even when the entry doesn't fully fit, we still write what
+            // we can — userspace observes `bufused < bufLen` and knows
+            // to allocate a larger buffer.
+            val dirNext: Long = (i + 1).toLong   // cookie of NEXT entry
+            // Header — up to 24 bytes of it.
+            val headerEnd = math.min(DIRENT_HEADER_SIZE, remaining)
+            writeDirentHeader(data, bufPtr + written, dirNext, ino, namlen, ft)
+            // Zero out anything we don't naturally write (padding bytes
+            // 21..23). writeDirentHeader handles that itself.
+            // Decide how many of the 24 header bytes "land" in the
+            // user buffer.
+            val headerInBuf = math.min(DIRENT_HEADER_SIZE, remaining)
+            // Name bytes.
+            val nameRemaining = remaining - headerInBuf
+            val nameLanding   = math.min(namlen, nameRemaining)
+            if nameLanding > 0 then
+              System.arraycopy(nameBytes, 0,
+                               data, bufPtr + written + DIRENT_HEADER_SIZE,
+                               nameLanding)
+            // Advance the write cursor by what we attempted (header +
+            // name's full length), not what landed — userspace uses
+            // bufused vs bufLen to detect the truncation.
+            written += totalSize
+            if written >= bufLen then stopped = true
+          i += 1
+
+        // Cap at bufLen — if we wrote past it (last entry truncated),
+        // bufused is bufLen.
+        val bufused = math.min(written, bufLen)
+        writeI32LE(data, bufusedPtr, bufused)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** Write up to 24 bytes of a dirent header at `data[offset]`. Bytes
+    * past `data.length` are dropped — the caller has already bounds-
+    * checked the dirent's expected start byte against `bufLen`; this
+    * helper only ever truncates against the physical array end as a
+    * belt-and-suspenders guard. The 3 padding bytes after `d_type`
+    * stay zero (the buf array is fresh). */
+  private def writeDirentHeader(data:    Array[Byte],
+                                offset:  Int,
+                                dNext:   Long,
+                                dIno:    Long,
+                                dNamlen: Int,
+                                dType:   Byte): Unit =
+    val dataLen = data.length
+    if offset < dataLen then
+      val end = math.min(offset + DIRENT_HEADER_SIZE, dataLen)
+      val buf = new Array[Byte](DIRENT_HEADER_SIZE)
+      // d_next @ 0..7
+      buf(0) = (dNext         & 0xff).toByte
+      buf(1) = ((dNext >>>  8)& 0xff).toByte
+      buf(2) = ((dNext >>> 16)& 0xff).toByte
+      buf(3) = ((dNext >>> 24)& 0xff).toByte
+      buf(4) = ((dNext >>> 32)& 0xff).toByte
+      buf(5) = ((dNext >>> 40)& 0xff).toByte
+      buf(6) = ((dNext >>> 48)& 0xff).toByte
+      buf(7) = ((dNext >>> 56)& 0xff).toByte
+      // d_ino @ 8..15
+      buf(8)  = (dIno         & 0xff).toByte
+      buf(9)  = ((dIno >>>  8)& 0xff).toByte
+      buf(10) = ((dIno >>> 16)& 0xff).toByte
+      buf(11) = ((dIno >>> 24)& 0xff).toByte
+      buf(12) = ((dIno >>> 32)& 0xff).toByte
+      buf(13) = ((dIno >>> 40)& 0xff).toByte
+      buf(14) = ((dIno >>> 48)& 0xff).toByte
+      buf(15) = ((dIno >>> 56)& 0xff).toByte
+      // d_namlen @ 16..19
+      buf(16) = (dNamlen          & 0xff).toByte
+      buf(17) = ((dNamlen >>>  8) & 0xff).toByte
+      buf(18) = ((dNamlen >>> 16) & 0xff).toByte
+      buf(19) = ((dNamlen >>> 24) & 0xff).toByte
+      // d_type @ 20, padding @ 21..23 (already zero)
+      buf(20) = dType
+      val n = end - offset
+      System.arraycopy(buf, 0, data, offset, n)
 
   // === preopen scaffolding (Phase 7.E.1) ====================================
   //
@@ -1431,6 +1653,20 @@ object WasiContext:
     private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
       Left(Wasi.ENOTCAPABLE)
 
+    /** Create a directory entry at `path`. Called by
+      * `path_create_directory`. Returns `Right(())` on success,
+      * `Left(Wasi.EEXIST)` if anything (file or dir) already exists
+      * at that path, `Left(Wasi.ENOTCAPABLE)` for a preopen with no
+      * FS capability. */
+    private[wasi] def mkdir(path: String): Either[Int, Unit] =
+      Left(Wasi.ENOTCAPABLE)
+
+    /** Enumerate directory entries for `fd_readdir`. Each tuple is
+      * `(name, filetype byte, inode)`. Default impl returns empty
+      * (name-only preopens advertise no contents). The InMemory impl
+      * returns all entries in insertion order. */
+    private[wasi] def readdir: Seq[(String, Byte, Long)] = Seq.empty
+
   object Preopen:
     /** A name-only preopen: advertises the directory through the
       * prestat-walk surface but refuses to open anything inside it
@@ -1469,23 +1705,35 @@ object WasiContext:
     // OFLAGS bits per wasi-preview1's `oflags` (witx-defined). EXCL is
     // honoured: `CREAT | EXCL` on an existing path returns EEXIST so
     // userspace gets the spec-correct "atomic create" semantics.
-    // DIRECTORY (0x02) still flows through unhandled — that needs a
-    // directory model and lands with `fd_readdir`.
-    private val OFLAGS_CREAT: Int = 0x0001
-    private val OFLAGS_EXCL:  Int = 0x0004
-    private val OFLAGS_TRUNC: Int = 0x0008
+    // DIRECTORY (0x02) is honoured at the existence-check layer: if
+    // set, the resolved path MUST be a DirEntry — else ENOTDIR.
+    // (Opening a directory fd through path_open is still unsupported;
+    // a DirEntry open returns EISDIR. fd_readdir works on preopen-dir
+    // fds for now.)
+    private val OFLAGS_CREAT:     Int = 0x0001
+    private val OFLAGS_DIRECTORY: Int = 0x0002
+    private val OFLAGS_EXCL:      Int = 0x0004
+    private val OFLAGS_TRUNC:     Int = 0x0008
 
     /** Read/write in-memory preopen. Files seeded at construction are
       * cloned defensively; later writes mutate only this preopen's
       * backing store. Tests inspect post-state via [[bytesOf]] or
-      * [[paths]].
+      * [[paths]] (which see both files and directories).
       *
-      * Storage: each path maps to a [[FileCell]] that holds the live
-      * `var bytes` array. Open file handles ([[InMemoryFile]]) reference
-      * the same cell, so a `write` that grows the buffer is visible to
-      * the preopen's `bytesOf` immediately — and to any other handle
-      * pointing at the same path. This matches POSIX behaviour where
-      * two `open` calls on the same file share the underlying inode. */
+      * Storage: each path maps to an [[Entry]] — either a [[FileEntry]]
+      * wrapping a mutable [[FileCell]] or a [[DirEntry]] sentinel. Open
+      * file handles ([[InMemoryFile]]) reference the same FileCell, so
+      * a `write` that grows the buffer is visible to the preopen's
+      * `bytesOf` immediately — and to any other handle pointing at the
+      * same path. This matches POSIX behaviour where two `open` calls
+      * on the same file share the underlying inode.
+      *
+      * Directories are represented as sentinels (no contents). They
+      * surface through `path_filestat_get` (filetype = DIRECTORY) and
+      * `fd_readdir`, and refuse `path_open` with `EISDIR`. The
+      * flat-path model means a directory entry has no "children" —
+      * `fd_readdir` lists every entry in the preopen regardless of
+      * which directory the caller asked about. */
     final class InMemoryPreopen private[wasi] (
         val name: String,
         initial:  Map[String, Array[Byte]],
@@ -1496,62 +1744,127 @@ object WasiContext:
       // order" after a write-heavy run. Clone the initial arrays so the
       // caller's references stay independent of subsequent in-FS writes.
       private val cells = scala.collection.mutable.LinkedHashMap.from(
-        initial.toSeq.map { case (k, v) => k -> new FileCell(v.clone()) }
+        initial.toSeq.map { case (k, v) =>
+          k -> (FileEntry(new FileCell(v.clone())): Entry)
+        }
       )
 
       override def open(path:    String,
                         oflags:  Int,
                         fdflags: Int): Either[Int, Wasi.FsFile] =
-        val creat = (oflags & OFLAGS_CREAT) != 0
-        val excl  = (oflags & OFLAGS_EXCL)  != 0
-        val trunc = (oflags & OFLAGS_TRUNC) != 0
+        val creat   = (oflags & OFLAGS_CREAT)     != 0
+        val excl    = (oflags & OFLAGS_EXCL)      != 0
+        val trunc   = (oflags & OFLAGS_TRUNC)     != 0
+        val dirOnly = (oflags & OFLAGS_DIRECTORY) != 0
         cells.get(path) match
-          case Some(cell) =>
+          case Some(FileEntry(cell)) =>
+            // OFLAGS_DIRECTORY guarded against opening a regular file as
+            // a directory — POSIX-style "you asked for a dir; got a file".
+            if dirOnly then Left(Wasi.ENOTDIR)
             // EXCL atomic-create: if both CREAT and EXCL are set and the
             // file already exists, fail rather than reuse. Userspace uses
-            // this for things like lockfiles where seeing an existing file
-            // is the *signal* it's looking for.
-            if creat && excl then Left(Wasi.EEXIST)
+            // this for things like lockfiles where seeing an existing
+            // file is the *signal* it's looking for.
+            else if creat && excl then Left(Wasi.EEXIST)
             else
               if trunc then cell.bytes = new Array[Byte](0)
               Right(new InMemoryFile(cell))
+          case Some(DirEntry) =>
+            // Path resolves to a directory. Opening a directory fd
+            // through path_open isn't supported in this slice — only
+            // preopens carry the "directory fd" role today, and
+            // fd_readdir runs against those. Userspace gets EISDIR.
+            Left(Wasi.EISDIR)
           case None =>
-            if !creat then Left(Wasi.ENOENT)
+            // Missing — CREAT-or-fail. If CREAT+DIRECTORY both set,
+            // userspace is asking to create a directory through
+            // path_open; that's not what path_open is for (it'd be
+            // path_create_directory). ENOTDIR matches uvwasi behaviour.
+            if dirOnly      then Left(Wasi.ENOTDIR)
+            else if !creat  then Left(Wasi.ENOENT)
             else
               val cell = new FileCell(new Array[Byte](0))
-              cells(path) = cell
+              cells(path) = FileEntry(cell)
               Right(new InMemoryFile(cell))
 
       /** Remove `path` from this preopen. Used by `path_unlink_file`.
         * Returns `Right(())` on success, `Left(Wasi.ENOENT)` for a
-        * missing path. Any currently-open handles on the file keep their
+        * missing path, `Left(Wasi.EISDIR)` for a directory entry
+        * (the syscall name is `path_unlink_FILE`; a separate
+        * `path_remove_directory` syscall handles directories — not yet
+        * implemented). Open handles against an unlinked file keep their
         * own [[FileCell]] reference — the cell isn't freed until those
-        * handles close, matching POSIX "unlink while open" semantics
-        * (open handles continue working against the now-anonymous
-        * inode). */
+        * handles close, matching POSIX "unlink while open" semantics. */
       override private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
-        if cells.remove(path).isDefined then Right(())
-        else Left(Wasi.ENOENT)
+        cells.get(path) match
+          case Some(FileEntry(_)) =>
+            cells.remove(path)
+            Right(())
+          case Some(DirEntry) => Left(Wasi.EISDIR)
+          case None           => Left(Wasi.ENOENT)
 
       override def statPath(path: String): Either[Int, Long] =
         cells.get(path) match
-          case Some(cell) => Right(cell.bytes.length.toLong)
-          case None       => Left(Wasi.ENOENT)
+          case Some(FileEntry(cell)) => Right(cell.bytes.length.toLong)
+          case Some(DirEntry)        => Right(0L)
+          case None                  => Left(Wasi.ENOENT)
+
+      /** Filetype of `path`. Used by `path_filestat_get` (which needs
+        * filetype + size) and `fd_readdir` (which needs filetype alone).
+        * Returns one of the wasi-preview1 filetype bytes: 3=DIRECTORY,
+        * 4=REGULAR_FILE; `None` for a missing path. */
+      private[wasi] def filetypeOf(path: String): Option[Byte] =
+        cells.get(path).map {
+          case FileEntry(_) => 4: Byte
+          case DirEntry     => 3: Byte
+        }
+
+      override private[wasi] def mkdir(path: String): Either[Int, Unit] =
+        if cells.contains(path) then Left(Wasi.EEXIST)
+        else
+          cells(path) = DirEntry
+          Right(())
+
+      /** Snapshot the directory entries for `fd_readdir`. Each tuple is
+        * `(name, filetype byte, inode)`; the inode is just an index here
+        * (0..N-1) since the InMemoryFs has no real inode-allocation
+        * machinery. Insertion order. */
+      override private[wasi] def readdir: Seq[(String, Byte, Long)] =
+        cells.toSeq.zipWithIndex.map { case ((name, entry), idx) =>
+          val ft: Byte = entry match
+            case FileEntry(_) => 4: Byte
+            case DirEntry     => 3: Byte
+          (name, ft, idx.toLong)
+        }
 
       /** Current bytes for `path` after any writes the wasi program
-        * performed. `None` if no file at that key — `Some(Array.empty)`
-        * is a CREAT-flagged open that never wrote anything. */
+        * performed. `None` if no file at that key (or the key is a
+        * directory). `Some(Array.empty)` is a CREAT-flagged open that
+        * never wrote anything. */
       def bytesOf(path: String): Option[Array[Byte]] =
-        cells.get(path).map(_.bytes)
+        cells.get(path).collect { case FileEntry(cell) => cell.bytes }
 
-      /** All paths currently in this FS, in insertion order. */
+      /** All paths currently in this FS (files and directories), in
+        * insertion order. */
       def paths: Seq[String] = cells.keys.toSeq
+
+      /** Subset of [[paths]] that are directories. Useful for tests
+        * that want to confirm `path_create_directory` lands. */
+      def directoryPaths: Seq[String] =
+        cells.collect { case (k, DirEntry) => k }.toSeq
+
+    /** One entry in an [[InMemoryPreopen]]: either a file (with its
+      * mutable byte cell) or a directory (a marker — no children in
+      * the flat-path model). */
+    private[wasi] sealed trait Entry
+    private[wasi] final case class FileEntry(cell: FileCell) extends Entry
+    private[wasi] case object DirEntry extends Entry
 
     /** Mutable byte-array cell. Open handles share the cell so a
       * cursor-advancing write on one handle is observable through the
       * preopen's `bytesOf` lookup (and through any other handle pointing
       * at the same path). */
-    private final class FileCell(var bytes: Array[Byte])
+    private[wasi] final class FileCell(var bytes: Array[Byte])
 
     /** In-memory [[Wasi.FsFile]] impl for [[InMemoryPreopen]].
       * `close()` is a no-op — there's no host resource to release.

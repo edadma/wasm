@@ -1439,6 +1439,261 @@ object WasiFsTests:
         case other => check(false, s"set_flags(fd=-1): $other")
     }
 
+    // ----- path_create_directory + OFLAGS_DIRECTORY + fd_readdir ---------
+    //
+    // The directory model: each entry in an InMemoryPreopen is either a
+    // FileEntry (with a FileCell) or a DirEntry sentinel. Files surface
+    // through bytesOf; both surface through paths/filetypeOf/readdir.
+    // path_create_directory adds DirEntry; path_open on DirEntry returns
+    // EISDIR; OFLAGS_DIRECTORY on FileEntry returns ENOTDIR.
+
+    test("path_create_directory: adds a directory entry") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "subdir")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_create_directory: $other")
+      check(preopen.directoryPaths.contains("subdir"),
+            s"directoryPaths=${preopen.directoryPaths} (want subdir)")
+      check(preopen.bytesOf("subdir").isEmpty,
+            "bytesOf returns None for dir entries (they have no bytes)")
+    }
+
+    test("path_create_directory: EEXIST if path already exists (file or dir)") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("existing" -> Array.emptyByteArray))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // Existing file → EEXIST.
+      storePath(inst, 0, "existing")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 8) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_create_directory: $other")
+      // Create a dir, then try again → also EEXIST.
+      storePath(inst, 0, "newdir")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"first mkdir errno=$e")
+        case other => check(false, s"call_path_create_directory: $other")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"second mkdir errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_create_directory(2): $other")
+    }
+
+    test("path_create_directory: ENOTCAPABLE on named preopen + EBADF on bad fd") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      storePath(inst, 0, "x")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_create_directory: $other")
+      callPathCreateDirectory(inst, fd = 99, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_path_create_directory(99): $other")
+    }
+
+    test("path_open: DirEntry refused with EISDIR (no opening dirs through path_open)") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "subdir")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"mkdir: $e")
+        case other              => check(false, s"call_path_create_directory: $other")
+      // Open subdir as a file — refused.
+      callPathOpen(inst, dirfd = 3, pathPtr = 0, pathLen = 6,
+                   openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EISDIR, s"errno=$e (want EISDIR)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: OFLAGS_DIRECTORY on regular file returns ENOTDIR") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // OFLAGS_DIRECTORY = 0x02.
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                        oflags = 0x0002, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTDIR, s"errno=$e (want ENOTDIR)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_open: OFLAGS_DIRECTORY|CREAT on missing path returns ENOTDIR") {
+      // path_open can't create directories — that's path_create_directory's
+      // job. CREAT+DIRECTORY is a misuse; we return ENOTDIR (matches uvwasi).
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "newdir")
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 6,
+                        oflags = 0x0003, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTDIR, s"errno=$e (want ENOTDIR)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    test("path_filestat_get: DirEntry reports DIRECTORY filetype") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "d")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"mkdir: $e")
+        case other              => check(false, s"mkdir: $other")
+      callPathFilestatGet(inst, fd = 3, lookupflags = 0,
+                          pathPtr = 0, pathLen = 1, buf = 512) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"stat: $e")
+        case other              => check(false, s"path_filestat_get: $other")
+      check(loadByte(inst, 512 + 16) == 3,
+            s"filetype=${loadByte(inst, 512 + 16)} (want DIRECTORY=3)")
+      check(peekI64(inst, 512 + 32) == 0L,
+            s"dir size=${peekI64(inst, 512 + 32)} (want 0)")
+    }
+
+    test("path_unlink_file: DirEntry returns EISDIR (not ENOENT, not success)") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "d")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"mkdir: $e")
+        case other              => check(false, s"mkdir: $other")
+      callPathUnlinkFile(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EISDIR, s"errno=$e (want EISDIR)")
+        case other => check(false, s"call_path_unlink_file: $other")
+      // Directory still there.
+      check(preopen.directoryPaths.contains("d"),
+            "directory survives path_unlink_file attempt")
+    }
+
+    // ----- fd_readdir -----------------------------------------------------
+
+    test("fd_readdir: empty preopen writes a zero-byte buffer") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.inMemory("/s")))
+      callFdReaddir(inst, fd = 3, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_readdir: $other")
+      check(peekI32(inst, 320) == 0, s"bufused=${peekI32(inst, 320)} (want 0)")
+    }
+
+    test("fd_readdir: lists files in insertion order") {
+      val initial = scala.collection.immutable.ListMap(
+        "alpha"   -> "A".getBytes("UTF-8"),
+        "beta"    -> "BB".getBytes("UTF-8"),
+        "gamma"   -> "CCC".getBytes("UTF-8"),
+      )
+      val preopen = Preopen.inMemory("/s", initial)
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      callFdReaddir(inst, fd = 3, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other => check(false, s"call_fd_readdir: $other")
+      val parsed = parseDirents(inst, 1024, peekI32(inst, 320))
+      check(parsed.map(_._1) == Seq("alpha", "beta", "gamma"),
+            s"names=${parsed.map(_._1)}")
+      check(parsed.forall(_._2 == 4),
+            s"all entries REGULAR_FILE: ${parsed.map(_._2)}")
+      // d_next on each entry is index+1; userspace passes the last
+      // d_next back to resume.
+      check(parsed.map(_._3) == Seq(1L, 2L, 3L),
+            s"d_next values=${parsed.map(_._3)}")
+    }
+
+    test("fd_readdir: directory entries report DIRECTORY filetype") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("file" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "subdir")
+      callPathCreateDirectory(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"mkdir: $e")
+        case other              => check(false, s"mkdir: $other")
+      callFdReaddir(inst, fd = 3, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"readdir: $e")
+        case other              => check(false, s"readdir: $other")
+      val parsed = parseDirents(inst, 1024, peekI32(inst, 320))
+      check(parsed.length == 2, s"entry count=${parsed.length}")
+      val byName = parsed.map(e => e._1 -> e._2).toMap
+      check(byName.get("file")   == Some(4), s"file filetype=${byName.get("file")}")
+      check(byName.get("subdir") == Some(3), s"subdir filetype=${byName.get("subdir")}")
+    }
+
+    test("fd_readdir: cookie pagination resumes mid-stream") {
+      val initial = scala.collection.immutable.ListMap(
+        "a" -> "1".getBytes("UTF-8"),
+        "b" -> "2".getBytes("UTF-8"),
+        "c" -> "3".getBytes("UTF-8"),
+      )
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.inMemory("/s", initial)))
+      // Pass cookie=2 — should start from the THIRD entry (index 2).
+      callFdReaddir(inst, fd = 3, buf = 1024, bufLen = 4096,
+                    cookie = 2L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"readdir: $other")
+      val parsed = parseDirents(inst, 1024, peekI32(inst, 320))
+      check(parsed.map(_._1) == Seq("c"),
+            s"names after cookie=2: ${parsed.map(_._1)}")
+    }
+
+    test("fd_readdir: ENOTDIR on stdio + opened-file fd; EBADF on unknown") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes("UTF-8")), "f")
+      // Stdio (fd 1) — not a directory.
+      callFdReaddir(inst, fd = 1, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTDIR, s"stdio errno=$e (want ENOTDIR)")
+        case other => check(false, s"readdir(fd=1): $other")
+      // Opened-file fd (fd 4) — not a directory.
+      callFdReaddir(inst, fd = 4, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTDIR, s"file errno=$e (want ENOTDIR)")
+        case other => check(false, s"readdir(fd=4): $other")
+      // Past everything → EBADF.
+      callFdReaddir(inst, fd = 99, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"unknown errno=$e (want EBADF)")
+        case other => check(false, s"readdir(fd=99): $other")
+      callFdReaddir(inst, fd = -1, buf = 1024, bufLen = 4096,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"negative errno=$e (want EBADF)")
+        case other => check(false, s"readdir(fd=-1): $other")
+    }
+
+    test("fd_readdir: EFAULT when buf+buf_len falls outside memory") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("a" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // 1 page = 65536; buf=65500 + 1000 = 66500 > 65536.
+      callFdReaddir(inst, fd = 3, buf = 65500, bufLen = 1000,
+                    cookie = 0L, bufusedOut = 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"readdir: $other")
+    }
+
     test("path_unlink_file: open handle survives unlink (POSIX inode semantics)") {
       // Open a file, unlink it, then read from the still-open handle.
       // The handle keeps its own FileCell reference, so the bytes are
@@ -1676,6 +1931,53 @@ object WasiFsTests:
                                  pathLen: Int) =
     inst.invoke("call_path_unlink_file",
                 Seq(I32(fd), I32(pathPtr), I32(pathLen)))
+
+  /** 3-arg `path_create_directory` wrapper. Add a directory entry at
+    * `pathPtr` resolved against the preopen at `fd`. */
+  private def callPathCreateDirectory(inst:    ModuleInstance,
+                                      fd:      Int,
+                                      pathPtr: Int,
+                                      pathLen: Int) =
+    inst.invoke("call_path_create_directory",
+                Seq(I32(fd), I32(pathPtr), I32(pathLen)))
+
+  /** 5-arg `fd_readdir` wrapper. Stream dirent records into `buf` up to
+    * `bufLen` bytes; cookie=0 starts from the first entry; bufused is
+    * written at `bufusedOut`. */
+  private def callFdReaddir(inst:       ModuleInstance,
+                            fd:         Int,
+                            buf:        Int,
+                            bufLen:     Int,
+                            cookie:     Long,
+                            bufusedOut: Int) =
+    inst.invoke("call_fd_readdir",
+                Seq(I32(fd), I32(buf), I32(bufLen),
+                    I64(cookie), I32(bufusedOut)))
+
+  /** Decode a fd_readdir buffer into `(name, filetype, d_next)` tuples.
+    * Walks the 24-byte dirent headers + name bytes that the shim wrote.
+    * Stops at `bufused` so a truncated final entry is ignored. */
+  private def parseDirents(inst:    ModuleInstance,
+                           bufAddr: Int,
+                           bufused: Int): Seq[(String, Int, Long)] =
+    val out = scala.collection.mutable.ArrayBuffer.empty[(String, Int, Long)]
+    var pos = 0
+    while pos + 24 <= bufused do
+      // d_next u64 @ 0; we only need the low 32 bits for the index-as-cookie
+      // model the shim uses, but read the full 64-bit field so a future
+      // expansion doesn't surprise us.
+      val dNextLo  = peekI32(inst, bufAddr + pos + 0).toLong & 0xffffffffL
+      val dNextHi  = peekI32(inst, bufAddr + pos + 4).toLong & 0xffffffffL
+      val dNext    = dNextLo | (dNextHi << 32)
+      val dNamlen  = peekI32(inst, bufAddr + pos + 16)
+      val dType    = loadByte(inst, bufAddr + pos + 20)
+      if pos + 24 + dNamlen > bufused then
+        // Truncated name — stop.
+        return out.toSeq
+      val nameBytes = readBytes(inst, bufAddr + pos + 24, dNamlen)
+      out += ((new String(nameBytes, "UTF-8"), dType, dNext))
+      pos += 24 + dNamlen
+    out.toSeq
 
   /** Open a single-preopen InMemoryFs, store the path bytes at addr 0,
     * open the file via `call_path_open`, and assert the returned fd is
