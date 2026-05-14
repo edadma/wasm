@@ -1180,6 +1180,149 @@ object WasiFsTests:
         case other => check(false, s"call_fd_datasync(-1): $other")
     }
 
+    // ----- OFLAGS_EXCL in path_open (hardening pass) ----------------------
+    //
+    // EXCL gives userspace atomic-create semantics: `CREAT | EXCL` on an
+    // existing path fails with EEXIST. Used for things like lockfiles
+    // where the existence-check IS the signal. Without EXCL, CREAT on an
+    // existing file is a benign no-op (the previous slice's behaviour).
+
+    test("path_open: OFLAGS_CREAT|EXCL on existing file returns EEXIST") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // CREAT = 0x01, EXCL = 0x04 → combined = 0x05.
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                        oflags = 0x0005, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_open: $other")
+      // The pre-existing file is untouched (no TRUNC) — assert the bytes
+      // are still there.
+      check(preopen.bytesOf("f").exists(_.sameElements("x".getBytes("UTF-8"))),
+            "file contents unchanged after EXCL-rejected open")
+    }
+
+    test("path_open: OFLAGS_CREAT|EXCL on missing path succeeds (atomic create)") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "new.txt")
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 7,
+                        oflags = 0x0005, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_open: $other")
+      // File was created (size 0).
+      check(preopen.bytesOf("new.txt").exists(_.isEmpty),
+            "new file created at size 0 via CREAT|EXCL")
+    }
+
+    test("path_open: OFLAGS_EXCL without CREAT is a no-op (existing file opens normally)") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // EXCL only (0x04) — POSIX says EXCL is meaningful only with CREAT;
+      // bare EXCL on an existing file just opens it.
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                        oflags = 0x0004, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_open: $other")
+    }
+
+    // ----- path_unlink_file (hardening pass) ------------------------------
+
+    test("path_unlink_file: removes existing file from preopen") {
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      callPathUnlinkFile(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_unlink_file: $other")
+      check(preopen.bytesOf("f").isEmpty, "file removed from preopen.bytesOf")
+      check(!preopen.paths.contains("f"), "file removed from preopen.paths")
+    }
+
+    test("path_unlink_file: missing path returns ENOENT") {
+      val preopen = Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "absent")
+      callPathUnlinkFile(inst, fd = 3, pathPtr = 0, pathLen = 6) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_unlink_file: $other")
+    }
+
+    test("path_unlink_file: ENOTCAPABLE on named preopen") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(Preopen.named("/s")))
+      storePath(inst, 0, "x")
+      callPathUnlinkFile(inst, fd = 3, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_unlink_file: $other")
+    }
+
+    test("path_unlink_file: EBADF on non-preopen fd") {
+      val (inst, _) = openSingleFile(Map("f" -> Array.emptyByteArray), "f")
+      // fd 4 is an opened-file fd, not a preopen-dir.
+      storePath(inst, 0, "f")
+      callPathUnlinkFile(inst, fd = 4, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_path_unlink_file: $other")
+      callPathUnlinkFile(inst, fd = 1, pathPtr = 0, pathLen = 1) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF)")
+        case other => check(false, s"call_path_unlink_file(fd=1): $other")
+    }
+
+    test("path_unlink_file: open handle survives unlink (POSIX inode semantics)") {
+      // Open a file, unlink it, then read from the still-open handle.
+      // The handle keeps its own FileCell reference, so the bytes are
+      // still readable through the fd even though `bytesOf` no longer
+      // sees them. Matches POSIX `unlink(2)` against an open fd.
+      val initial = Map("doomed.txt" -> "stay-readable".getBytes("UTF-8"))
+      val preopen = Preopen.inMemory("/s", initial)
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // Open first.
+      storePath(inst, 0, "doomed.txt")
+      callPathOpen(inst, dirfd = 3, pathPtr = 0, pathLen = 10,
+                   openedFdOut = 64) match
+        case Right(Seq(I32(e))) if e == Wasi.ESUCCESS => ()
+        case other => check(false, s"open: $other")
+      val fd = peekI32(inst, 64)
+      // Unlink.
+      callPathUnlinkFile(inst, fd = 3, pathPtr = 0, pathLen = 10) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"unlink errno=$e")
+        case other => check(false, s"call_path_unlink_file: $other")
+      check(preopen.bytesOf("doomed.txt").isEmpty,
+            "preopen.bytesOf no longer sees the unlinked path")
+      // Read through the still-open fd — POSIX inode semantics keep
+      // the bytes alive.
+      storeI32(inst, 256, 768)    // iov.buf
+      storeI32(inst, 260, 32)     // iov.len
+      callFdRead(inst, fd = fd, iovs = 256, iovsLen = 1, nreadOut = 320) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"fd_read: $e")
+        case other              => check(false, s"call_fd_read: $other")
+      val n = peekI32(inst, 320)
+      check(n == 13, s"nread=$n (want 13 — 'stay-readable')")
+      val bytes = readBytes(inst, 768, n)
+      check(new String(bytes, "UTF-8") == "stay-readable",
+            s"bytes=${new String(bytes, "UTF-8")}")
+    }
+
   // ----- helpers ----------------------------------------------------------
 
   /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
@@ -1354,6 +1497,16 @@ object WasiFsTests:
     inst.invoke("call_path_filestat_get",
                 Seq(I32(fd), I32(lookupflags), I32(pathPtr),
                     I32(pathLen), I32(buf)))
+
+  /** 3-arg `path_unlink_file` wrapper. Remove the file at `pathPtr`
+    * (resolved against the preopen at `fd`). No `lookupflags` in
+    * wasi-preview1 (always lstat-style — never follows symlinks). */
+  private def callPathUnlinkFile(inst:    ModuleInstance,
+                                 fd:      Int,
+                                 pathPtr: Int,
+                                 pathLen: Int) =
+    inst.invoke("call_path_unlink_file",
+                Seq(I32(fd), I32(pathPtr), I32(pathLen)))
 
   /** Open a single-preopen InMemoryFs, store the path bytes at addr 0,
     * open the file via `call_path_open`, and assert the returned fd is

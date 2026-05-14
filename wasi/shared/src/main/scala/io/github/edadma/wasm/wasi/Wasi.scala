@@ -79,6 +79,10 @@ object Wasi:
     * but documented here so future host-backed write impls have a
     * consistent errno to surface. */
   val ENOSPC:       Int = 51
+  /** File exists — `path_open` with `OFLAGS_CREAT | OFLAGS_EXCL` was
+    * asked to create a file that already exists. EXCL is the way
+    * userspace asks for "atomic create" semantics. */
+  val EEXIST:       Int = 20
   /** Capability insufficient — the preopen advertises its name but has no
     * FS capability behind it ([[WasiContext.Preopen.named]]). A program
     * asking to `path_open` through it gets this errno rather than
@@ -287,6 +291,7 @@ object Wasi:
         "fd_prestat_dir_name" -> ((mem, args) => prestatDirName(mem, args, ctx)),
         "path_open"           -> ((mem, args) => pathOpen(mem, args, ctx, fdTable)),
         "path_filestat_get"   -> ((mem, args) => pathFilestatGet(mem, args, ctx)),
+        "path_unlink_file"    -> ((mem, args) => pathUnlinkFile(mem, args, ctx)),
         "fd_sync"             -> ((_,   args) => fdSync(args, ctx, fdTable)),
         "fd_datasync"         -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
       )
@@ -954,6 +959,45 @@ object Wasi:
             Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
+  // === path_unlink_file =====================================================
+
+  /** `path_unlink_file(fd: i32, path_ptr: i32, path_len: i32) -> errno`
+    *
+    * Remove the regular file at `path` (resolved against the preopen
+    * directory `fd`). Returns `ESUCCESS` on success, `ENOENT` if the
+    * path doesn't exist, `ENOTCAPABLE` for a `Preopen.named` (no FS
+    * backing), `EBADF` if `fd` isn't a preopen-dir, or `EFAULT` if the
+    * path bytes fall outside live memory.
+    *
+    * No `lookupflags` arg in wasi-preview1 (the syscall is always
+    * lstat-style — symlinks are removed, not followed). The InMemoryFs
+    * doesn't model symlinks anyway, so the distinction is moot.
+    *
+    * Any open file handles against the unlinked path keep their own
+    * [[WasiContext.Preopen.InMemoryPreopen.FileCell]] reference — the
+    * cell is only fully dropped when both the map entry is gone AND
+    * all handles closed. This matches POSIX `unlink(2)` semantics
+    * where open fds keep working against the now-anonymous inode. */
+  private def pathUnlinkFile(memory: Memory, args: Seq[Value],
+                             ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(pathPtr), I32(pathLen)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathLen < 0 ||
+           pathPtr.toLong + pathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        val pathBytes = new Array[Byte](pathLen)
+        System.arraycopy(data, pathPtr, pathBytes, 0, pathLen)
+        val path = new String(pathBytes, "UTF-8")
+        ctx.preopens(idx).unlinkPath(path) match
+          case Right(_)    => Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
   // === preopen scaffolding (Phase 7.E.1) ====================================
   //
   // wasi-libc walks fd 3 upward at startup, asking `fd_prestat_get` for
@@ -1284,6 +1328,18 @@ object WasiContext:
     def statPath(path: String): Either[Int, Long] =
       Left(Wasi.ENOTCAPABLE)
 
+    /** Remove `path` from this preopen. Called by `path_unlink_file`.
+      * Returns `Right(())` on success, `Left(Wasi.ENOENT)` for a
+      * missing path, `Left(Wasi.ENOTCAPABLE)` for a preopen with no
+      * FS capability.
+      *
+      * Default impl returns `Left(Wasi.ENOTCAPABLE)`. The InMemory
+      * impl overrides to actually drop the path from its backing
+      * map; any already-open handles keep their own cell reference
+      * (POSIX unlink-while-open). */
+    private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
+      Left(Wasi.ENOTCAPABLE)
+
   object Preopen:
     /** A name-only preopen: advertises the directory through the
       * prestat-walk surface but refuses to open anything inside it
@@ -1319,12 +1375,13 @@ object WasiContext:
                  files: Map[String, Array[Byte]] = Map.empty): InMemoryPreopen =
       new InMemoryPreopen(n, files)
 
-    // OFLAGS bits per wasi-preview1's `oflags` (witx-defined). Only the
-    // two `path_open`'s in-memory FS acts on are named here; the
-    // remaining bits (DIRECTORY=2, EXCL=4) flow through unhandled at
-    // this slice, with the InMemoryFs ignoring them. Hardening pass
-    // can enforce.
+    // OFLAGS bits per wasi-preview1's `oflags` (witx-defined). EXCL is
+    // honoured: `CREAT | EXCL` on an existing path returns EEXIST so
+    // userspace gets the spec-correct "atomic create" semantics.
+    // DIRECTORY (0x02) still flows through unhandled — that needs a
+    // directory model and lands with `fd_readdir`.
     private val OFLAGS_CREAT: Int = 0x0001
+    private val OFLAGS_EXCL:  Int = 0x0004
     private val OFLAGS_TRUNC: Int = 0x0008
 
     /** Read/write in-memory preopen. Files seeded at construction are
@@ -1355,17 +1412,35 @@ object WasiContext:
                         oflags:  Int,
                         fdflags: Int): Either[Int, Wasi.FsFile] =
         val creat = (oflags & OFLAGS_CREAT) != 0
+        val excl  = (oflags & OFLAGS_EXCL)  != 0
         val trunc = (oflags & OFLAGS_TRUNC) != 0
         cells.get(path) match
           case Some(cell) =>
-            if trunc then cell.bytes = new Array[Byte](0)
-            Right(new InMemoryFile(cell))
+            // EXCL atomic-create: if both CREAT and EXCL are set and the
+            // file already exists, fail rather than reuse. Userspace uses
+            // this for things like lockfiles where seeing an existing file
+            // is the *signal* it's looking for.
+            if creat && excl then Left(Wasi.EEXIST)
+            else
+              if trunc then cell.bytes = new Array[Byte](0)
+              Right(new InMemoryFile(cell))
           case None =>
             if !creat then Left(Wasi.ENOENT)
             else
               val cell = new FileCell(new Array[Byte](0))
               cells(path) = cell
               Right(new InMemoryFile(cell))
+
+      /** Remove `path` from this preopen. Used by `path_unlink_file`.
+        * Returns `Right(())` on success, `Left(Wasi.ENOENT)` for a
+        * missing path. Any currently-open handles on the file keep their
+        * own [[FileCell]] reference — the cell isn't freed until those
+        * handles close, matching POSIX "unlink while open" semantics
+        * (open handles continue working against the now-anonymous
+        * inode). */
+      override private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
+        if cells.remove(path).isDefined then Right(())
+        else Left(Wasi.ENOENT)
 
       override def statPath(path: String): Either[Int, Long] =
         cells.get(path) match
