@@ -2,7 +2,7 @@
 title: wasm
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: WebAssembly Core MVP plus sign-extension, bulk-memory subset, and non-trapping float-to-int — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: WebAssembly Core MVP plus sign-extension, full bulk-memory, and non-trapping float-to-int — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
@@ -23,7 +23,7 @@ Runtime.instantiate(bytes, Seq(EnvModule.default, Wasi.preview1(ctx))) match
   case Left(err)   => System.err.println(err)
 ```
 
-Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `println!`, a `std::fs::read_to_string`, and a `std::fs::write` — so "runs real rust binaries" isn't an aspiration, it's covered by the test suite.
+Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `println!`, a `std::fs::read_to_string`, and a `std::fs::write` — so "runs real rust binaries" isn't an aspiration, it's covered by the test suite. The full [sysl](https://github.com/edadma/trisc) standard-library test suite (973 cases) also runs end-to-end on this interpreter as sysl's `wasm32-WASI` backend — large mixed workload, zero divergence from the reference run on wasmtime.
 
 ## Why this one?
 
@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**421 tests** on the JVM (255 interpreter + 157 WASI + 9 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
+**441 tests** on the JVM (275 interpreter + 157 WASI + 9 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
 
 ## Try it
 

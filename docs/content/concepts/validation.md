@@ -44,9 +44,10 @@ The byte offset is from the start of the function body, not the whole module, so
 | Global   | 6  | Module-level globals (mutable and immutable) |
 | Export   | 7  | Names exposed to the host |
 | Start    | 8  | A function index to run at instantiate time, before any export call |
-| Element  | 9  | Funcref table initializers |
+| Element  | 9  | Funcref table initializers (active, passive, and declarative kinds) |
 | Code     | 10 | Function bodies |
-| Data     | 11 | Linear-memory initializers |
+| Data     | 11 | Linear-memory initializers (active and passive kinds) |
+| DataCount | 12 | A `u32` = the number of data segments. Required when a function uses `memory.init` or `data.drop`. The validator cross-checks this against section 11; a mismatch is `InvalidModule`, and a function that references a `dataidx` without section 12 present is also `InvalidModule`. |
 
 Custom sections are skipped harmlessly. The `name` custom section is not yet used (functions appear as `function <N>` in error messages, not by their debug name).
 
