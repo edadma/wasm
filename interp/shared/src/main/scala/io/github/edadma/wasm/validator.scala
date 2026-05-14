@@ -97,15 +97,18 @@ object Validator:
           throw new ValFail(WasmError.InvalidModule(
             s"function $funcIdx: type index $typeIdx out of range"))
         validateFunction(
-          funcIdx     = funcIdx,
-          sig         = module.types(typeIdx),
-          declared    = module.codes(i).locals,
-          body        = module.codes(i).body,
-          funcSigs    = funcSigs,
-          globalSigs  = globalSigs,
-          types       = module.types,
-          tableCount  = module.tables.length,
-          memoryCount = module.memories.length,
+          funcIdx          = funcIdx,
+          sig              = module.types(typeIdx),
+          declared         = module.codes(i).locals,
+          body             = module.codes(i).body,
+          funcSigs         = funcSigs,
+          globalSigs       = globalSigs,
+          types            = module.types,
+          tableCount       = module.tables.length,
+          memoryCount      = module.memories.length,
+          dataSegmentCount = module.data.length,
+          elemSegmentCount = module.elements.length,
+          dataCountPresent = module.dataCount.isDefined,
         )
         i += 1
       Right(())
@@ -142,26 +145,32 @@ object Validator:
     * outer body-end (0x0B) pops that frame, ensuring the function's
     * results are on the stack at exit. */
   private def validateFunction(
-      funcIdx:    Int,
-      sig:        FuncType,
-      declared:   Vector[ValueType],
-      body:       Array[Byte],
-      funcSigs:   Vector[FuncType],
-      globalSigs: Vector[(ValueType, Boolean)],
-      types:      Vector[FuncType],
-      tableCount: Int,
-      memoryCount: Int,
+      funcIdx:          Int,
+      sig:              FuncType,
+      declared:         Vector[ValueType],
+      body:             Array[Byte],
+      funcSigs:         Vector[FuncType],
+      globalSigs:       Vector[(ValueType, Boolean)],
+      types:            Vector[FuncType],
+      tableCount:       Int,
+      memoryCount:      Int,
+      dataSegmentCount: Int,
+      elemSegmentCount: Int,
+      dataCountPresent: Boolean,
   ): Unit =
     val state = new State(
-      funcIdx     = funcIdx,
-      funcResults = sig.results,
-      locals      = sig.params ++ declared,
-      funcSigs    = funcSigs,
-      globalSigs  = globalSigs,
-      types       = types,
-      tableCount  = tableCount,
-      memoryCount = memoryCount,
-      body        = body,
+      funcIdx          = funcIdx,
+      funcResults      = sig.results,
+      locals           = sig.params ++ declared,
+      funcSigs         = funcSigs,
+      globalSigs       = globalSigs,
+      types            = types,
+      tableCount       = tableCount,
+      memoryCount      = memoryCount,
+      dataSegmentCount = dataSegmentCount,
+      elemSegmentCount = elemSegmentCount,
+      dataCountPresent = dataCountPresent,
+      body             = body,
     )
     state.pushCtrl(CtrlKind.Function, Vector.empty, sig.results)
     state.walk()
@@ -180,6 +189,17 @@ object Validator:
       val types:       Vector[FuncType],
       val tableCount:  Int,
       val memoryCount: Int,
+      // Phase 8.B context for bulk-memory + table ops:
+      //   dataSegmentCount — `memory.init` / `data.drop` need their
+      //     dataidx immediate validated against this.
+      //   elemSegmentCount — `table.init` / `elem.drop` need their
+      //     elemidx immediate validated against this.
+      //   dataCountPresent — `memory.init` and `data.drop` are only
+      //     valid in a module that declared a DataCount section
+      //     (Section 12) per the bulk-memory spec.
+      val dataSegmentCount: Int,
+      val elemSegmentCount: Int,
+      val dataCountPresent: Boolean,
       val body:        Array[Byte],
   ):
     val operandStack: ArrayBuffer[AbsValue]  = ArrayBuffer.empty
@@ -610,6 +630,28 @@ object Validator:
           case 5 => unop(ValueType.F32Type, ValueType.I64Type)                  // i64.trunc_sat_f32_u
           case 6 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_s
           case 7 => unop(ValueType.F64Type, ValueType.I64Type)                  // i64.trunc_sat_f64_u
+          case 8 =>                                                             // memory.init dataidx, memidx-reserved-byte
+            requireMemory("memory.init")
+            if !dataCountPresent then
+              fail("memory.init requires a Data Count section (Section 12)")
+            val dataIdx = readU32()
+            if dataIdx < 0 || dataIdx >= dataSegmentCount then
+              fail(s"memory.init: data index $dataIdx out of range (have $dataSegmentCount segments)")
+            if pc + 1 > body.length then
+              fail("truncated memory.init reserved memidx byte")
+            val mem = body(pc) & 0xff
+            if mem != 0 then
+              fail(s"memory.init: non-zero reserved memidx byte 0x${mem.toHexString}")
+            pc += 1
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.I32Type)                                           // src (offset into data segment)
+            popVal(ValueType.I32Type)                                           // dst (offset into memory)
+          case 9 =>                                                             // data.drop dataidx
+            if !dataCountPresent then
+              fail("data.drop requires a Data Count section (Section 12)")
+            val dataIdx = readU32()
+            if dataIdx < 0 || dataIdx >= dataSegmentCount then
+              fail(s"data.drop: data index $dataIdx out of range (have $dataSegmentCount segments)")
           case 10 =>                                                            // memory.copy
             requireMemory("memory.copy")
             if pc + 2 > body.length then
@@ -632,6 +674,30 @@ object Validator:
             pc += 1
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // value
+            popVal(ValueType.I32Type)                                           // dst
+          case 12 =>                                                            // table.init elemidx, tableidx
+            val elemIdx  = readU32()
+            val tableIdx = readU32()
+            if elemIdx < 0 || elemIdx >= elemSegmentCount then
+              fail(s"table.init: elem index $elemIdx out of range (have $elemSegmentCount segments)")
+            if tableIdx < 0 || tableIdx >= tableCount then
+              fail(s"table.init: table index $tableIdx out of range (have $tableCount tables)")
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.I32Type)                                           // src (offset into elem segment)
+            popVal(ValueType.I32Type)                                           // dst (offset into table)
+          case 13 =>                                                            // elem.drop elemidx
+            val elemIdx = readU32()
+            if elemIdx < 0 || elemIdx >= elemSegmentCount then
+              fail(s"elem.drop: elem index $elemIdx out of range (have $elemSegmentCount segments)")
+          case 14 =>                                                            // table.copy dst-tableidx, src-tableidx
+            val dstTab = readU32()
+            val srcTab = readU32()
+            if dstTab < 0 || dstTab >= tableCount then
+              fail(s"table.copy: dst table index $dstTab out of range (have $tableCount tables)")
+            if srcTab < 0 || srcTab >= tableCount then
+              fail(s"table.copy: src table index $srcTab out of range (have $tableCount tables)")
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.I32Type)                                           // src
             popVal(ValueType.I32Type)                                           // dst
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfc))

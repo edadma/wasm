@@ -303,19 +303,35 @@ object Interpreter:
         Right(pc + 1)
       case 0xfc =>
         // 0xFC is a multibyte-opcode prefix; the sub-opcode is a LEB u32.
-        // Sub 0..7 are the non-trapping (saturating) float→int conversions
-        // from the trunc_sat proposal — single-LEB encoding, no further
-        // immediates. Sub 10/11 are the two bulk-memory forms (memory.copy
-        // / memory.fill) which carry reserved memidx bytes. Anything else
-        // surfaces as `UnknownOpcode(0xFC)` so a future sub-opcode addition
-        // (memory.init, table.copy, etc.) is forced through dispatch +
-        // skipImmediates together.
+        // Sub 0..7: trunc_sat proposal — single-LEB encoding, no further
+        // immediates (Phase 8.A).
+        // Sub 8..14: bulk-memory + table proposal (Phase 8.B added 8/9/12/13/14
+        // alongside 7.B's 10/11). Immediate layout per spec:
+        //   sub  8 (memory.init): dataidx LEB + memidx-reserved-byte (0x00)
+        //   sub  9 (data.drop):   dataidx LEB
+        //   sub 10 (memory.copy): two memidx reserved bytes (dst, src)
+        //   sub 11 (memory.fill): memidx reserved byte
+        //   sub 12 (table.init):  elemidx LEB + tableidx LEB
+        //   sub 13 (elem.drop):   elemidx LEB
+        //   sub 14 (table.copy):  dst tableidx LEB + src tableidx LEB
+        // Sub ≥15 is reserved space; surfaces as UnknownOpcode(0xFC).
         Leb128.readU32(body, pc + 1) match
           case Left(e)          => Left(e)
           case Right((sub, p1)) =>
             sub match
               case s if s >= 0 && s <= 7 =>                                    // i32/i64.trunc_sat_{f32,f64}_{s,u}
                 Right(p1)
+              case 8 =>                                                        // memory.init dataidx, memidx-reserved-byte
+                Leb128.readU32(body, p1) match
+                  case Left(e)            => Left(e)
+                  case Right((_, p2)) =>
+                    if p2 + 1 > body.length then
+                      Left(WasmError.InvalidModule("truncated memory.init reserved memidx"))
+                    else Right(p2 + 1)
+              case 9 =>                                                        // data.drop dataidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)      => Left(e)
+                  case Right((_, p2)) => Right(p2)
               case 10 =>                                                       // memory.copy — two reserved bytes (dst, src memidx)
                 if p1 + 2 > body.length then
                   Left(WasmError.InvalidModule("truncated memory.copy reserved bytes"))
@@ -324,6 +340,24 @@ object Interpreter:
                 if p1 + 1 > body.length then
                   Left(WasmError.InvalidModule("truncated memory.fill reserved byte"))
                 else Right(p1 + 1)
+              case 12 =>                                                       // table.init elemidx, tableidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)            => Left(e)
+                  case Right((_, p2)) =>
+                    Leb128.readU32(body, p2) match
+                      case Left(e)        => Left(e)
+                      case Right((_, p3)) => Right(p3)
+              case 13 =>                                                       // elem.drop elemidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)      => Left(e)
+                  case Right((_, p2)) => Right(p2)
+              case 14 =>                                                       // table.copy dst-tableidx, src-tableidx
+                Leb128.readU32(body, p1) match
+                  case Left(e)            => Left(e)
+                  case Right((_, p2)) =>
+                    Leb128.readU32(body, p2) match
+                      case Left(e)        => Left(e)
+                      case Right((_, p3)) => Right(p3)
               case _  => Left(WasmError.UnknownOpcode(0xfc))
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -374,11 +408,24 @@ final class Interpreter private[wasm] (
       * false if `const`. `global.set` traps if the bit is false. */
     private val globalMutable: Array[Boolean],
     /** One funcidx-int array per table; `-1` marks a null funcref slot.
-      * Shared across calls (write-once at instantiation in Phase 3). */
+      * Shared across calls. Phase 8.B promotes these from "write-once at
+      * instantiation" to mutable — `table.init` and `table.copy` write
+      * here at run time. */
     private val tables: Array[Array[Int]],
     /** Module function-type vector — `call_indirect`'s dynamic signature
       * check resolves the static typeidx immediate against this. */
     private val types: Vector[FuncType],
+    // Phase 8.B: bulk-memory state. `dataBytes(i)` is segment `i`'s original
+    // byte payload (active or passive); `dataDropped(i)` is the drop flag —
+    // active segments start dropped (their bytes already landed in memory at
+    // instantiation), passive ones start undropped until `data.drop`. Same
+    // shape for elements: `elemFuncs(i)` is the original funcidx vector,
+    // `elemDropped(i)` the drop flag (active + declarative start dropped,
+    // passive starts undropped).
+    private val dataBytes:   Array[Array[Byte]],
+    private val dataDropped: Array[Boolean],
+    private val elemFuncs:   Array[Vector[Int]],
+    private val elemDropped: Array[Boolean],
 ):
   import Interpreter.*
 
@@ -1379,6 +1426,47 @@ final class Interpreter private[wasm] (
             pushI64(r)
             f.pc = p1
 
+          // ===== Phase 8.B bulk-memory remainder =================================
+          //
+          // memory.init / data.drop reference one data segment by dataidx;
+          // table.init / elem.drop reference one element segment by elemidx;
+          // table.copy references two tables (dst, src). All five share the
+          // unsigned-Long bounds check pattern used by memory.copy/fill.
+          // The validator has already range-checked the static immediates
+          // (dataidx, elemidx, tableidx, reserved memidx); the interpreter
+          // re-reads them via readU32At for the dispatch.
+
+          case 8 =>                                                                         // memory.init dataidx, memidx-reserved-byte
+            val (dataIdx, p2) = readU32At(f, p1)
+            val mem = body(p2) & 0xff
+            if mem != 0 then
+              fail(WasmError.InvalidModule(s"memory.init: non-zero reserved memidx $mem"))
+            f.pc = p2 + 1
+            val n   = popI32()
+            val src = popI32()                                                              // offset into data segment
+            val dst = popI32()                                                              // offset into memory
+            val nL   = n.toLong   & 0xffffffffL
+            val srcL = src.toLong & 0xffffffffL
+            val dstL = dst.toLong & 0xffffffffL
+            // A dropped segment is treated as an empty byte vector — the
+            // OOB check uses its effective length (0 if dropped, else
+            // original byte-count). The dataDropped flag is set both for
+            // active segments post-instantiation and for passive segments
+            // that have been explicitly `data.drop`'d.
+            val segLen =
+              if dataDropped(dataIdx) then 0L else dataBytes(dataIdx).length.toLong
+            if srcL + nL > segLen || dstL + nL > memory.data.length.toLong then
+              fail(WasmError.MemoryOutOfBounds)
+            if nL > 0L then
+              System.arraycopy(dataBytes(dataIdx), srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+
+          case 9 =>                                                                         // data.drop dataidx
+            val (dataIdx, p2) = readU32At(f, p1)
+            f.pc = p2
+            // Idempotent — dropping a dropped (or originally-active) segment
+            // is a no-op, not an error. The bit stays set.
+            dataDropped(dataIdx) = true
+
           case 10 =>                                                                        // memory.copy dst-memidx src-memidx
             val dstMem = body(p1)     & 0xff
             val srcMem = body(p1 + 1) & 0xff
@@ -1418,6 +1506,57 @@ final class Interpreter private[wasm] (
               fail(WasmError.MemoryOutOfBounds)
             if nL > 0L then
               java.util.Arrays.fill(memory.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
+
+          case 12 =>                                                                        // table.init elemidx, tableidx
+            val (elemIdx, p2) = readU32At(f, p1)
+            val (tableIdx, p3) = readU32At(f, p2)
+            f.pc = p3
+            val n   = popI32()
+            val src = popI32()                                                              // offset into elem segment
+            val dst = popI32()                                                              // offset into table
+            val nL   = n.toLong   & 0xffffffffL
+            val srcL = src.toLong & 0xffffffffL
+            val dstL = dst.toLong & 0xffffffffL
+            val tab    = tables(tableIdx)
+            val segLen = if elemDropped(elemIdx) then 0L else elemFuncs(elemIdx).length.toLong
+            // tables are funcidx-int arrays — same unsigned-Long bounds check
+            // pattern as memory.init. We reuse the MemoryOutOfBounds error
+            // variant because no Table-specific one exists yet; the
+            // diagnostic message disambiguates.
+            if srcL + nL > segLen || dstL + nL > tab.length.toLong then
+              fail(WasmError.MemoryOutOfBounds)
+            if nL > 0L then
+              val src0  = srcL.toInt
+              val dst0  = dstL.toInt
+              val funcs = elemFuncs(elemIdx)
+              var k = 0
+              while k < nL.toInt do
+                tab(dst0 + k) = funcs(src0 + k)
+                k += 1
+
+          case 13 =>                                                                        // elem.drop elemidx
+            val (elemIdx, p2) = readU32At(f, p1)
+            f.pc = p2
+            elemDropped(elemIdx) = true
+
+          case 14 =>                                                                        // table.copy dst-tableidx, src-tableidx
+            val (dstTab, p2) = readU32At(f, p1)
+            val (srcTab, p3) = readU32At(f, p2)
+            f.pc = p3
+            val n   = popI32()
+            val src = popI32()
+            val dst = popI32()
+            val nL   = n.toLong   & 0xffffffffL
+            val srcL = src.toLong & 0xffffffffL
+            val dstL = dst.toLong & 0xffffffffL
+            val sTab = tables(srcTab)
+            val dTab = tables(dstTab)
+            if srcL + nL > sTab.length.toLong || dstL + nL > dTab.length.toLong then
+              fail(WasmError.MemoryOutOfBounds)
+            if nL > 0L then
+              // System.arraycopy handles overlapping copies correctly,
+              // including same-table self-copy (dstTab == srcTab).
+              System.arraycopy(sTab, srcL.toInt, dTab, dstL.toInt, nL.toInt)
 
           case _ =>
             fail(WasmError.UnknownOpcode(0xfc))

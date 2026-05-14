@@ -93,6 +93,10 @@ object Parser:
     var codes     = Vector.empty[FuncBody]
     var data      = Vector.empty[DataSegment]
     var start     = Option.empty[Int]
+    // Section 12 (Data Count). Required by spec for any module that uses
+    // `memory.init` / `data.drop`. We capture it on parse; the validator
+    // gates those ops on its presence + agreement with `data.length`.
+    var dataCount = Option.empty[Int]
 
     while c.hasMore do
       val id      = c.readByte()
@@ -112,14 +116,24 @@ object Parser:
         case 9  => elements  = parseElementSection(c)
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
-        case _  => () // ignore Custom (0), DataCount (12)
+        case 12 => dataCount = Some(c.readU32())                              // Section 12 (Data Count)
+        case _  => () // ignore Custom (0) and any future / unknown id
       c.pos = secEnd
 
     if codes.size != functions.size then
       fail(WasmError.InvalidModule(
         s"function/code section length mismatch: ${functions.size} types vs ${codes.size} bodies"))
 
-    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start)
+    // Per spec: if Section 12 (DataCount) is present, its value MUST equal
+    // the number of segments declared by Section 11 (Data). The validator
+    // separately gates `memory.init` / `data.drop` on DataCount presence.
+    dataCount.foreach { n =>
+      if n != data.size then
+        fail(WasmError.InvalidModule(
+          s"DataCount section value $n disagrees with data section size ${data.size}"))
+    }
+
+    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start, dataCount)
 
   // === Type section ===
 
@@ -271,32 +285,54 @@ object Parser:
     * (passive, declarative, active-with-elem-expr) are rejected explicitly
     * with a diagnostic naming the flag so a future implementation knows
     * exactly which form surfaced. */
+  /** Phase 8.B extends MVP flag 0 / flag 2 (active) with flag 1 (passive)
+    * and flag 3 (declarative). Flags 4..7 use elemexpr instead of funcidx
+    * and belong to the reference-types proposal — they stay rejected.
+    *
+    *   flag 0: active, table 0, offset = i32.const, funcidx vec
+    *   flag 1: passive, elemkind byte (0x00 = funcref), funcidx vec
+    *   flag 2: active, explicit tableidx, offset, elemkind byte, funcidx vec
+    *   flag 3: declarative, elemkind byte, funcidx vec
+    */
   private def parseElementSection(c: Cursor): Vector[ElementSegment] =
     val n = c.readU32()
     Vector.tabulate(n) { _ =>
       val flag = c.readU32()
       flag match
         case 0 =>
-          // active, table 0, offset = i32.const expr, vec(funcidx)
           val offset = readConstI32Expr(c)
           val cnt    = c.readU32()
           val idxs   = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment(0, offset, idxs)
+          ElementSegment.Active(0, offset, idxs)
+        case 1 =>
+          val ek = c.readByte()
+          if ek != 0x00 then
+            fail(WasmError.InvalidModule(
+              s"passive element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
+          val cnt  = c.readU32()
+          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
+          ElementSegment.Passive(idxs)
         case 2 =>
-          // active, explicit tableidx, offset = i32.const expr, elemkind byte
-          // (must be 0x00 = funcref), vec(funcidx)
           val tableIdx = c.readU32()
           val offset   = readConstI32Expr(c)
           val ek       = c.readByte()
           if ek != 0x00 then
             fail(WasmError.InvalidModule(
-              s"element segment elemkind 0x${ek.toHexString} not supported (MVP funcref only)"))
+              s"element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
           val cnt  = c.readU32()
           val idxs = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment(tableIdx, offset, idxs)
+          ElementSegment.Active(tableIdx, offset, idxs)
+        case 3 =>
+          val ek = c.readByte()
+          if ek != 0x00 then
+            fail(WasmError.InvalidModule(
+              s"declarative element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
+          val cnt  = c.readU32()
+          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
+          ElementSegment.Declarative(idxs)
         case other =>
           fail(WasmError.InvalidModule(
-            s"element segment flag $other not supported (MVP: flag 0 / flag 2 — active only)"))
+            s"element segment flag $other not supported (Phase 8.B accepts 0/1/2/3 — funcref kinds only)"))
     }
 
   // === Code section ===
@@ -324,24 +360,34 @@ object Parser:
 
   // === Data section ===
 
+  /** Phase 8.B promotes flag 1 (passive) from "rejected" to a real
+    * `DataSegment.Passive` carrying the bytes for `memory.init` /
+    * `data.drop`. Flags 0 / 2 keep the active shape and now carry an
+    * explicit memIdx (always 0 in the single-memory MVP, but plumbed
+    * through so multi-memory Phase 8.D doesn't have to re-touch the
+    * type).
+    *
+    *   flag 0: active, memory 0,     offset = i32.const, byte vec
+    *   flag 1: passive,                                  byte vec
+    *   flag 2: active, explicit memidx, offset,          byte vec
+    */
   private def parseDataSection(c: Cursor): Vector[DataSegment] =
     val n = c.readU32()
     Vector.tabulate(n) { _ =>
       val flag = c.readU32()
       flag match
-        case 0 => // active, memory 0, offset = const expr
+        case 0 =>
           val offset = readConstI32Expr(c)
           val len    = c.readU32()
-          DataSegment(offset, c.readBytes(len))
-        case 1 => // passive — ignored content
+          DataSegment.Active(0, offset, c.readBytes(len))
+        case 1 =>
           val len = c.readU32()
-          c.readBytes(len)
-          fail(WasmError.InvalidModule("passive data segments not supported in MVP"))
+          DataSegment.Passive(c.readBytes(len))
         case 2 =>
-          c.readU32() // memidx
+          val memIdx = c.readU32()
           val offset = readConstI32Expr(c)
           val len    = c.readU32()
-          DataSegment(offset, c.readBytes(len))
+          DataSegment.Active(memIdx, offset, c.readBytes(len))
         case other =>
           fail(WasmError.InvalidModule(s"unknown data segment flag $other"))
     }

@@ -15,6 +15,7 @@ object MemoryTests:
     baseline()
     phase4()
     bulkMemory()
+    bulkMemoryRemainder()
 
   // === Pre-Phase-4 baseline ===============================================
 
@@ -272,4 +273,99 @@ object MemoryTests:
       expectError(inst, "do_copy", Seq(I32(65530), I32(0), I32(10))) {
         case WasmError.MemoryOutOfBounds => true
       }
+    }
+
+  // === Phase 8.B: bulk-memory remainder ====================================
+  //
+  // memory.init copies bytes from a passive data segment into memory;
+  // data.drop marks the segment as "consumed" so subsequent memory.init
+  // with n > 0 traps. The fixture exposes one passive data segment
+  // ("ABCDEFGH", 8 bytes) addressable as dataidx 0.
+
+  private def bulkMemoryRemainder(): Unit =
+
+    test("memory.init: copies bytes from passive data segment into memory") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // Copy all 8 bytes at offset 100.
+      inst.invoke("do_memory_init", Seq(I32(100), I32(0), I32(8))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_memory_init: $other")
+      val expected = "ABCDEFGH".getBytes
+      var i = 0
+      while i < 8 do
+        check(callI32(inst, "load_byte", 100 + i) == (expected(i) & 0xff),
+              s"byte[${100 + i}] should be 0x${(expected(i) & 0xff).toHexString}")
+        i += 1
+      // Neighbours stay zero — copy must not bleed past `n`.
+      check(callI32(inst, "load_byte",  99) == 0x00, "byte 99 untouched")
+      check(callI32(inst, "load_byte", 108) == 0x00, "byte 108 untouched")
+    }
+
+    test("memory.init: src offset into data segment selects a slice") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // Copy bytes 4..7 of "ABCDEFGH" ("EFGH") to memory[200..203].
+      inst.invoke("do_memory_init", Seq(I32(200), I32(4), I32(4))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_memory_init: $other")
+      check(callI32(inst, "load_byte", 200) == 'E'.toInt, "byte 200 = 'E'")
+      check(callI32(inst, "load_byte", 201) == 'F'.toInt, "byte 201 = 'F'")
+      check(callI32(inst, "load_byte", 202) == 'G'.toInt, "byte 202 = 'G'")
+      check(callI32(inst, "load_byte", 203) == 'H'.toInt, "byte 203 = 'H'")
+    }
+
+    test("memory.init: n == 0 is a no-op even at segment-end boundary") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // src=8 (one past the segment end) with n=0 is allowed by spec —
+      // only src + n > segLen traps.
+      inst.invoke("do_memory_init", Seq(I32(0), I32(8), I32(0))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_memory_init n=0 at boundary: $other")
+    }
+
+    test("memory.init: src + n > segment-length traps MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // Segment is 8 bytes; src=4 with n=5 overruns by 1.
+      expectError(inst, "do_memory_init", Seq(I32(0), I32(4), I32(5))) {
+        case WasmError.MemoryOutOfBounds => true
+      }
+    }
+
+    test("memory.init: dst + n > memory-size traps MemoryOutOfBounds") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // 1 page = 65536 bytes; copying 8 bytes at dst=65530 overruns by 2.
+      expectError(inst, "do_memory_init", Seq(I32(65530), I32(0), I32(8))) {
+        case WasmError.MemoryOutOfBounds => true
+      }
+    }
+
+    test("data.drop: subsequent memory.init with n > 0 traps; n == 0 still OK") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      // Pre-drop: memory.init with n=1 succeeds.
+      inst.invoke("do_memory_init", Seq(I32(0), I32(0), I32(1))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"pre-drop memory.init: $other")
+      check(callI32(inst, "load_byte", 0) == 'A'.toInt, "pre-drop byte 0 = 'A'")
+      // Drop.
+      inst.invoke("do_data_drop", Seq.empty) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"do_data_drop: $other")
+      // Post-drop: any n > 0 traps; the dropped segment's effective length
+      // is 0, so src=0 n=1 is out-of-bounds.
+      expectError(inst, "do_memory_init", Seq(I32(10), I32(0), I32(1))) {
+        case WasmError.MemoryOutOfBounds => true
+      }
+      // n=0 is still permitted (vacuous).
+      inst.invoke("do_memory_init", Seq(I32(0), I32(0), I32(0))) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"post-drop n=0: $other")
+    }
+
+    test("data.drop: idempotent (dropping twice is fine)") {
+      val inst = instantiate(Fixtures.bulk_memory_remainder)
+      inst.invoke("do_data_drop", Seq.empty) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"first drop: $other")
+      inst.invoke("do_data_drop", Seq.empty) match
+        case Right(Seq()) => ()
+        case other        => check(false, s"second drop: $other")
     }

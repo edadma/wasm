@@ -152,12 +152,19 @@ object ParserAndRuntimeTests:
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("function"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(function/code mismatch), got $other")
     }
-    test("parser: passive data segments (flag 1) return InvalidModule") {
-      val dataSec = b(0x01, 0x01, 0x00)                    // 1 segment, flag 1, 0 bytes
+    test("parser: passive data segments (flag 1) parse as DataSegment.Passive (Phase 8.B)") {
+      // 1 segment, flag 1, 0 bytes. Pre-8.B this rejected with
+      // InvalidModule(passive); 8.B promoted it to a real DataSegment.Passive
+      // for memory.init / data.drop to address.
+      val dataSec = b(0x01, 0x01, 0x00)
       val bad = Header ++ b(0x0b, dataSec.length) ++ dataSec
       Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("passive"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(passive), got $other")
+        case Right(m) =>
+          check(m.data.length == 1, s"expected 1 data segment, got ${m.data.length}")
+          m.data.head match
+            case DataSegment.Passive(bytes) => check(bytes.length == 0, s"expected 0 bytes, got ${bytes.length}")
+            case other => check(false, s"expected DataSegment.Passive, got $other")
+        case other => check(false, s"expected Right(module), got $other")
     }
     test("parser: unknown data segment flag returns InvalidModule") {
       val dataSec = b(0x01, 0x05)                          // 1 segment, flag 5 (unknown)
@@ -192,13 +199,29 @@ object ParserAndRuntimeTests:
         case other => check(false, s"expected InvalidModule(reftype), got $other")
     }
 
-    test("parser: section 9 with passive flag (1) returns InvalidModule") {
-      // 1 element segment with flag=1 (passive) — Phase 3 only models the
-      // active forms (flag 0 / flag 2).
-      val elemSec = b(0x01, 0x01)
+    test("parser: section 9 with passive flag (1) parses as ElementSegment.Passive (Phase 8.B)") {
+      // 1 element segment, flag=1 (passive), elemkind 0x00 (funcref), 0 funcs.
+      // Pre-8.B this rejected; 8.B promoted to a real ElementSegment.Passive.
+      val elemSec = b(0x01, 0x01, 0x00, 0x00)
       val bad = Header ++ b(0x09, elemSec.length) ++ elemSec
       Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("element"), s"message: $msg")
+        case Right(m) =>
+          check(m.elements.length == 1, s"expected 1 element segment, got ${m.elements.length}")
+          m.elements.head match
+            case ElementSegment.Passive(idxs) => check(idxs.isEmpty, s"expected empty, got $idxs")
+            case other => check(false, s"expected ElementSegment.Passive, got $other")
+        case other => check(false, s"expected Right(module), got $other")
+    }
+
+    test("parser: section 9 with elemexpr flag (5 — reference types) still rejected") {
+      // Flag 5 is passive-with-elemexpr; that's reference-types-proposal
+      // territory and Phase 8.B explicitly leaves it rejected (will land
+      // in 8.C).
+      val elemSec = b(0x01, 0x05)
+      val bad = Header ++ b(0x09, elemSec.length) ++ elemSec
+      Parser.parse(bad) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("element segment flag"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(element flag), got $other")
     }
 

@@ -27,6 +27,14 @@ final class ModuleInstance private[wasm] (
     private val types: Vector[FuncType],
     private val exportFuncs: Map[String, Int],
     private val exportGlobals: Map[String, Int],
+    // Phase 8.B: bulk-memory state. Both `dataBytes`/`dataDropped` and
+    // `elemFuncs`/`elemDropped` persist across `invoke` calls — `data.drop`
+    // / `elem.drop` flips bits that subsequent `memory.init` / `table.init`
+    // calls observe.
+    private val dataBytes:   Array[Array[Byte]],
+    private val dataDropped: Array[Boolean],
+    private val elemFuncs:   Array[Vector[Int]],
+    private val elemDropped: Array[Boolean],
 ):
 
   /** Invoke an exported function. Each call gets a fresh interpreter so
@@ -35,7 +43,10 @@ final class ModuleInstance private[wasm] (
   def invoke(name: String, args: Seq[Value] = Seq.empty): Either[WasmError, Seq[Value]] =
     exportFuncs.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
-      case Some(idx) => new Interpreter(funcs, memory, globals, globalMutable, tables, types).invoke(idx, args)
+      case Some(idx) => new Interpreter(
+        funcs, memory, globals, globalMutable, tables, types,
+        dataBytes, dataDropped, elemFuncs, elemDropped,
+      ).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
     * confirm linking worked. */
@@ -140,12 +151,35 @@ object Runtime:
       fail(WasmError.InvalidModule(s"unsupported memory size: $pages pages"))
     val memory = new Memory(pages, maxPages)
 
-    // === active data segments ==============================================
-    module.data.foreach { seg =>
-      val end = seg.offset.toLong + seg.bytes.length
-      if seg.offset < 0 || end > memory.size then fail(WasmError.MemoryOutOfBounds)
-      System.arraycopy(seg.bytes, 0, memory.data, seg.offset, seg.bytes.length)
-    }
+    // === data segments =====================================================
+    // Active segments copy into memory at instantiation as they did before
+    // Phase 8.B; post-init they're marked "dropped" so subsequent
+    // `memory.init` with n > 0 traps OOB (the spec models this as the
+    // segment's byte vector becoming empty). Passive segments keep their
+    // bytes addressable as dataidx until `data.drop` flips the bit.
+    //
+    // We store BOTH kinds in the same `dataBytes` array indexed by dataidx
+    // so the interpreter doesn't have to translate between the binary's
+    // unified index space and our runtime model.
+    val nData       = module.data.size
+    val dataBytes   = new Array[Array[Byte]](nData)
+    val dataDropped = new Array[Boolean](nData)
+    var di = 0
+    while di < nData do
+      module.data(di) match
+        case DataSegment.Active(memIdx, offset, bytes) =>
+          if memIdx != 0 then
+            fail(WasmError.InvalidModule(
+              s"active data segment $di: memIdx=$memIdx (multi-memory not supported yet)"))
+          val end = offset.toLong + bytes.length
+          if offset < 0 || end > memory.size then fail(WasmError.MemoryOutOfBounds)
+          System.arraycopy(bytes, 0, memory.data, offset, bytes.length)
+          dataBytes(di)   = bytes
+          dataDropped(di) = true                                            // active = "dropped right after init"
+        case DataSegment.Passive(bytes) =>
+          dataBytes(di)   = bytes
+          dataDropped(di) = false
+      di += 1
 
     // === globals ============================================================
     // Module-defined globals only; imported globals will join the head of
@@ -191,26 +225,62 @@ object Runtime:
       tables(ti) = arr
       ti += 1
 
-    // Apply active element segments. Each must fit entirely within its
-    // declared table's bounds (the spec calls this an instantiation-time
-    // check; failure surfaces as `InvalidModule` here, alongside data
-    // segments' out-of-range trap shape).
-    module.elements.foreach { seg =>
-      if seg.tableIdx < 0 || seg.tableIdx >= tables.length then
-        fail(WasmError.InvalidModule(s"element segment references invalid table ${seg.tableIdx}"))
-      val tab = tables(seg.tableIdx)
-      val end = seg.offset.toLong + seg.funcIndices.length
-      if seg.offset < 0 || end > tab.length then
-        fail(WasmError.InvalidModule(
-          s"element segment overflows table ${seg.tableIdx} (offset=${seg.offset}, len=${seg.funcIndices.length}, size=${tab.length})"))
-      var k = 0
-      while k < seg.funcIndices.length do
-        val fi = seg.funcIndices(k)
-        if fi < 0 || fi >= funcs.size then
-          fail(WasmError.InvalidModule(s"element segment references invalid function $fi"))
-        tab(seg.offset + k) = fi
-        k += 1
-    }
+    // === element segments ==================================================
+    // Active segments still copy into their declared table at instantiation
+    // (failure = `InvalidModule`, matching data-segment trap shape). Passive
+    // and declarative segments stay addressable by elemidx; declarative is
+    // a runtime no-op until Phase 8.C wires `ref.func` to consult them.
+    // All three kinds share one `elemFuncs` array so `table.init` /
+    // `elem.drop` can index uniformly.
+    val nElem      = module.elements.size
+    val elemFuncs  = new Array[Vector[Int]](nElem)
+    val elemDropped = new Array[Boolean](nElem)
+    var ei = 0
+    while ei < nElem do
+      module.elements(ei) match
+        case ElementSegment.Active(tableIdx, offset, idxs) =>
+          if tableIdx < 0 || tableIdx >= tables.length then
+            fail(WasmError.InvalidModule(s"element segment $ei references invalid table $tableIdx"))
+          val tab = tables(tableIdx)
+          val end = offset.toLong + idxs.length
+          if offset < 0 || end > tab.length then
+            fail(WasmError.InvalidModule(
+              s"element segment $ei overflows table $tableIdx (offset=$offset, len=${idxs.length}, size=${tab.length})"))
+          var k = 0
+          while k < idxs.length do
+            val fi = idxs(k)
+            if fi < 0 || fi >= funcs.size then
+              fail(WasmError.InvalidModule(s"element segment $ei references invalid function $fi"))
+            tab(offset + k) = fi
+            k += 1
+          elemFuncs(ei)   = idxs
+          elemDropped(ei) = true                                            // active = "dropped right after init"
+        case ElementSegment.Passive(idxs) =>
+          // Validate each funcidx up front — a passive segment may be used
+          // by `table.init` later, but the spec requires funcidxs to be
+          // in-range at instantiation, not at use.
+          var k = 0
+          while k < idxs.length do
+            val fi = idxs(k)
+            if fi < 0 || fi >= funcs.size then
+              fail(WasmError.InvalidModule(s"passive element segment $ei references invalid function $fi"))
+            k += 1
+          elemFuncs(ei)   = idxs
+          elemDropped(ei) = false
+        case ElementSegment.Declarative(idxs) =>
+          // Same funcidx validation as passive — declarative segments
+          // pre-declare funcrefs for future `ref.func` resolution and
+          // their funcidxs must be in-range. Treated as "dropped" at
+          // runtime: never copied by `table.init`.
+          var k = 0
+          while k < idxs.length do
+            val fi = idxs(k)
+            if fi < 0 || fi >= funcs.size then
+              fail(WasmError.InvalidModule(s"declarative element segment $ei references invalid function $fi"))
+            k += 1
+          elemFuncs(ei)   = idxs
+          elemDropped(ei) = true
+      ei += 1
 
     // === exports ============================================================
     val exportFuncs: Map[String, Int] = module.exports.iterator.collect {
@@ -260,6 +330,7 @@ object Runtime:
           s"start: function $startIdx has signature $sig, expected () -> ()"))
       val interp = new Interpreter(
         funcs.toIndexedSeq, memory, globals, globalMutable, tables, module.types,
+        dataBytes, dataDropped, elemFuncs, elemDropped,
       )
       interp.invoke(startIdx, Seq.empty) match
         case Right(_) => ()
@@ -275,4 +346,8 @@ object Runtime:
       module.types,
       exportFuncs,
       exportGlobals,
+      dataBytes,
+      dataDropped,
+      elemFuncs,
+      elemDropped,
     )

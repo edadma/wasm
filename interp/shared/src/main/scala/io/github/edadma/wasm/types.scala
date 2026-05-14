@@ -46,11 +46,41 @@ final case class MemoryLimits(min: Int, max: Option[Int])
   */
 final case class Table(refType: Int, min: Int, max: Option[Int])
 
-/** An active element segment: at instantiation, copy `funcIndices` into
-  * `tables(tableIdx)` starting at `offset`. MVP only models the active form
-  * (flag 0 and flag 2 in the binary). Passive / declarative segments are
-  * deferred. */
-final case class ElementSegment(tableIdx: Int, offset: Int, funcIndices: Vector[Int])
+/** An element segment. Phase 8.B extends the MVP active-only shape with
+  * passive + declarative variants so `table.init` / `elem.drop` have
+  * something to address. The funcref/funcidx encoding is shared by all
+  * three forms (the elemexpr-bearing flags 4..7 are reference-types-
+  * proposal territory and stay rejected by the parser).
+  *
+  *   Active     — flag 0 / flag 2 in the binary; copied into
+  *                `tables(tableIdx)` at `offset` during instantiation
+  *                (current behaviour). Still referenceable by elemidx
+  *                from `table.init`, but post-instantiation the segment
+  *                is treated as "dropped" — `table.init` with n>0 on
+  *                an active segment traps OOB by design.
+  *   Passive    — flag 1; bytes stay around as an elemidx-addressable
+  *                table fragment. `table.init` copies; `elem.drop`
+  *                marks it as effectively empty.
+  *   Declarative — flag 3; the spec describes this as a "no-op at
+  *                instantiation, no-op at run time" marker used to
+  *                pre-declare funcrefs that `ref.func` would otherwise
+  *                fail to resolve. Until Phase 8.C (reference types)
+  *                lands `ref.func`, declarative segments are
+  *                accepted-and-ignored at the type level. */
+sealed trait ElementSegment:
+  def funcIndices: Vector[Int]
+
+object ElementSegment:
+  /** Active: copy `funcIndices` into `tables(tableIdx)` at `offset` at
+    * instantiation. The runtime then marks this segment "dropped" so
+    * subsequent `table.init` with n > 0 traps. */
+  final case class Active(tableIdx: Int, offset: Int, funcIndices: Vector[Int]) extends ElementSegment
+
+  /** Passive: indices remain addressable by elemidx until `elem.drop`. */
+  final case class Passive(funcIndices: Vector[Int]) extends ElementSegment
+
+  /** Declarative: parsed for `ref.func` pre-declaration; runtime no-op. */
+  final case class Declarative(funcIndices: Vector[Int]) extends ElementSegment
 
 /** A module-defined global. The init expression is evaluated at parse time
   * for the MVP-style `*.const` form and stored directly here as `initialValue`;
@@ -64,8 +94,21 @@ final case class ElementSegment(tableIdx: Int, offset: Int, funcIndices: Vector[
   */
 final case class Global(valueType: ValueType, mutable: Boolean, initialValue: Value)
 
-/** Active data segment: `bytes` are copied into memory 0 at `offset` during instantiation. */
-final case class DataSegment(offset: Int, bytes: Array[Byte])
+/** A data segment. Phase 8.B extends the MVP active-only shape with a
+  * passive variant so `memory.init` / `data.drop` have something to
+  * address. Active and passive both carry a `bytes` payload; passive
+  * has no offset (it's set by `memory.init` at run time). */
+sealed trait DataSegment:
+  def bytes: Array[Byte]
+
+object DataSegment:
+  /** Active: copied into memory `memIdx` at `offset` during instantiation.
+    * Post-instantiation the segment is "dropped" — subsequent
+    * `memory.init` with n > 0 traps. */
+  final case class Active(memIdx: Int, offset: Int, bytes: Array[Byte]) extends DataSegment
+
+  /** Passive: bytes remain addressable by dataidx until `data.drop`. */
+  final case class Passive(bytes: Array[Byte]) extends DataSegment
 
 /** One entry in the Code section.
   *
@@ -92,10 +135,15 @@ final case class WasmModule(
     memories: Vector[MemoryLimits],
     globals: Vector[Global],         // module-defined globals (imports not surfaced yet)
     exports: Vector[Export],
-    elements: Vector[ElementSegment],// active element segments — applied to `tables` at instantiation
+    elements: Vector[ElementSegment],// element segments — active ones populate `tables` at instantiation
     codes: Vector[FuncBody],
     data: Vector[DataSegment],
     startFunction: Option[Int],      // section 8 (Start) — funcidx to invoke at instantiation
+    // Section 12 (DataCount). `Some(n)` if the binary declared one (required
+    // by the spec for any module that uses `memory.init` / `data.drop`); the
+    // validator gates those ops on `dataCount.isDefined` matching `data.length`.
+    // `None` if the section was absent.
+    dataCount: Option[Int] = None,
 )
 
 /** All failure modes surfaced by the public API.
