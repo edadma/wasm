@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, and E are shipped.** Chunks F..I add float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, and F are shipped.** Chunks G..I add bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
 
 ### Foundations (Chunk A — done)
 
@@ -196,6 +196,34 @@ Lane-wise shifts (`shl`, `shr_s`, `shr_u`) on all four integer shapes, plus per-
 
 The signed vs unsigned distinction matters at the lane width: byte `0xFF` is `-1` signed but `255` unsigned, so `i8x16.shr_s` of it stays `-1` while `i8x16.shr_u` of it becomes `0x7F`; `i8x16.min_s` picks `-1` as the minimum but `i8x16.min_u` picks `0`.
 
+### Float arithmetic (Chunk F — done)
+
+Lane-wise IEEE-754 arithmetic across `f32x4` and `f64x2`. Rounding (`ceil`, `floor`, `trunc`, `nearest`) and `abs` / `neg` / `sqrt` are unary; `add` / `sub` / `mul` / `div` and `min` / `max` / `pmin` / `pmax` are binary. All ops have no immediate.
+
+`abs` / `neg` are bit-level (clear / flip the sign bit) and preserve NaN payloads exactly — useful for round-tripping signaling NaNs. Arithmetic ops produce *an* NaN when any operand is NaN; the bit pattern follows the same implementation-defined rule as scalar `f32.add` / `f64.add` (in practice the JVM's canonical `0x7FC00000` / `0x7FF8000000000000`).
+
+`min` and `max` use IEEE-754 semantics: NaN-involving inputs produce NaN, and `-0` orders below `+0`. `pmin(a,b)` and `pmax(a,b)` follow the spec's compare-then-pick formula — `pmin = if b<a then b else a`, `pmax = if a<b then b else a` — which means a NaN-involving compare always returns `false`, so `a` is picked. That gives `pmin` / `pmax` a *different* NaN behaviour from `min` / `max`: a non-NaN `a` paired with a NaN `b` yields `a` (no NaN propagation), but a NaN `a` always propagates.
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `f32x4.ceil` | `0x67` | Round each lane toward +Inf. |
+| `f32x4.floor` | `0x68` | Round each lane toward -Inf. |
+| `f32x4.trunc` | `0x69` | Round each lane toward zero (preserves signed zero). |
+| `f32x4.nearest` | `0x6A` | Round half to even per lane. |
+| `f64x2.ceil` / `floor` | `0x74` / `0x75` | Same shape as `f32x4`, double precision. |
+| `f64x2.trunc` | `0x7A` | |
+| `f64x2.nearest` | `0x94` | |
+| `f32x4.abs` / `neg` | `0xE0` / `0xE1` | Bit-twiddle the sign bit; NaN payloads preserved. |
+| `f32x4.sqrt` | `0xE3` | `sqrt(-x>0) = NaN`; `sqrt(-0) = -0`. |
+| `f32x4.add` / `sub` / `mul` / `div` | `0xE4` / `0xE5` / `0xE6` / `0xE7` | IEEE-754 per lane. `0/0 = NaN`, `1/0 = +Inf`. |
+| `f32x4.min` / `max` | `0xE8` / `0xE9` | NaN → NaN; `min(-0,+0) = -0`. |
+| `f32x4.pmin` / `pmax` | `0xEA` / `0xEB` | `if b<a then b else a` / `if a<b then b else a`; NaN-compare picks `a`. |
+| `f64x2.abs` / `neg` | `0xEC` / `0xED` | Bit-level sign manipulation. |
+| `f64x2.sqrt` | `0xEF` | |
+| `f64x2.add` / `sub` / `mul` / `div` | `0xF0` / `0xF1` / `0xF2` / `0xF3` | |
+| `f64x2.min` / `max` | `0xF4` / `0xF5` | |
+| `f64x2.pmin` / `pmax` | `0xF6` / `0xF7` | |
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -211,7 +239,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks F..I) |
+| SIMD remainder | bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks G..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
