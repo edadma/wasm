@@ -397,6 +397,28 @@ object Validator:
       if m < 0 || m >= memoryCount then
         fail(s"$label: memidx $m out of range (have $memoryCount memories)")
 
+    /** Read one laneidx byte and validate `lane < max`. Every SIMD
+      * lane-immediate op (extract_lane, replace_lane) calls this. The
+      * value itself is discarded — the typing rule doesn't depend on
+      * which lane is touched, only that the index is in range. */
+    def readLaneIdx(label: String, max: Int): Unit =
+      if pc + 1 > body.length then fail(s"$label: truncated lane index")
+      val lane = body(pc) & 0xff
+      if lane >= max then fail(s"$label: lane $lane out of range (max $max)")
+      pc += 1
+
+    /** Read the 16-byte `i8x16.shuffle` immediate; each byte must be
+      * `< 32` (lanes 0..15 source from the first v128, 16..31 from the
+      * second). All 16 are advanced past in one shot. */
+    def readShuffleLanes(): Unit =
+      if pc + 16 > body.length then fail("i8x16.shuffle: truncated lane vector")
+      var i = 0
+      while i < 16 do
+        val c = body(pc + i) & 0xff
+        if c >= 32 then fail(s"i8x16.shuffle: lane $c out of range (max 32)")
+        i += 1
+      pc += 16
+
     // --- walker ----
 
     /** Walk the function body, dispatching each opcode to its
@@ -895,6 +917,54 @@ object Validator:
             popVal(ValueType.V128Type)
             popVal(ValueType.I32Type)
 
+          // --- Chunk C — lane access ----------------------------------
+          //
+          // i8x16.shuffle: 16-byte laneidx immediate (each < 32). Both
+          // sources are v128; result is v128.
+          case 13 =>                                                              // i8x16.shuffle
+            readShuffleLanes()
+            popVal(ValueType.V128Type)
+            popVal(ValueType.V128Type)
+            pushVal(ValueType.V128Type)
+
+          // i8x16.swizzle: no immediate. `s` (top) is the index vector,
+          // `v` (below) is the source; result is v128.
+          case 14 =>                                                              // i8x16.swizzle
+            popVal(ValueType.V128Type)
+            popVal(ValueType.V128Type)
+            pushVal(ValueType.V128Type)
+
+          // *.splat — scalar → v128. Sub-opcode table below picks the
+          // scalar input type per shape; i8x16/i16x8 truncate from i32.
+          case 15 => simdSplat(ValueType.I32Type)                                 // i8x16.splat
+          case 16 => simdSplat(ValueType.I32Type)                                 // i16x8.splat
+          case 17 => simdSplat(ValueType.I32Type)                                 // i32x4.splat
+          case 18 => simdSplat(ValueType.I64Type)                                 // i64x2.splat
+          case 19 => simdSplat(ValueType.F32Type)                                 // f32x4.splat
+          case 20 => simdSplat(ValueType.F64Type)                                 // f64x2.splat
+
+          // *.extract_lane — v128 + 1-byte lane imm → scalar. i8x16 and
+          // i16x8 each split into _s/_u variants; the wider shapes have
+          // a single (signed-irrelevant) form because the destination is
+          // already at least as wide as the source lane.
+          case 21 => simdExtract("i8x16.extract_lane_s", 16, ValueType.I32Type)
+          case 22 => simdExtract("i8x16.extract_lane_u", 16, ValueType.I32Type)
+          case 24 => simdExtract("i16x8.extract_lane_s",  8, ValueType.I32Type)
+          case 25 => simdExtract("i16x8.extract_lane_u",  8, ValueType.I32Type)
+          case 27 => simdExtract("i32x4.extract_lane",    4, ValueType.I32Type)
+          case 29 => simdExtract("i64x2.extract_lane",    2, ValueType.I64Type)
+          case 31 => simdExtract("f32x4.extract_lane",    4, ValueType.F32Type)
+          case 33 => simdExtract("f64x2.extract_lane",    2, ValueType.F64Type)
+
+          // *.replace_lane — v128 + 1-byte lane imm + scalar → v128.
+          // Scalar is at stack-top (popped first), v128 below.
+          case 23 => simdReplace("i8x16.replace_lane", 16, ValueType.I32Type)
+          case 26 => simdReplace("i16x8.replace_lane",  8, ValueType.I32Type)
+          case 28 => simdReplace("i32x4.replace_lane",  4, ValueType.I32Type)
+          case 30 => simdReplace("i64x2.replace_lane",  2, ValueType.I64Type)
+          case 32 => simdReplace("f32x4.replace_lane",  4, ValueType.F32Type)
+          case 34 => simdReplace("f64x2.replace_lane",  2, ValueType.F64Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
@@ -932,6 +1002,32 @@ object Validator:
       skipMemArg("memory store")
       popVal(t)
       popVal(ValueType.I32Type)
+
+    /** Phase 8.E.C: every `*.splat` is "pop scalar, push v128". The
+      * lane-shape is implicit in the sub-opcode — i8x16/i16x8/i32x4
+      * each take an i32 scalar (the high bits are truncated at runtime),
+      * the wider shapes take their natural type. */
+    def simdSplat(in: ValueType): Unit =
+      popVal(in)
+      pushVal(ValueType.V128Type)
+
+    /** Phase 8.E.C: `*.extract_lane` reads a 1-byte lane index (< max),
+      * pops a v128, and pushes the scalar lane value. The i8x16/i16x8
+      * split into `_s/_u` lives at the opcode level — the validator
+      * only sees one fixed output type. */
+    def simdExtract(label: String, max: Int, out: ValueType): Unit =
+      readLaneIdx(label, max)
+      popVal(ValueType.V128Type)
+      pushVal(out)
+
+    /** Phase 8.E.C: `*.replace_lane` reads a 1-byte lane index (< max),
+      * pops the scalar (top), pops the v128 (below), and pushes the
+      * modified v128. */
+    def simdReplace(label: String, max: Int, scalar: ValueType): Unit =
+      readLaneIdx(label, max)
+      popVal(scalar)
+      popVal(ValueType.V128Type)
+      pushVal(ValueType.V128Type)
 
     /** Resolve a [[Interpreter.BlockSig]] (arity-only) into a full
       * `FuncType` so we can pop+push the actual types. For the inline

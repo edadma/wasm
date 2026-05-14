@@ -449,6 +449,25 @@ object Interpreter:
                   case Left(e)             => Left(e)
                   case Right((_, pAfter))  => Right(pAfter)
 
+              // Chunk C — `i8x16.shuffle` carries a 16-byte laneidx imm.
+              case 13 =>
+                val end = p1 + 16
+                if end > body.length then
+                  Left(WasmError.InvalidModule(s"truncated i8x16.shuffle immediate at $pc"))
+                else Right(end)
+
+              // Chunk C — `i8x16.swizzle` and `*.splat` have no operand
+              // past the sub-opcode.
+              case 14 | 15 | 16 | 17 | 18 | 19 | 20 =>
+                Right(p1)
+
+              // Chunk C — `*.extract_lane` (signed/unsigned variants)
+              // and `*.replace_lane` each carry a 1-byte lane index.
+              case 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 =>
+                if p1 + 1 > body.length then
+                  Left(WasmError.InvalidModule(s"truncated lane immediate at $pc"))
+                else Right(p1 + 1)
+
               case _ => Left(WasmError.UnknownOpcode(0xfd))
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -1855,6 +1874,178 @@ final class Interpreter private[wasm] (
         boundsCheck(mem, addr, 16)
         System.arraycopy(bits, 0, mem.data, addr.toInt, 16)
 
+      // === Chunk C — shuffle + swizzle ========================================
+
+      case 13 =>                                                                          // i8x16.shuffle : 16-byte laneidx immediate
+        // Each immediate byte picks a source lane: c < 16 means lane c
+        // of `a` (deeper on stack); c >= 16 means lane (c-16) of `b`
+        // (top of stack). Indices are pre-validated < 32 by the
+        // validator, so the dispatch below is exhaustive.
+        val idx = body
+        val ip  = p1
+        val b   = popV128()
+        val a   = popV128()
+        val r   = new Array[Byte](16)
+        var i   = 0
+        while i < 16 do
+          val c = idx(ip + i) & 0xff
+          r(i) = if c < 16 then a(c) else b(c - 16)
+          i += 1
+        f.pc = p1 + 16
+        valueStack += V128(r)
+
+      case 14 =>                                                                          // i8x16.swizzle : dynamic shuffle
+        // `s` (top) holds 16 lane indices; `v` (below) is the source.
+        // Each result lane is `v[s[i]]` for `s[i] < 16`, else 0. Indices
+        // ≥ 16 are *not* a trap — they just emit zero.
+        val s = popV128()
+        val v = popV128()
+        val r = new Array[Byte](16)
+        var i = 0
+        while i < 16 do
+          val si = s(i) & 0xff
+          r(i) = if si < 16 then v(si) else 0
+          i += 1
+        f.pc = p1
+        valueStack += V128(r)
+
+      // === Chunk C — splats ===================================================
+
+      case 15 =>                                                                          // i8x16.splat : broadcast low 8 bits to 16 lanes
+        val v    = popI32().toByte
+        val bits = new Array[Byte](16)
+        var i    = 0
+        while i < 16 do { bits(i) = v; i += 1 }
+        f.pc = p1
+        valueStack += V128(bits)
+
+      case 16 =>                                                                          // i16x8.splat : broadcast low 16 bits LE
+        splatNarrow(p1, popI32().toLong & 0xffffL, width = 2)
+
+      case 17 =>                                                                          // i32x4.splat
+        splatNarrow(p1, popI32().toLong & 0xffffffffL, width = 4)
+
+      case 18 =>                                                                          // i64x2.splat
+        splatNarrow(p1, popI64(), width = 8)
+
+      case 19 =>                                                                          // f32x4.splat : raw bit pattern, no NaN canonicalisation
+        splatNarrow(p1, jl.Float.floatToRawIntBits(popF32()).toLong & 0xffffffffL, width = 4)
+
+      case 20 =>                                                                          // f64x2.splat
+        splatNarrow(p1, jl.Double.doubleToRawLongBits(popF64()), width = 8)
+
+      // === Chunk C — extract_lane =============================================
+      //
+      // Each variant reads a 1-byte lane index, pops the v128, and
+      // pushes the scalar lane value. i8x16/i16x8 have `_s/_u` forms
+      // that differ only in sign-extension; the wider shapes have a
+      // single (signed-irrelevant) form.
+
+      case 21 =>                                                                          // i8x16.extract_lane_s
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushI32(v(lane).toInt)                                                            // Byte → Int is sign-extending
+        f.pc = p1 + 1
+
+      case 22 =>                                                                          // i8x16.extract_lane_u
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushI32(v(lane) & 0xff)
+        f.pc = p1 + 1
+
+      case 24 =>                                                                          // i16x8.extract_lane_s
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        val o    = lane * 2
+        val raw  = (v(o) & 0xff) | ((v(o + 1) & 0xff) << 8)
+        pushI32((raw << 16) >> 16)                                                        // sign-extend i16 → i32
+        f.pc = p1 + 1
+
+      case 25 =>                                                                          // i16x8.extract_lane_u
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        val o    = lane * 2
+        pushI32((v(o) & 0xff) | ((v(o + 1) & 0xff) << 8))
+        f.pc = p1 + 1
+
+      case 27 =>                                                                          // i32x4.extract_lane
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushI32(readLaneI32(v, lane))
+        f.pc = p1 + 1
+
+      case 29 =>                                                                          // i64x2.extract_lane
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushI64(readLaneI64(v, lane))
+        f.pc = p1 + 1
+
+      case 31 =>                                                                          // f32x4.extract_lane
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushF32(jl.Float.intBitsToFloat(readLaneI32(v, lane)))
+        f.pc = p1 + 1
+
+      case 33 =>                                                                          // f64x2.extract_lane
+        val lane = body(p1) & 0xff
+        val v    = popV128()
+        pushF64(jl.Double.longBitsToDouble(readLaneI64(v, lane)))
+        f.pc = p1 + 1
+
+      // === Chunk C — replace_lane =============================================
+      //
+      // Scalar is popped first (stack-top), then the v128 below. The
+      // popped backing array MUST be cloned before mutation (per
+      // popV128's contract — it returns the value's own backing store).
+
+      case 23 =>                                                                          // i8x16.replace_lane
+        val lane = body(p1) & 0xff
+        val s    = popI32()
+        val v    = popV128().clone
+        v(lane)  = s.toByte
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
+      case 26 =>                                                                          // i16x8.replace_lane
+        val lane = body(p1) & 0xff
+        val s    = popI32()
+        val v    = popV128().clone
+        writeLaneI16(v, lane, s)
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
+      case 28 =>                                                                          // i32x4.replace_lane
+        val lane = body(p1) & 0xff
+        val s    = popI32()
+        val v    = popV128().clone
+        writeLaneI32(v, lane, s)
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
+      case 30 =>                                                                          // i64x2.replace_lane
+        val lane = body(p1) & 0xff
+        val s    = popI64()
+        val v    = popV128().clone
+        writeLaneI64(v, lane, s)
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
+      case 32 =>                                                                          // f32x4.replace_lane
+        val lane = body(p1) & 0xff
+        val raw  = jl.Float.floatToRawIntBits(popF32())
+        val v    = popV128().clone
+        writeLaneI32(v, lane, raw)
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
+      case 34 =>                                                                          // f64x2.replace_lane
+        val lane = body(p1) & 0xff
+        val raw  = jl.Double.doubleToRawLongBits(popF64())
+        val v    = popV128().clone
+        writeLaneI64(v, lane, raw)
+        f.pc = p1 + 1
+        valueStack += V128(v)
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -1896,6 +2087,72 @@ final class Interpreter private[wasm] (
     val bits = new Array[Byte](16)
     System.arraycopy(mem.data, addr.toInt, bits, 0, width)
     valueStack += V128(bits)
+
+  /** Phase 8.E.C splat helper for widths 2/4/8. The low `width` bytes of
+    * `src` (little-endian) are written into lane 0 and then replicated
+    * across the remaining `16/width - 1` lanes. Used by every splat
+    * except i8x16 (which inlines the single-byte fast path). */
+  private def splatNarrow(p1: Int, src: Long, width: Int): Unit =
+    val bits  = new Array[Byte](16)
+    val lanes = 16 / width
+    var lane  = 0
+    while lane < lanes do
+      val off = lane * width
+      var k   = 0
+      while k < width do
+        bits(off + k) = ((src >>> (k * 8)) & 0xffL).toByte
+        k += 1
+      lane += 1
+    frame.pc = p1
+    valueStack += V128(bits)
+
+  /** Read 4 little-endian bytes from `v` at byte offset `lane * 4` as a
+    * signed i32. Used by both `i32x4.extract_lane` and the raw-bit
+    * surface of `f32x4.extract_lane`. */
+  private inline def readLaneI32(v: Array[Byte], lane: Int): Int =
+    val o = lane * 4
+    (v(o)     & 0xff)        |
+    ((v(o + 1) & 0xff) <<  8) |
+    ((v(o + 2) & 0xff) << 16) |
+    ((v(o + 3) & 0xff) << 24)
+
+  /** Read 8 little-endian bytes from `v` at byte offset `lane * 8` as a
+    * signed i64. Used by `i64x2.extract_lane` and the raw-bit surface
+    * of `f64x2.extract_lane`. */
+  private inline def readLaneI64(v: Array[Byte], lane: Int): Long =
+    val o = lane * 8
+    var k = 0
+    var r = 0L
+    while k < 8 do
+      r |= (v(o + k).toLong & 0xffL) << (k * 8)
+      k += 1
+    r
+
+  /** Write the low 16 bits of `value` into `v` at byte offset
+    * `lane * 2`, little-endian. */
+  private inline def writeLaneI16(v: Array[Byte], lane: Int, value: Int): Unit =
+    val o = lane * 2
+    v(o)     = (value & 0xff).toByte
+    v(o + 1) = ((value >>> 8) & 0xff).toByte
+
+  /** Write all 32 bits of `value` into `v` at byte offset `lane * 4`,
+    * little-endian. Used by i32x4 + f32x4 replace_lane (the float form
+    * passes the raw bit pattern). */
+  private inline def writeLaneI32(v: Array[Byte], lane: Int, value: Int): Unit =
+    val o = lane * 4
+    v(o)     = (value & 0xff).toByte
+    v(o + 1) = ((value >>> 8)  & 0xff).toByte
+    v(o + 2) = ((value >>> 16) & 0xff).toByte
+    v(o + 3) = ((value >>> 24) & 0xff).toByte
+
+  /** Write all 64 bits of `value` into `v` at byte offset `lane * 8`,
+    * little-endian. Used by i64x2 + f64x2 replace_lane. */
+  private inline def writeLaneI64(v: Array[Byte], lane: Int, value: Long): Unit =
+    val o = lane * 8
+    var k = 0
+    while k < 8 do
+      v(o + k) = ((value >>> (k * 8)) & 0xffL).toByte
+      k += 1
 
   /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
     * 8/width source lanes, and widen each into a `outLaneBytes`-byte

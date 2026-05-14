@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A and B are shipped.** Chunks C..I add lane access (splat/extract/replace/shuffle), integer and float arithmetic, comparisons, conversions, and the special dot/lane ops.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, and C are shipped.** Chunks D..I add integer and float arithmetic, comparisons, conversions, and the special dot/lane mem ops.
 
 ### Foundations (Chunk A — done)
 
@@ -119,6 +119,35 @@ Every load is `[i32 addr] → [v128]`; the store is `[i32 addr, v128 value] → 
 
 Out-of-bounds (addr + offset + width past memory end) traps with `MemoryOutOfBounds`, same shape as the scalar memory ops.
 
+### Lane access (Chunk C — done)
+
+Every "build / inspect / rearrange a v128 lane-by-lane" surface lives here. Lane shapes — `i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2` — pick the lane width (1/2/4/8 bytes) and the count (16/8/4/2 lanes). Lane immediates are validated `< lane_count` at compile time.
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `i8x16.shuffle` | `0x0D` | 16-byte laneidx immediate (each `< 32`); each result lane is `a[c]` if `c<16` else `b[c-16]`. |
+| `i8x16.swizzle` | `0x0E` | Dynamic shuffle. `s` (top) is the index vector, `v` (below) is the source. Result lane `i` = `v[s[i]]` if `s[i] < 16` else `0`. |
+| `i8x16.splat` | `0x0F` | Broadcast the low 8 bits of an i32 to 16 lanes. |
+| `i16x8.splat` | `0x10` | Broadcast the low 16 bits LE to 8 lanes. |
+| `i32x4.splat` | `0x11` | Broadcast 4 LE bytes to 4 lanes. |
+| `i64x2.splat` | `0x12` | Broadcast 8 LE bytes to 2 lanes. |
+| `f32x4.splat` | `0x13` | Broadcast the IEEE-754 bit pattern of an f32 to 4 lanes. |
+| `f64x2.splat` | `0x14` | Broadcast the IEEE-754 bit pattern of an f64 to 2 lanes. |
+| `i8x16.extract_lane_s` / `_u` | `0x15` / `0x16` | Read 1 byte at lane (signed / zero extended to i32). |
+| `i8x16.replace_lane` | `0x17` | Write the low byte of an i32 at the lane. |
+| `i16x8.extract_lane_s` / `_u` | `0x18` / `0x19` | Read 2 LE bytes at lane (signed / zero extended to i32). |
+| `i16x8.replace_lane` | `0x1A` | Write the low 16 bits LE at the lane. |
+| `i32x4.extract_lane` | `0x1B` | Read 4 LE bytes at lane → i32. |
+| `i32x4.replace_lane` | `0x1C` | Write 4 LE bytes at lane. |
+| `i64x2.extract_lane` | `0x1D` | Read 8 LE bytes at lane → i64. |
+| `i64x2.replace_lane` | `0x1E` | Write 8 LE bytes at lane. |
+| `f32x4.extract_lane` | `0x1F` | Read 4 LE bytes at lane → f32 (raw IEEE-754 bits, no NaN canonicalisation). |
+| `f32x4.replace_lane` | `0x20` | Write 4 LE bytes at lane. |
+| `f64x2.extract_lane` | `0x21` | Read 8 LE bytes at lane → f64. |
+| `f64x2.replace_lane` | `0x22` | Write 8 LE bytes at lane. |
+
+`extract_lane` / `replace_lane` carry a 1-byte lane immediate after the sub-opcode; `i8x16.shuffle` carries a 16-byte laneidx vector. `splat` and `swizzle` have no immediate beyond the sub-opcode.
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -134,7 +163,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | lane access (splat/extract/replace/shuffle), integer + float arithmetic, comparisons, conversions, dot/lane mem ops | in progress (8.E, chunks C..I) |
+| SIMD remainder | integer + float arithmetic, shifts + min/max, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks D..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
