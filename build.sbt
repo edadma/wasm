@@ -166,7 +166,7 @@ lazy val interp = crossProject(JSPlatform, JVMPlatform, NativePlatform)
 
 lazy val cli = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("cli"))
-  .dependsOn(interp)
+  .dependsOn(interp, wasi)
   .settings(
     name := "wasm-cli",
     scalacOptions ++= commonScalacOptions,
@@ -177,6 +177,14 @@ lazy val cli = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     // scopt is the only external dep in the whole project, and it's confined
     // to the CLI module — the interp library stays zero-dep.
     libraryDependencies += "com.github.scopt" %%% "scopt" % "4.1.0",
+  )
+  .jvmSettings(
+    // Hand-rolled `Test/run` main, same convention as interp / wasi. Tests
+    // exercise the dispatch logic (legacy main mode, _start auto-detect,
+    // proc_exit propagation, explicit --invoke override) against committed
+    // wasi fixtures resolved via project-relative paths — JVM-only because
+    // those paths don't survive into the JS / Native test classpaths.
+    Test / mainClass := Some("io.github.edadma.wasm.cli.CliJvmTests"),
   )
   .jsSettings(
     // CommonJS keeps the linker output runnable as a plain `node main.js`
