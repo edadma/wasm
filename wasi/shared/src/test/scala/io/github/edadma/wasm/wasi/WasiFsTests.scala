@@ -4,7 +4,8 @@ import io.github.edadma.wasm.{I32, I64, ModuleInstance}
 
 import WasiTestSupport.{check, instantiate, test}
 
-/** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3 + 7.E.4:
+/** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3 +
+  * 7.E.4 + 7.F:
   *
   *   - **7.E.1** wired the preopen-walk syscalls (`fd_prestat_get` and
   *     `fd_prestat_dir_name`), the two functions wasi-libc reaches for at
@@ -39,6 +40,17 @@ import WasiTestSupport.{check, instantiate, test}
   *     filetype, u16 flags, two u64 rights words); filetype dispatch
   *     matches `fd_filestat_get`, flags are zero (no APPEND/NONBLOCK),
   *     rights are full-mask at this slice.
+  *
+  *   - **7.F** extended the write surface: `fd_write` now routes to the
+  *     FdTable for opened-file fds (stdio + preopen-dir fds keep their
+  *     7.A/7.E.2 EBADF semantics), `path_open` honours `OFLAGS_CREAT`
+  *     (creates a missing file with size 0) and `OFLAGS_TRUNC` (zeroes
+  *     an existing file's contents on open), and the [[Wasi.FsFile]]
+  *     trait grew a `write(src, offset, length): Int` method.
+  *     `WasiContext.Preopen.inMemory` is now genuinely read/write:
+  *     its concrete return type
+  *     [[WasiContext.Preopen.InMemoryPreopen]] exposes `bytesOf(path)`
+  *     and `paths` so tests can inspect post-state.
   *
   * Three fixtures drive the surface: `wasi_prestat.wat` (7.E.1,
   * peek-only), `wasi_path_open.wat` (7.E.2, adds `call_path_open` /
@@ -775,6 +787,222 @@ object WasiFsTests:
         case other => check(false, s"call_fd_fdstat_get: $other")
     }
 
+    // ===== fd_write to opened files + path_open OFLAGS (7.F) =============
+    //
+    // Address layout (same convention as the 7.E.3 tests):
+    //   path bytes        @ 0
+    //   opened_fd_out     @ 64
+    //   iovec table       @ 256
+    //   nwritten / nread  @ 320
+    //   write source data @ 768 onward
+    //
+    // Each test seeds an InMemoryPreopen (empty for CREAT paths,
+    // pre-populated for TRUNC paths), opens a file, plants iovec entries
+    // pointing at write-source bytes in linear memory, drives `call_fd_write`,
+    // and inspects `preopen.bytesOf(path)` to confirm what landed in the FS.
+
+    test("fd_write: writes through to InMemoryFs at offset 0 (single iovec)") {
+      val preopen = Preopen.inMemory("/s", Map("f" -> "      ".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      val payload = "WRITE!".getBytes("UTF-8")
+      storeBytes(inst, 768, payload)
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, payload.length)
+      callFdWrite(inst, fd, 256, 1, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_write: $other")
+      check(peekI32(inst, 320) == payload.length,
+            s"nwritten=${peekI32(inst, 320)} (want ${payload.length})")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(bytes.sameElements(payload),
+            s"file=${new String(bytes, "UTF-8")} (want 'WRITE!')")
+    }
+
+    test("fd_write: multi-iovec concatenates at the cursor in order") {
+      val preopen = Preopen.inMemory("/s", Map("f" -> Array.empty[Byte]))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      val a = "abcd".getBytes("UTF-8")
+      val b = "efgh".getBytes("UTF-8")
+      storeBytes(inst, 768, a)
+      storeBytes(inst, 800, b)
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, a.length)
+      storeI32(inst, 264, 800)
+      storeI32(inst, 268, b.length)
+      callFdWrite(inst, fd, 256, 2, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other => check(false, s"call_fd_write: $other")
+      check(peekI32(inst, 320) == 8, s"nwritten=${peekI32(inst, 320)} (want 8)")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "abcdefgh",
+            s"file='${new String(bytes, "UTF-8")}' (want 'abcdefgh')")
+    }
+
+    test("fd_write: past-end write grows the file and zero-fills the gap") {
+      // Seed a 3-byte file, seek to offset 8, write 2 bytes. Result is
+      // 10 bytes long with [a, b, c, 0, 0, 0, 0, 0, X, Y].
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> Array[Byte]('a', 'b', 'c')))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      callFdSeek(inst, fd, 8L, 0, 320)
+      storeBytes(inst, 768, Array[Byte]('X', 'Y'))
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 2)
+      callFdWrite(inst, fd, 256, 1, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other => check(false, s"call_fd_write: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      val want  = Array[Byte]('a', 'b', 'c', 0, 0, 0, 0, 0, 'X', 'Y')
+      check(bytes.sameElements(want),
+            s"file=${bytes.toSeq} (want ${want.toSeq})")
+    }
+
+    test("fd_write: write after fd_seek lands at the new cursor") {
+      // Seed "abcdef", seek to offset 2, write "XY" → "abXYef".
+      val preopen = Preopen.inMemory("/s",
+                                     Map("f" -> "abcdef".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      callFdSeek(inst, fd, 2L, 0, 320)
+      storeBytes(inst, 768, "XY".getBytes("UTF-8"))
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 2)
+      callFdWrite(inst, fd, 256, 1, 320)
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "abXYef",
+            s"file='${new String(bytes, "UTF-8")}' (want 'abXYef')")
+    }
+
+    test("fd_write: write-then-seek-to-0-then-read returns the bytes (round-trip)") {
+      val preopen = Preopen.inMemory("/s", Map("f" -> Array.empty[Byte]))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      val payload = "hello".getBytes("UTF-8")
+      storeBytes(inst, 768, payload)
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, payload.length)
+      callFdWrite(inst, fd, 256, 1, 320)
+
+      // Seek back to start, read into a fresh region.
+      callFdSeek(inst, fd, 0L, 0, 320)
+      storeI32(inst, 256, 832)
+      storeI32(inst, 260, payload.length)
+      callFdRead(inst, fd, 256, 1, 320)
+      check(peekI32(inst, 320) == payload.length,
+            s"nread=${peekI32(inst, 320)}")
+      val got = readBytes(inst, 832, payload.length)
+      check(got.sameElements(payload),
+            s"round-trip got=${new String(got, "UTF-8")} (want 'hello')")
+    }
+
+    test("fd_write: EBADF on stdio fd 0, preopen fd 3, never-opened fd") {
+      val preopen   = Preopen.inMemory("/s", Map("f" -> "x".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      // Plant a dummy 1-byte iovec — doesn't matter because dispatch
+      // bails before reading the source.
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 1)
+      for badFd <- Seq(0, 3, 99) do
+        callFdWrite(inst, badFd, 256, 1, 320) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EBADF, s"fd=$badFd errno=$e (want EBADF)")
+          case other => check(false, s"call_fd_write(fd=$badFd): $other")
+    }
+
+    test("fd_write: EBADF after fd_close releases the slot") {
+      val preopen   = Preopen.inMemory("/s", Map("f" -> Array.empty[Byte]))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      inst.invoke("call_fd_close", Seq(I32(fd))) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"close errno=$e")
+        case other              => check(false, s"call_fd_close: $other")
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 1)
+      callFdWrite(inst, fd, 256, 1, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"errno=$e (want EBADF on closed fd)")
+        case other => check(false, s"call_fd_write: $other")
+    }
+
+    test("fd_write: EFAULT when iovec buffer extends past memory") {
+      val preopen   = Preopen.inMemory("/s", Map("f" -> Array.empty[Byte]))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      val fd = openWithFlags(inst, "f", oflags = 0)
+      // 1 page = 65536. buf=65530, len=10 → end 65540 > 65536.
+      storeI32(inst, 256, 65530)
+      storeI32(inst, 260, 10)
+      callFdWrite(inst, fd, 256, 1, 320) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EFAULT, s"errno=$e (want EFAULT)")
+        case other => check(false, s"call_fd_write: $other")
+      // File must remain empty — the failed call did not partial-write.
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(bytes.isEmpty, s"file size=${bytes.length} (want 0, EFAULT must not write)")
+    }
+
+    test("path_open: OFLAGS_CREAT creates a missing file with size 0") {
+      val preopen   = Preopen.inMemory("/s")  // empty
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "new")
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 3,
+                        oflags = 0x0001, openedFdOut = 64) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0 — OFLAGS_CREAT new file)")
+        case other => check(false, s"call_path_open: $other")
+      check(preopen.paths == Seq("new"),
+            s"paths=${preopen.paths} (want Seq(new))")
+      check(preopen.bytesOf("new").exists(_.length == 0),
+            "newly CREAT'd file must be size 0")
+    }
+
+    test("path_open: OFLAGS_CREAT on existing file preserves contents") {
+      val preopen   = Preopen.inMemory("/s",
+                                       Map("f" -> "keep".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // CREAT (0x01) without TRUNC: open existing without zeroing.
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                        oflags = 0x0001, openedFdOut = 64) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_path_open: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "keep",
+            s"file='${new String(bytes, "UTF-8")}' (want 'keep' — CREAT-only " +
+            "must not truncate)")
+    }
+
+    test("path_open: OFLAGS_TRUNC zeros an existing file's contents") {
+      val preopen   = Preopen.inMemory("/s",
+                                       Map("f" -> "junk".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      // TRUNC = 0x08; no CREAT bit, but file exists so unconditional zero.
+      callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                        oflags = 0x0008, openedFdOut = 64) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_path_open: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(bytes.isEmpty,
+            s"file size=${bytes.length} (want 0 — OFLAGS_TRUNC zeroed it)")
+    }
+
   // ----- helpers ----------------------------------------------------------
 
   /** Poke the UTF-8 bytes of `path` into linear memory starting at `addr`
@@ -807,6 +1035,66 @@ object WasiFsTests:
       I32(0),           // fdflags
       I32(openedFdOut), // opened_fd_out
     ))
+
+  /** 9-arg path_open wrapper for 7.F tests that need non-zero `oflags`
+    * (`OFLAGS_CREAT` = 0x0001, `OFLAGS_TRUNC` = 0x0008) or non-zero
+    * `fdflags`. Default `fdflags` is 0. */
+  private def callPathOpenFlags(inst: ModuleInstance,
+                                dirfd:       Int,
+                                pathPtr:     Int,
+                                pathLen:     Int,
+                                oflags:      Int,
+                                fdflags:     Int = 0,
+                                openedFdOut: Int = 64) =
+    inst.invoke("call_path_open", Seq(
+      I32(dirfd),
+      I32(0),
+      I32(pathPtr),
+      I32(pathLen),
+      I32(oflags),
+      I64(0L),
+      I64(0L),
+      I32(fdflags),
+      I32(openedFdOut),
+    ))
+
+  /** Plant `bytes` into linear memory starting at `addr` via the fixture's
+    * `store_byte` export. Tests use this to seed the source buffer that
+    * `fd_write` reads through iovecs. Same shape as [[storePath]] but
+    * accepts a raw `Array[Byte]`. */
+  private def storeBytes(inst: ModuleInstance, addr: Int, bytes: Array[Byte]): Unit =
+    var i = 0
+    while i < bytes.length do
+      inst.invoke("store_byte", Seq(I32(addr + i), I32(bytes(i) & 0xff))) match
+        case Right(_) => ()
+        case other    => throw new AssertionError(s"store_byte($i): $other")
+      i += 1
+
+  /** 4-arg `fd_write` wrapper — same arity as the underlying syscall.
+    * Mirrors [[callFdRead]]; tests use it to drive writes through the
+    * 7.F FdTable routing path. */
+  private def callFdWrite(inst:         ModuleInstance,
+                          fd:           Int,
+                          iovs:         Int,
+                          iovsLen:      Int,
+                          nwrittenOut:  Int) =
+    inst.invoke("call_fd_write",
+                Seq(I32(fd), I32(iovs), I32(iovsLen), I32(nwrittenOut)))
+
+  /** Open `pathKey` against the single-preopen fixture with the given
+    * `oflags`, plant the path bytes at addr 0, and return the freshly
+    * allocated fd. Used by the 7.F regression tests as the common
+    * boilerplate for "seed an InMemoryFs file, then drive fd_write". */
+  private def openWithFlags(inst:    ModuleInstance,
+                            pathKey: String,
+                            oflags:  Int): Int =
+    storePath(inst, 0, pathKey)
+    callPathOpenFlags(inst, dirfd = 3, pathPtr = 0,
+                      pathLen = pathKey.getBytes("UTF-8").length,
+                      oflags = oflags, openedFdOut = 64) match
+      case Right(Seq(I32(e))) if e == Wasi.ESUCCESS => ()
+      case other => throw new AssertionError(s"openWithFlags: $other")
+    peekI32(inst, 64)
 
   /** Read back a little-endian i32 at `addr` via the fixture's
     * `load_i32` helper. Throws on a non-i32 return so the test fails

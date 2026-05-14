@@ -4,8 +4,8 @@ import io.github.edadma.wasm.{I32, Runtime}
 
 import WasiTestSupport.{check, test}
 
-/** Phase 7.D + 7.E.4 — drives real rustc-built `wasm32-wasip1` binaries
-  * through the shim end-to-end.
+/** Phase 7.D + 7.E.4 + 7.F — drives real rustc-built `wasm32-wasip1`
+  * binaries through the shim end-to-end.
   *
   * 7.D ([[real_rust_hello.rs]]):
   *
@@ -39,9 +39,26 @@ import WasiTestSupport.{check, test}
   * its own regression test in `WasiFsTests` before the integration test
   * went green.
   *
-  * Both tests print to a [[WasiContext.Collecting]] sink and assert on
-  * captured stdout — the part of the contract most "obviously broken"
-  * if anything regresses.
+  * 7.F ([[real_rust_filewrite.rs]]):
+  *
+  *   fn main() {
+  *       let path     = "/sandbox/out.txt";
+  *       let contents = "Hello from rustc-wasm32-wasip1 file write!\n";
+  *       std::fs::write(path, contents).expect(...);
+  *   }
+  *
+  * `std::fs::write` is sugar for `OpenOptions::new().write(true)
+  * .create(true).truncate(true).open(p)` + `write_all` + drop — so this
+  * exercises `path_open` with `OFLAGS_CREAT | OFLAGS_TRUNC`, `fd_write`
+  * to a non-stdio fd (routed through the FdTable in 7.F), and the
+  * close-on-drop path. The test seeds [[InMemoryPreopen]] with an
+  * empty map, runs the binary, and inspects `bytesOf("out.txt")` for
+  * the written content. Stderr is pinned empty: a Rust panic on the
+  * `.expect(...)` would land there.
+  *
+  * All three tests print to a [[WasiContext.Collecting]] sink and assert
+  * on captured stdout / file post-state — the part of the contract most
+  * "obviously broken" if anything regresses.
   */
 object WasiRealRustTests:
 
@@ -97,6 +114,46 @@ object WasiRealRustTests:
       // stderr empty: a panic-print (e.g. failed .expect) would land here.
       val errOut = ctx.stderrString
       check(errOut.isEmpty, s"stderr expected empty, got ${quote(errOut)}")
+    }
+
+    test("rustc-built filewrite: writes /sandbox/out.txt via std::fs::write") {
+      // Empty in-memory preopen: the binary must CREAT the file before
+      // writing. Asserting `paths == Seq("out.txt")` post-run also pins
+      // that no spurious intermediates land in the FS.
+      val expected = "Hello from rustc-wasm32-wasip1 file write!\n"
+      val preopen  = WasiContext.Preopen.inMemory("/sandbox")
+      val ctx      = WasiContext.collecting(preopens = Seq(preopen))
+
+      val inst = Runtime.instantiate(
+        WasiFixtures.real_rust_filewrite,
+        Seq(Wasi.preview1(ctx.context)),
+      ) match
+        case Right(i) => i
+        case Left(e)  => throw new AssertionError(s"instantiate failed: $e")
+
+      Wasi.run(inst) match
+        case Right(code) =>
+          check(code == 0, s"exit code=$code (want 0)")
+        case Left(err) =>
+          check(false, s"Wasi.run failed: $err")
+
+      // Post-state: exactly one file at "out.txt" with the bytes Rust
+      // handed std::fs::write.
+      check(preopen.paths == Seq("out.txt"),
+            s"paths=${preopen.paths} (want Seq(out.txt))")
+      preopen.bytesOf("out.txt") match
+        case Some(bytes) =>
+          val got = new String(bytes, "UTF-8")
+          check(got == expected, s"file=${quote(got)} (want ${quote(expected)})")
+        case None =>
+          check(false, "out.txt did not appear in the InMemoryFs")
+
+      // Stdout/stderr both silent — std::fs::write doesn't print and a
+      // failing .expect would land on stderr.
+      check(ctx.stdoutString.isEmpty,
+            s"stdout expected empty, got ${quote(ctx.stdoutString)}")
+      check(ctx.stderrString.isEmpty,
+            s"stderr expected empty, got ${quote(ctx.stderrString)}")
     }
 
   /** Escape control characters so a failing assertion is debuggable.

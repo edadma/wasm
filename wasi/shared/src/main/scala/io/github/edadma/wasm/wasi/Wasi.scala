@@ -8,15 +8,20 @@ import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInst
   *
   * Provides a [[HostModule]] named `"wasi_snapshot_preview1"` plus a
   * [[Wasi.run]] convenience wrapper for the canonical "invoke `_start`,
-  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.E.4 the
+  * unwind on `proc_exit`" entry-point pattern. Through Phase 7.F the
   * shim resolves sixteen syscalls: `fd_write`, `fd_read`, `fd_close`
   * (full table — stdio, preopens, opened-file fds), `fd_seek`,
   * `fd_filestat_get`, `fd_fdstat_get`, `proc_exit`, `args_sizes_get` /
   * `args_get`, `environ_sizes_get` / `environ_get`, `clock_time_get`,
   * `random_get`, `fd_prestat_get`, `fd_prestat_dir_name`, and
-  * `path_open`. 7.E.4 is the end-to-end smoke test that boots a real
+  * `path_open`. 7.E.4 was the end-to-end smoke test that boots a real
   * rustc-built `wasm32-wasip1` file-reader binary through this surface;
-  * `fd_fdstat_get` was the only gap the binary surfaced.
+  * `fd_fdstat_get` was the only gap the binary surfaced. Phase 7.F
+  * extends the file surface to writes: `path_open` now honours
+  * `OFLAGS_CREAT` and `OFLAGS_TRUNC`, `fd_write` routes to the FdTable
+  * for opened-file fds, and [[Wasi.FsFile]] grew a `write` method.
+  * The 7.F smoke test boots a rustc `std::fs::write` binary; no new
+  * syscall gap surfaced.
   *
   * The shim stays zero-dep: it leans only on `interp`'s [[HostFunc]] /
   * [[HostModule]] / [[Memory]] surface, which is itself zero-dep. So
@@ -69,6 +74,11 @@ object Wasi:
     * didn't find the path in its FS. The conventional return when a
     * user-typed path doesn't exist. */
   val ENOENT:       Int = 44
+  /** No space left on device — reserved for write impls that hit a
+    * declared cap. Not currently emitted by [[WasiContext.Preopen.inMemory]],
+    * but documented here so future host-backed write impls have a
+    * consistent errno to surface. */
+  val ENOSPC:       Int = 51
   /** Capability insufficient — the preopen advertises its name but has no
     * FS capability behind it ([[WasiContext.Preopen.named]]). A program
     * asking to `path_open` through it gets this errno rather than
@@ -87,8 +97,11 @@ object Wasi:
     * returns bytes-read), `size` (total file size in bytes), `tell` (the
     * current cursor as a wasi `filesize`), and `seek` (absolute set —
     * whence math is done at the syscall layer because it doesn't depend
-    * on the impl). Real-FS impls in a future sub-phase can plug in
-    * against the same trait without touching the syscall layer. */
+    * on the impl). Phase 7.F added `write` for the symmetric host-buffer-
+    * source path; default impl returns 0 ("read-only file"), so existing
+    * read-only impls compile unchanged. Real-FS impls in a future
+    * sub-phase can plug in against the same trait without touching the
+    * syscall layer. */
   trait FsFile:
     /** Release any host resources backing this handle. For the in-memory
       * test impl this is a no-op. Real-FS impls (a future
@@ -105,8 +118,16 @@ object Wasi:
       * end-of-file: when `tell ≥ size` the call returns 0 cleanly. */
     def read(dst: Array[Byte], offset: Int, length: Int): Int
 
-    /** Total file size in bytes. Static for the lifetime of the handle
-      * at this slice — there's no write surface yet. */
+    /** Write up to `length` bytes from `src[offset .. offset + length)`
+      * starting at the current cursor. Returns the number of bytes
+      * actually consumed (`0` for a read-only impl; negative is never
+      * legal). Advances the cursor by the returned count, growing the
+      * file if the write extends past `size`. Default impl is `0` —
+      * read-only [[FsFile]]s inherit the no-op without having to
+      * override. */
+    def write(src: Array[Byte], offset: Int, length: Int): Int = 0
+
+    /** Total file size in bytes. May grow after a `write` past end. */
     def size: Long
 
     /** Current cursor position in bytes. `0` immediately after `open`. */
@@ -115,7 +136,9 @@ object Wasi:
     /** Move the cursor to an absolute byte position. Caller (the
       * syscall layer) validates `pos ≥ 0`; POSIX (and wasi-preview1
       * by inheritance) allows `pos > size`, in which case a subsequent
-      * `read` returns 0 without advancing further. */
+      * `read` returns 0 without advancing further. A subsequent `write`
+      * past end may grow the file (impl-defined; the InMemoryFs grows
+      * and zero-fills the gap). */
     def seek(pos: Long): Unit
 
   // === proc_exit unwind exception ===========================================
@@ -154,7 +177,7 @@ object Wasi:
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       val functions: Map[String, HostFunc] = Map(
-        "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx)),
+        "fd_write"            -> ((mem, args) => fdWrite(mem, args, ctx, fdTable)),
         "fd_read"             -> ((mem, args) => fdRead(mem, args, ctx, fdTable)),
         "fd_close"            -> ((_,   args) => fdClose(args, ctx, fdTable)),
         "fd_seek"             -> ((mem, args) => fdSeek(mem, args, ctx, fdTable)),
@@ -196,63 +219,81 @@ object Wasi:
     * vectors in order, writes each buffer's bytes to the sink chosen
     * by `fd`, and stores the total byte count at `nwritten`.
     *
+    * fd dispatch:
+    *   - `fd 1 / fd 2` → `ctx.stdout` / `ctx.stderr` byte sink.
+    *   - `fd 0`        → EBADF (stdin can't be written to).
+    *   - `fd 3 .. 3 + N − 1` (preopens) → EBADF (directories aren't
+    *     writable through `fd_write`; a future hardening pass could
+    *     return `EISDIR` instead).
+    *   - `fd ≥ 3 + N` (opened files) → routes to [[FsFile.write]] on
+    *     the file backing the fd; EBADF if the slot is free.
+    *
     * Errno discipline: out-of-bounds reads of any descriptor or buffer
-    * return EFAULT (and DO NOT write `nwritten`). An unknown fd returns
-    * EBADF. On a partial-success scenario (where some iovecs landed in
-    * the sink but a later one is bad) we still return EFAULT and don't
-    * stamp `nwritten` — wasi callers treat any non-zero errno as
-    * authoritative and ignore the `nwritten` slot in that case, so this
-    * choice is conservative but spec-compatible. */
-  private def fdWrite(memory: Memory, args: Seq[Value], ctx: WasiContext): Seq[Value] =
+    * return EFAULT (and DO NOT write `nwritten`). On a partial-success
+    * scenario (where some iovecs landed in the sink but a later one is
+    * bad) we still return EFAULT and don't stamp `nwritten` — wasi
+    * callers treat any non-zero errno as authoritative and ignore the
+    * `nwritten` slot in that case, so this choice is conservative but
+    * spec-compatible. */
+  private def fdWrite(memory: Memory, args: Seq[Value], ctx: WasiContext,
+                      fdTable: FdTable): Seq[Value] =
     args match
       case Seq(I32(fd), I32(iovsPtr), I32(iovsLen), I32(nwrittenPtr)) =>
-        val sink: Option[Int => Unit] = fd match
+        // Pick the destination. Stdio gets a byte-sink callback; opened
+        // files go through [[FsFile.write]] with the linear-memory slice
+        // as the source. EBADF if neither matches — fd 0, preopen fds,
+        // and unallocated table slots all land here.
+        val stdio: Option[Int => Unit] = fd match
           case 1 => Some(ctx.stdout)
           case 2 => Some(ctx.stderr)
           case _ => None
+        val file: Option[FsFile] = lookupFile(fd, ctx, fdTable)
+        if stdio.isEmpty && file.isEmpty then return Seq(I32(EBADF))
 
-        sink match
-          case None => Seq(I32(EBADF))
+        // Chase through `memory.data` once — the interpreter can't
+        // grow memory while a host call is in flight (no wasm code
+        // runs during the call), so caching the array reference for
+        // the duration of this call is safe.
+        val data    = memory.data
+        val dataLen = data.length
 
-          case Some(write) =>
-            // Chase through `memory.data` once — the interpreter can't
-            // grow memory while a host call is in flight (no wasm code
-            // runs during the call), so caching the array reference for
-            // the duration of this call is safe.
-            val data    = memory.data
-            val dataLen = data.length
+        // Validate iovec table bounds up front. `iovs_len` is the
+        // declared element count, so the total table size is
+        // `iovs_len * 8` bytes; we use Long arithmetic for the
+        // bounds check so a malicious i32 multiply can't wrap.
+        val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
+        if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
+          return Seq(I32(EFAULT))
 
-            // Validate iovec table bounds up front. `iovs_len` is the
-            // declared element count, so the total table size is
-            // `iovs_len * 8` bytes; we use Long arithmetic for the
-            // bounds check so a malicious i32 multiply can't wrap.
-            val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
-            if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
-              return Seq(I32(EFAULT))
-
-            var total = 0
-            var i     = 0
-            while i < iovsLen do
-              val iovec = iovsPtr + i * 8
-              val buf   = readI32LE(data, iovec)
-              val len   = readI32LE(data, iovec + 4)
-              val end   = buf.toLong + len.toLong
-              if buf < 0 || len < 0 || end > dataLen then
-                return Seq(I32(EFAULT))
+        var total = 0
+        var i     = 0
+        while i < iovsLen do
+          val iovec = iovsPtr + i * 8
+          val buf   = readI32LE(data, iovec)
+          val len   = readI32LE(data, iovec + 4)
+          val end   = buf.toLong + len.toLong
+          if buf < 0 || len < 0 || end > dataLen then
+            return Seq(I32(EFAULT))
+          stdio match
+            case Some(w) =>
               var j = 0
               while j < len do
-                write(data(buf + j) & 0xff)
+                w(data(buf + j) & 0xff)
                 j += 1
-              total += len
-              i     += 1
+            case None =>
+              // `file` is known non-empty here because the upfront
+              // dispatch returned EBADF otherwise. `.get` is safe.
+              file.get.write(data, buf, len)
+          total += len
+          i     += 1
 
-            // Stash the total count into `nwritten`. Same bounds rule:
-            // if the destination 4 bytes don't fit in memory, the
-            // syscall is malformed and we return EFAULT.
-            if nwrittenPtr < 0 || nwrittenPtr.toLong + 4L > dataLen then
-              return Seq(I32(EFAULT))
-            writeI32LE(data, nwrittenPtr, total)
-            Seq(I32(ESUCCESS))
+        // Stash the total count into `nwritten`. Same bounds rule:
+        // if the destination 4 bytes don't fit in memory, the
+        // syscall is malformed and we return EFAULT.
+        if nwrittenPtr < 0 || nwrittenPtr.toLong + 4L > dataLen then
+          return Seq(I32(EFAULT))
+        writeI32LE(data, nwrittenPtr, total)
+        Seq(I32(ESUCCESS))
 
       case _ => Seq(I32(EINVAL))
 
@@ -1022,53 +1063,135 @@ object WasiContext:
     def named(n: String): Preopen = new Preopen:
       val name: String = n
 
-    /** A preopen backed by an in-memory `Map[String, Array[Byte]]`.
-      * `open(path)` returns the file's bytes wrapped in an `InMemoryFile`
-      * on hit, `Left(Wasi.ENOENT)` on miss. Read-only — `oflags` and
-      * `fdflags` are ignored. This is the test harness Phase 7.E.2 was
-      * designed around; Phase 7.E.4's real-rustc file-reader smoke test
-      * will populate one with the file the Rust program reads.
+    /** A read/write preopen backed by an in-memory map. `open(path)`
+      * returns the file's bytes wrapped in an [[InMemoryFile]] handle;
+      * a miss returns `Left(Wasi.ENOENT)` unless `oflags & OFLAGS_CREAT`
+      * is set, in which case the file is created (size 0) and a fresh
+      * handle is returned. `oflags & OFLAGS_TRUNC` zeroes an existing
+      * file's contents before returning the handle. `fdflags` is
+      * currently ignored — `FDFLAGS_APPEND` and friends are a future
+      * hardening pass. This is the test harness Phases 7.E.2–7.F were
+      * designed around; the 7.F real-rustc file-write smoke test relies
+      * on the CREAT+TRUNC path.
       *
-      * Paths are matched verbatim against the map's keys — no
+      * Returns the concrete [[InMemoryPreopen]] subtype so callers can
+      * reach `.bytesOf(path)` to inspect what the wasi program wrote
+      * after the run. Storing the return as a bare `Preopen` is fine —
+      * the prestat-walk surface still works.
+      *
+      * Paths are matched verbatim against the backing map's keys — no
       * canonicalisation, no `.`/`..` resolution, no leading-slash
       * normalisation. Tests construct keys to match exactly what
       * wasi-libc's `__wasilibc_find_relpath` strips a preopen path
       * down to (e.g. `hello.txt`, not `/sandbox/hello.txt`, when the
       * preopen is `/sandbox`). */
-    def inMemory(n: String, files: Map[String, Array[Byte]]): Preopen =
-      new Preopen:
-        val name: String = n
-        override def open(path: String,
-                          oflags: Int,
-                          fdflags: Int): Either[Int, Wasi.FsFile] =
-          files.get(path) match
-            case Some(bytes) => Right(new InMemoryFile(bytes))
-            case None        => Left(Wasi.ENOENT)
+    def inMemory(n: String,
+                 files: Map[String, Array[Byte]] = Map.empty): InMemoryPreopen =
+      new InMemoryPreopen(n, files)
 
-    /** Read-only in-memory [[Wasi.FsFile]] impl for [[inMemory]].
+    // OFLAGS bits per wasi-preview1's `oflags` (witx-defined). Only the
+    // two `path_open`'s in-memory FS acts on are named here; the
+    // remaining bits (DIRECTORY=2, EXCL=4) flow through unhandled at
+    // this slice, with the InMemoryFs ignoring them. Hardening pass
+    // can enforce.
+    private val OFLAGS_CREAT: Int = 0x0001
+    private val OFLAGS_TRUNC: Int = 0x0008
+
+    /** Read/write in-memory preopen. Files seeded at construction are
+      * cloned defensively; later writes mutate only this preopen's
+      * backing store. Tests inspect post-state via [[bytesOf]] or
+      * [[paths]].
+      *
+      * Storage: each path maps to a [[FileCell]] that holds the live
+      * `var bytes` array. Open file handles ([[InMemoryFile]]) reference
+      * the same cell, so a `write` that grows the buffer is visible to
+      * the preopen's `bytesOf` immediately — and to any other handle
+      * pointing at the same path. This matches POSIX behaviour where
+      * two `open` calls on the same file share the underlying inode. */
+    final class InMemoryPreopen private[wasi] (
+        val name: String,
+        initial:  Map[String, Array[Byte]],
+    ) extends Preopen:
+
+      // LinkedHashMap so `.paths` reports insertion order — useful for
+      // tests that want to assert "exactly one new file appeared in this
+      // order" after a write-heavy run. Clone the initial arrays so the
+      // caller's references stay independent of subsequent in-FS writes.
+      private val cells = scala.collection.mutable.LinkedHashMap.from(
+        initial.toSeq.map { case (k, v) => k -> new FileCell(v.clone()) }
+      )
+
+      override def open(path:    String,
+                        oflags:  Int,
+                        fdflags: Int): Either[Int, Wasi.FsFile] =
+        val creat = (oflags & OFLAGS_CREAT) != 0
+        val trunc = (oflags & OFLAGS_TRUNC) != 0
+        cells.get(path) match
+          case Some(cell) =>
+            if trunc then cell.bytes = new Array[Byte](0)
+            Right(new InMemoryFile(cell))
+          case None =>
+            if !creat then Left(Wasi.ENOENT)
+            else
+              val cell = new FileCell(new Array[Byte](0))
+              cells(path) = cell
+              Right(new InMemoryFile(cell))
+
+      /** Current bytes for `path` after any writes the wasi program
+        * performed. `None` if no file at that key — `Some(Array.empty)`
+        * is a CREAT-flagged open that never wrote anything. */
+      def bytesOf(path: String): Option[Array[Byte]] =
+        cells.get(path).map(_.bytes)
+
+      /** All paths currently in this FS, in insertion order. */
+      def paths: Seq[String] = cells.keys.toSeq
+
+    /** Mutable byte-array cell. Open handles share the cell so a
+      * cursor-advancing write on one handle is observable through the
+      * preopen's `bytesOf` lookup (and through any other handle pointing
+      * at the same path). */
+    private final class FileCell(var bytes: Array[Byte])
+
+    /** In-memory [[Wasi.FsFile]] impl for [[InMemoryPreopen]].
       * `close()` is a no-op — there's no host resource to release.
-      * The cursor starts at 0 and advances on `read`. `seek` is an
-      * unconditional set — `pos > size` is allowed (subsequent reads
-      * then return 0, matching POSIX semantics for lseek past EOF).
+      * The cursor starts at 0 and advances on `read` / `write`. `seek`
+      * is an unconditional set — `pos > size` is allowed (subsequent
+      * reads then return 0, matching POSIX `lseek` past EOF; subsequent
+      * writes grow the file and zero-fill the gap).
+      *
       * Negative cursors can't be reached through the syscall surface
       * (`fd_seek` rejects them with EINVAL before calling), but the
-      * `read` impl still guards against `cursor < 0` so a hand-written
-      * test that pokes the impl directly stays safe. */
-    private final class InMemoryFile(val bytes: Array[Byte]) extends Wasi.FsFile:
+      * `read` and `write` impls still guard against `cursor < 0` so a
+      * hand-written test that pokes the impl directly stays safe. */
+    private final class InMemoryFile(cell: FileCell) extends Wasi.FsFile:
       private var cursor: Long = 0L
       def close(): Unit = ()
-      def size:    Long = bytes.length.toLong
+      def size:    Long = cell.bytes.length.toLong
       def tell:    Long = cursor
       def seek(pos: Long): Unit = cursor = pos
       def read(dst: Array[Byte], offset: Int, length: Int): Int =
+        val bytes = cell.bytes
         if cursor < 0 || cursor >= bytes.length || length <= 0 then 0
         else
-          // bytes.length is Int so the remaining-bytes count fits in Int
-          // once we've ruled out cursor ≥ length above.
           val available = math.min(bytes.length - cursor, length.toLong).toInt
           System.arraycopy(bytes, cursor.toInt, dst, offset, available)
           cursor += available
           available
+      override def write(src: Array[Byte], offset: Int, length: Int): Int =
+        if length <= 0 then return 0
+        val start = if cursor < 0 then 0L else cursor
+        val end   = start + length.toLong
+        if end > cell.bytes.length then
+          // Grow the cell to fit. Java's `new Array[Byte]` is zero-init,
+          // so any gap between the old size and `start` reads back as
+          // zero — POSIX hole semantics, but materialised eagerly because
+          // the InMemoryFs has no sparse-file machinery.
+          val grown = new Array[Byte](end.toInt)
+          System.arraycopy(cell.bytes, 0, grown, 0, cell.bytes.length)
+          cell.bytes = grown
+        System.arraycopy(src, offset, cell.bytes, start.toInt, length)
+        cursor = end
+        length
 
   /** A pair of clocks — wall clock and a non-decreasing monotonic source.
     * Both surfaced as nanoseconds because that's the wasi-preview1 ABI

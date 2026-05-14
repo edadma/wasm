@@ -1,11 +1,15 @@
-;; Phase 7.E.3 + 7.E.4 — fd_read / fd_seek / fd_filestat_get / fd_fdstat_get
-;; passthrough.
+;; Phase 7.E.3 + 7.E.4 + 7.F — fd_read / fd_write / fd_seek /
+;; fd_filestat_get / fd_fdstat_get passthrough.
 ;;
 ;; Tests open a file via call_path_open, plant iovec entries with
 ;; store_i32, drive each syscall via the matching call_* wrapper, and
 ;; read back the destination bytes / new offset / filestat struct with
 ;; load_byte / load_i32 / load_i64. Same generic-fixture shape as
 ;; wasi_path_open.wat — call patterns live in the tests.
+;;
+;; 7.F added call_fd_write so the read/write/seek surface lives in one
+;; instance — tests that exercise the InMemoryFs through path_open
+;; +fd_write don't need a separate fixture.
 ;;
 ;; Memory is 1 page (65536 bytes), exported. Layout convention used by
 ;; the tests:
@@ -22,6 +26,8 @@
     (func $fd_close (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_read"
     (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_seek"
     (func $fd_seek (param i32 i64 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_filestat_get"
@@ -61,6 +67,15 @@
     local.get $iovs_len
     local.get $nread_out
     call $fd_read)
+
+  (func (export "call_fd_write")
+        (param $fd i32) (param $iovs i32) (param $iovs_len i32)
+        (param $nwritten_out i32) (result i32)
+    local.get $fd
+    local.get $iovs
+    local.get $iovs_len
+    local.get $nwritten_out
+    call $fd_write)
 
   (func (export "call_fd_seek")
         (param $fd i32) (param $offset i64) (param $whence i32)
