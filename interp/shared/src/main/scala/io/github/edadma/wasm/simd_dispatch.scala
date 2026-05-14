@@ -33,10 +33,14 @@ import java.lang as jl
   *   - F: 30 float arithmetic ops (rounding ceil/floor/trunc/nearest +
   *     abs/neg/sqrt + add/sub/mul/div + min/max/pmin/pmax — subs
   *     0x67..0x6A, 0x74 / 0x75 / 0x7A / 0x94, 0xE0..0xEB, 0xEC..0xF7).
+  *   - G.1: 15 bitwise + reduction ops (not/and/andnot/or/xor/bitselect
+  *     — subs 0x4D..0x52; any_true 0x53; *.all_true 0x63/0x83/0xA3/0xC3;
+  *     *.bitmask 0x64/0x84/0xA4/0xC4).
   *
-  * Chunks remaining: G (bitwise + comparisons + reductions), H
-  * (narrow/widen + float conversions), I (special — dot product +
-  * load_lane / store_lane).
+  * Chunks remaining: G.2 (the 48 comparison ops — eq/ne/lt/gt/le/ge
+  * across the four int shapes and both float shapes), H (narrow/widen +
+  * float conversions), I (special — dot product + load_lane /
+  * store_lane).
   * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
@@ -807,6 +811,158 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(f64x2BinOp(a, b, (x, y) => if x < y then y else x))
 
+      // === Chunk G.1 — bitwise (6) + reductions (9) ===========================
+      //
+      // Bitwise ops act on the raw 16 bytes regardless of lane shape — five
+      // pure byte-level operations (`not`, `and`, `andnot`, `or`, `xor`) plus
+      // `bitselect` which takes 3 operands `(a, b, c)` and produces
+      // `(a AND c) OR (b AND NOT c)` — c is the selector mask.
+      //
+      // Reductions collapse a v128 down to an i32 result:
+      // `any_true` checks the whole vector for any set bit; `*.all_true` is
+      // shape-aware (every lane non-zero); `*.bitmask` packs the MSB of each
+      // lane into bit position lane_index of the i32 result.
+
+      // --- bitwise -----------------------------------------------------------
+
+      case 0x4D =>                                                                        // v128.not — bitwise complement of all 16 bytes
+        val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = (~a(i)).toByte
+          i += 1
+        valueStack += V128(r)
+
+      case 0x4E =>                                                                        // v128.and
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = (a(i) & b(i)).toByte
+          i += 1
+        valueStack += V128(r)
+
+      case 0x4F =>                                                                        // v128.andnot — a AND (NOT b)
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = (a(i) & ~b(i)).toByte
+          i += 1
+        valueStack += V128(r)
+
+      case 0x50 =>                                                                        // v128.or
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = (a(i) | b(i)).toByte
+          i += 1
+        valueStack += V128(r)
+
+      case 0x51 =>                                                                        // v128.xor
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = (a(i) ^ b(i)).toByte
+          i += 1
+        valueStack += V128(r)
+
+      case 0x52 =>                                                                        // v128.bitselect — (a AND c) OR (b AND NOT c); 3 v128 operands
+        val c = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = ((a(i) & c(i)) | (b(i) & ~c(i))).toByte
+          i += 1
+        valueStack += V128(r)
+
+      // --- reductions --------------------------------------------------------
+
+      case 0x53 =>                                                                        // v128.any_true — any byte non-zero → 1, else 0
+        val a = popV128()
+        f.pc = p1
+        var any = 0; var i = 0
+        while i < 16 do
+          if a(i) != 0 then any = 1
+          i += 1
+        pushI32(any)
+
+      case 0x63 =>                                                                        // i8x16.all_true — every byte non-zero
+        val a = popV128()
+        f.pc = p1
+        var all = 1; var i = 0
+        while i < 16 do
+          if a(i) == 0 then all = 0
+          i += 1
+        pushI32(all)
+
+      case 0x83 =>                                                                        // i16x8.all_true — every i16 lane non-zero
+        val a = popV128()
+        f.pc = p1
+        var all = 1; var ln = 0
+        while ln < 8 do
+          val off = ln * 2
+          if (a(off) == 0) && (a(off + 1) == 0) then all = 0
+          ln += 1
+        pushI32(all)
+
+      case 0xA3 =>                                                                        // i32x4.all_true — every i32 lane non-zero
+        val a = popV128()
+        f.pc = p1
+        var all = 1; var ln = 0
+        while ln < 4 do
+          if readLaneI32(a, ln) == 0 then all = 0
+          ln += 1
+        pushI32(all)
+
+      case 0xC3 =>                                                                        // i64x2.all_true — every i64 lane non-zero
+        val a = popV128()
+        f.pc = p1
+        var all = 1; var ln = 0
+        while ln < 2 do
+          if readLaneI64(a, ln) == 0L then all = 0
+          ln += 1
+        pushI32(all)
+
+      case 0x64 =>                                                                        // i8x16.bitmask — top bit of each byte → 16-bit mask in i32
+        val a = popV128()
+        f.pc = p1
+        var mask = 0; var i = 0
+        while i < 16 do
+          if (a(i) & 0x80) != 0 then mask |= (1 << i)
+          i += 1
+        pushI32(mask)
+
+      case 0x84 =>                                                                        // i16x8.bitmask — sign byte is the high (LE) byte of each i16 lane
+        val a = popV128()
+        f.pc = p1
+        var mask = 0; var ln = 0
+        while ln < 8 do
+          if (a(ln * 2 + 1) & 0x80) != 0 then mask |= (1 << ln)
+          ln += 1
+        pushI32(mask)
+
+      case 0xA4 =>                                                                        // i32x4.bitmask
+        val a = popV128()
+        f.pc = p1
+        var mask = 0; var ln = 0
+        while ln < 4 do
+          if (readLaneI32(a, ln) & 0x80000000) != 0 then mask |= (1 << ln)
+          ln += 1
+        pushI32(mask)
+
+      case 0xC4 =>                                                                        // i64x2.bitmask
+        val a = popV128()
+        f.pc = p1
+        var mask = 0; var ln = 0
+        while ln < 2 do
+          if (readLaneI64(a, ln) & 0x8000000000000000L) != 0L then mask |= (1 << ln)
+          ln += 1
+        pushI32(mask)
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -1226,6 +1382,15 @@ private[wasm] object SimdDispatch:
            0xEC | 0xED | 0xEF |                                                   // f64x2  abs/neg/sqrt
            0xF0 | 0xF1 | 0xF2 | 0xF3 |                                            // f64x2  add/sub/mul/div
            0xF4 | 0xF5 | 0xF6 | 0xF7 =>                                           // f64x2  min/max/pmin/pmax
+        Right(p1)
+
+      // Chunk G.1 — bitwise (incl. ternary bitselect) + reductions.
+      // All 15 ops are no-immediate; operand count differences are
+      // handled at the validator and stepFd levels.
+      case 0x4D | 0x4E | 0x4F | 0x50 | 0x51 | 0x52 |                              // v128.not/and/andnot/or/xor/bitselect
+           0x53 |                                                                 // v128.any_true
+           0x63 | 0x83 | 0xA3 | 0xC3 |                                            // *.all_true
+           0x64 | 0x84 | 0xA4 | 0xC4 =>                                           // *.bitmask
         Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))

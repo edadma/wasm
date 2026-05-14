@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, and F are shipped.** Chunks G..I add bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, and G.1 are shipped.** The remainder (chunk G.2 comparison ops, H narrow/widen + conversions, I dot/lane mem ops) is still to come.
 
 ### Foundations (Chunk A — done)
 
@@ -224,6 +224,30 @@ Lane-wise IEEE-754 arithmetic across `f32x4` and `f64x2`. Rounding (`ceil`, `flo
 | `f64x2.min` / `max` | `0xF4` / `0xF5` | |
 | `f64x2.pmin` / `pmax` | `0xF6` / `0xF7` | |
 
+### Bitwise + reductions (Chunk G.1 — done)
+
+Six bitwise ops that ignore lane shape (the v128 is just 16 raw bytes), plus nine v128 → i32 reductions. `v128.bitselect` is the only SIMD ternary op — it takes three v128 operands `(a, b, c)` and returns `(a AND c) OR (b AND NOT c)`, where `c` is the selector mask. All 15 ops have no immediate past the sub-opcode.
+
+`any_true` is shape-agnostic — any byte non-zero returns `1`, otherwise `0`. `*.all_true` is lane-shape-aware: a v128 whose bytes are `[0, 1, 0, 1, 0, 1, ...]` is `i8x16.all_true = 0` (every other byte is zero) but `i16x8.all_true = 1` (every 16-bit lane is non-zero). `*.bitmask` packs the MSB of each lane into the i32 result at the lane-indexed bit position (lane 0 → bit 0).
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `v128.not` | `0x4D` | Bitwise complement of all 16 bytes. |
+| `v128.and` | `0x4E` | Bitwise AND. |
+| `v128.andnot` | `0x4F` | `a AND (NOT b)` — note the asymmetry. |
+| `v128.or` | `0x50` | Bitwise OR. |
+| `v128.xor` | `0x51` | Bitwise XOR. |
+| `v128.bitselect` | `0x52` | `(a AND c) OR (b AND NOT c)`; ternary. |
+| `v128.any_true` | `0x53` | `1` if any bit is set, else `0`. |
+| `i8x16.all_true` | `0x63` | `1` iff every byte is non-zero. |
+| `i16x8.all_true` | `0x83` | `1` iff every 16-bit lane is non-zero. |
+| `i32x4.all_true` | `0xA3` | `1` iff every i32 lane is non-zero. |
+| `i64x2.all_true` | `0xC3` | `1` iff both i64 lanes are non-zero. |
+| `i8x16.bitmask` | `0x64` | Top bit of each byte → 16-bit mask in i32. |
+| `i16x8.bitmask` | `0x84` | Top bit of each i16 lane → 8-bit mask. |
+| `i32x4.bitmask` | `0xA4` | Top bit of each i32 lane → 4-bit mask. |
+| `i64x2.bitmask` | `0xC4` | Top bit of each i64 lane → 2-bit mask. |
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -239,7 +263,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks G..I) |
+| SIMD remainder | comparisons (G.2), narrow/widen + conversions (H), dot product + lane mem ops (I) | in progress (8.E, chunks G.2..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
