@@ -430,9 +430,9 @@ object Interpreter:
               case _  => Left(WasmError.UnknownOpcode(0xfc))
       case 0xfd =>
         // 0xFD is the SIMD opcode prefix (Phase 8.E). Sub-opcode is LEB
-        // u32. Chunk A only handles `v128.const` (sub 12), with a 16-
-        // byte raw-literal immediate after the sub-opcode. Subsequent
-        // chunks will fan this out as the surface grows.
+        // u32. Chunks A + B: `v128.const` (sub 12) carries a 16-byte
+        // raw literal; loads (subs 0..10, 92, 93) and the store (sub
+        // 11) all carry a memarg, same shape as the scalar loads/stores.
         Leb128.readU32(body, pc + 1) match
           case Left(e)          => Left(e)
           case Right((sub, p1)) =>
@@ -442,6 +442,13 @@ object Interpreter:
                 if end > body.length then
                   Left(WasmError.InvalidModule(s"truncated v128.const literal at $pc"))
                 else Right(end)
+
+              // Chunk B — every load + store carries a memarg.
+              case 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 92 | 93 =>
+                readMemArg(body, p1) match
+                  case Left(e)             => Left(e)
+                  case Right((_, pAfter))  => Right(pAfter)
+
               case _ => Left(WasmError.UnknownOpcode(0xfd))
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -585,6 +592,16 @@ final class Interpreter private[wasm] (
     valueStack.remove(valueStack.size - 1) match
       case F64(v) => v
       case _      => fail(WasmError.TypeMismatch)
+
+  /** Phase 8.E: pop a V128 from the operand stack and return its 16-byte
+    * little-endian payload. The returned array is the value's own backing
+    * store — callers that mutate it (e.g. lane-replace ops) MUST clone
+    * first. Read-only callers (stores, lane extracts) can use it directly. */
+  private inline def popV128(): Array[Byte] =
+    if valueStack.isEmpty then fail(WasmError.TypeMismatch)
+    valueStack.remove(valueStack.size - 1) match
+      case V128(bs) => bs
+      case _        => fail(WasmError.TypeMismatch)
 
   private inline def popValue(): Value =
     if valueStack.isEmpty then fail(WasmError.TypeMismatch)
@@ -1773,6 +1790,10 @@ final class Interpreter private[wasm] (
   private def stepFd(f: Frame): Unit =
     val body = f.func.body
     val (sub, p1) = readU32At(f, f.pc + 1)
+    // Advance past the LEB-encoded sub-opcode so subsequent immediate
+    // reads (memarg, lane index, raw literal, ...) start at `f.pc + 0`.
+    // `readMemArgAt` below uses `p1` directly to keep the entry pattern
+    // identical for every chunk-B-and-beyond opcode.
     sub match
       case 12 =>                                                                          // v128.const
         // Encoding: 0xFD 0x0C followed by 16 raw bytes (little-endian).
@@ -1786,8 +1807,137 @@ final class Interpreter private[wasm] (
         f.pc = end
         valueStack += V128(bits)
 
+      // === Chunk B — loads ====================================================
+
+      case 0 =>                                                                           // v128.load : 16-byte aligned load
+        val memArg = readMemArgAt(f, p1)
+        val mem    = memArgMemory(memArg)
+        val addr   = (popI32() & 0xffffffffL) + memArg.offset
+        boundsCheck(mem, addr, 16)
+        val bits = new Array[Byte](16)
+        System.arraycopy(mem.data, addr.toInt, bits, 0, 16)
+        valueStack += V128(bits)
+
+      case 1 =>                                                                           // v128.load8x8_s
+        loadExtPair(f, p1, width = 1, signed = true,  outLaneBytes = 2)
+      case 2 =>                                                                           // v128.load8x8_u
+        loadExtPair(f, p1, width = 1, signed = false, outLaneBytes = 2)
+      case 3 =>                                                                           // v128.load16x4_s
+        loadExtPair(f, p1, width = 2, signed = true,  outLaneBytes = 4)
+      case 4 =>                                                                           // v128.load16x4_u
+        loadExtPair(f, p1, width = 2, signed = false, outLaneBytes = 4)
+      case 5 =>                                                                           // v128.load32x2_s
+        loadExtPair(f, p1, width = 4, signed = true,  outLaneBytes = 8)
+      case 6 =>                                                                           // v128.load32x2_u
+        loadExtPair(f, p1, width = 4, signed = false, outLaneBytes = 8)
+
+      case 7 =>                                                                           // v128.load8_splat
+        loadSplat(f, p1, width = 1)
+      case 8 =>                                                                           // v128.load16_splat
+        loadSplat(f, p1, width = 2)
+      case 9 =>                                                                           // v128.load32_splat
+        loadSplat(f, p1, width = 4)
+      case 10 =>                                                                          // v128.load64_splat
+        loadSplat(f, p1, width = 8)
+
+      case 92 =>                                                                          // v128.load32_zero
+        loadZero(f, p1, width = 4)
+      case 93 =>                                                                          // v128.load64_zero
+        loadZero(f, p1, width = 8)
+
+      // === Chunk B — store ====================================================
+
+      case 11 =>                                                                          // v128.store : 16-byte aligned store
+        val memArg = readMemArgAt(f, p1)
+        val mem    = memArgMemory(memArg)
+        val bits   = popV128()
+        val addr   = (popI32() & 0xffffffffL) + memArg.offset
+        boundsCheck(mem, addr, 16)
+        System.arraycopy(bits, 0, mem.data, addr.toInt, 16)
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
+
+  /** Read a memarg starting at byte position `pos` in the current body,
+    * advance `f.pc` past it, and return the immediate. Used by stepFd
+    * after the LEB sub-opcode has already been decoded. */
+  private inline def readMemArgAt(f: Frame, pos: Int): MemArg =
+    Interpreter.readMemArg(f.func.body, pos) match
+      case Left(e) => fail(e)
+      case Right((memArg, p)) =>
+        f.pc = p
+        memArg
+
+  /** Splat load: read `width` bytes from memory, broadcast across the
+    * resulting 16-byte vector (16/width copies). `width` ∈ {1,2,4,8}.
+    * `memArgPos` is the byte position right after the LEB sub-opcode,
+    * where the memarg immediate starts. */
+  private def loadSplat(f: Frame, memArgPos: Int, width: Int): Unit =
+    val memArg = readMemArgAt(f, memArgPos)
+    val mem    = memArgMemory(memArg)
+    val addr   = (popI32() & 0xffffffffL) + memArg.offset
+    boundsCheck(mem, addr, width)
+    val bits = new Array[Byte](16)
+    val a    = addr.toInt
+    var i    = 0
+    while i < 16 do
+      bits(i) = mem.data(a + (i % width))
+      i += 1
+    valueStack += V128(bits)
+
+  /** Zero-extending lane load: read `width` bytes from memory into lane 0
+    * of the result vector; the remaining 16 − width bytes are zero.
+    * `width` ∈ {4, 8}. */
+  private def loadZero(f: Frame, memArgPos: Int, width: Int): Unit =
+    val memArg = readMemArgAt(f, memArgPos)
+    val mem    = memArgMemory(memArg)
+    val addr   = (popI32() & 0xffffffffL) + memArg.offset
+    boundsCheck(mem, addr, width)
+    val bits = new Array[Byte](16)
+    System.arraycopy(mem.data, addr.toInt, bits, 0, width)
+    valueStack += V128(bits)
+
+  /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
+    * 8/width source lanes, and widen each into a `outLaneBytes`-byte
+    * destination lane. `width` ∈ {1,2,4}, `outLaneBytes = width * 2`. */
+  private def loadExtPair(f: Frame, memArgPos: Int, width: Int, signed: Boolean, outLaneBytes: Int): Unit =
+    val memArg = readMemArgAt(f, memArgPos)
+    val mem    = memArgMemory(memArg)
+    val addr   = (popI32() & 0xffffffffL) + memArg.offset
+    boundsCheck(mem, addr, 8)
+    val bits     = new Array[Byte](16)
+    val a        = addr.toInt
+    val laneCount = 8 / width
+    var lane     = 0
+    while lane < laneCount do
+      // Read this lane's `width` bytes as a signed/unsigned integer, then
+      // splat back out into `outLaneBytes` little-endian bytes.
+      val srcOff = a + lane * width
+      val v: Long =
+        width match
+          case 1 =>
+            val b = mem.data(srcOff) & 0xff
+            if signed then (b << 24 >> 24).toLong else b.toLong
+          case 2 =>
+            val raw = (mem.data(srcOff) & 0xff) | ((mem.data(srcOff + 1) & 0xff) << 8)
+            if signed then ((raw << 16) >> 16).toLong else (raw & 0xffffL)
+          case 4 =>
+            val raw =
+              (mem.data(srcOff)     & 0xff)        |
+              ((mem.data(srcOff + 1) & 0xff) <<  8) |
+              ((mem.data(srcOff + 2) & 0xff) << 16) |
+              ((mem.data(srcOff + 3) & 0xff) << 24)
+            if signed then raw.toLong else (raw.toLong & 0xffffffffL)
+          case _ =>
+            // Defensive: only 1/2/4 are valid pair-load widths.
+            fail(WasmError.InvalidModule(s"invalid pair-load width $width"))
+      val dstOff = lane * outLaneBytes
+      var i      = 0
+      while i < outLaneBytes do
+        bits(dstOff + i) = ((v >>> (i * 8)) & 0xff).toByte
+        i += 1
+      lane += 1
+    valueStack += V128(bits)
 
   // === Control-flow helpers ===============================================
 
