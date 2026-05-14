@@ -550,6 +550,30 @@ object Validator:
             pushVal(b)
           case (AbsValue.Unknown, AbsValue.Unknown)  => pushVal(AbsValue.Unknown)
 
+      case 0x1c =>                                                              // select t* (typed)
+        // Encoding: vec(valtype). Per the wasm-3.0 spec the vector has
+        // length exactly 1 — multi-value `select` isn't enabled by any
+        // shipped proposal. The typed form is what reftype operands
+        // must use (the untyped `select` (0x1B) rejects them above).
+        val count = readU32()
+        if count != 1 then
+          fail(s"select t*: vector length $count, expected 1")
+        if pc >= body.length then fail("truncated select t* valtype")
+        val tb = body(pc) & 0xff
+        pc += 1
+        val t = tb match
+          case 0x7f => ValueType.I32Type
+          case 0x7e => ValueType.I64Type
+          case 0x7d => ValueType.F32Type
+          case 0x7c => ValueType.F64Type
+          case 0x70 => ValueType.FuncRefType
+          case 0x6f => ValueType.ExternRefType
+          case other => fail(s"select t*: unknown valtype byte 0x${other.toHexString}")
+        popVal(ValueType.I32Type)                                               // cond
+        popVal(t)                                                               // b
+        popVal(t)                                                               // a
+        pushVal(t)
+
       // === Phase 8.C: reference-types ====================================
       //
       // Five new top-level opcodes — ref.null / ref.is_null / ref.func plus

@@ -29,6 +29,11 @@ htmlDir         = ""
 # Bump when cutting a new release.
 version         = "v0.0.1"
 
+# Renders the "Get started" CTA in the landing-page hero, linking to
+# /getting-started/. Without this flag the juicerdocs template skips
+# the button entirely.
+getStarted      = true
+
 # Brand palette — violet, evoking the WebAssembly logo lineage without
 # copying it outright. Distinct from juicer's plum, squiggly's cyan, and
 # markdown's slate, so the four sites read as siblings.

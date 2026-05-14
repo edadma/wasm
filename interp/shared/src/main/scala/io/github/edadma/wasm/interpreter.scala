@@ -106,8 +106,11 @@ object Interpreter:
       meta: BodyMeta,
   ) extends ResolvedFunc
 
-  /** A function supplied by the host. */
-  final case class HostBound(signature: FuncType, fn: HostFunc) extends ResolvedFunc
+  /** A function supplied by the host. The runtime normalises both
+    * `HostFunc` (single-memory) and `HostFuncMulti` (multi-memory) at
+    * import-resolution time into this shared multi-memory shape, so
+    * the per-call dispatch path is uniform. */
+  final case class HostBound(signature: FuncType, fn: HostFuncMulti) extends ResolvedFunc
 
   // === Phase 8.D: multi-memory memarg ======================================
 
@@ -266,6 +269,13 @@ object Interpreter:
     op match
       case 0x00 | 0x01 | 0x0f | 0x1a | 0x1b =>             // unreachable, nop, return, drop, select
         Right(pc + 1)
+      case 0x1c =>                                         // select t* (typed) — u32 count + count valtype bytes
+        Leb128.readU32(body, pc + 1).flatMap { case (count, p) =>
+          val end = p + count
+          if end > body.length then
+            Left(WasmError.InvalidModule(s"truncated select t* immediates at $pc"))
+          else Right(end)
+        }
       case 0x0c | 0x0d | 0x10 |                            // br, br_if, call
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
            0x23 | 0x24 |                                   // global.{get,set}
@@ -492,6 +502,14 @@ final class Interpreter private[wasm] (
 ):
   import Interpreter.*
 
+  /** Immutable view over [[memories]] passed to multi-memory host
+    * functions (HostFuncMulti). Single-memory hosts (HostFunc) are
+    * wrapped at import resolution time and never see this; the view
+    * exists purely so multi-memory hosts can index any declared
+    * memory without the runtime exposing the underlying array. */
+  private val memoriesView: IndexedSeq[Memory] =
+    scala.collection.immutable.ArraySeq.unsafeWrapArray(memories)
+
   private val valueStack = ArrayBuffer.empty[Value]
   private val frames     = ArrayBuffer.empty[Frame]
 
@@ -705,6 +723,21 @@ final class Interpreter private[wasm] (
         val a    = popValue()
         valueStack += (if cond != 0 then a else b)
         f.pc += 1
+
+      case 0x1c =>                                                                        // select t* (typed)
+        // Vector of valtypes (count == 1 per spec); the validator
+        // checked the operand types + range-checked the valtype byte,
+        // so the runtime just walks past the immediates and does the
+        // same operand-stack rotation as untyped select.
+        val (count, p1) = readU32At(f, f.pc + 1)
+        val newPc = p1 + count                                                            // skip `count` valtype bytes
+        if newPc > body.length then
+          fail(WasmError.InvalidModule(s"truncated select t* immediates at ${f.pc}"))
+        f.pc = newPc
+        val cond = popI32()
+        val b    = popValue()
+        val a    = popValue()
+        valueStack += (if cond != 0 then a else b)
 
       // === variables =====================================================
 
@@ -1757,13 +1790,13 @@ final class Interpreter private[wasm] (
         val args = new Array[Value](n)
         var k    = n - 1
         while k >= 0 do { args(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
-        // Host functions take the implicit "memory 0" handle. Phase 8.D
-        // multi-memory introspection is host-side only — host modules
-        // wanting access to memidx > 0 can reach through ModuleInstance
-        // separately; the per-call HostFunc surface keeps the MVP
-        // contract for backwards compat. memories.length is always >= 1
-        // (zero-memory modules get a synthetic zero-page placeholder).
-        val results = fn(memories(0), args.toSeq)
+        // The HostBound shape is normalised to multi-memory at import
+        // resolution time — single-memory imports are wrapped so they
+        // see only `mems.head`. memoriesView is an immutable ArraySeq
+        // wrapper over the interpreter's Array[Memory] (which is
+        // always length >= 1; zero-memory modules get a synthetic
+        // zero-page placeholder so memoriesView.head is safe).
+        val results = fn(memoriesView, args.toSeq)
         if results.size != sig.results.size then fail(WasmError.TypeMismatch)
         results.foreach(valueStack += _)
 

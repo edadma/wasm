@@ -166,20 +166,40 @@ object Runtime:
       case Right(()) => ()
       case Left(e)   => fail(e)
 
-    val hosts: Map[String, Map[String, HostFunc]] =
+    // Phase 8.D follow-up: two parallel HostModule surfaces.
+    //   `functions`      — single-memory host functions (HostFunc).
+    //   `functionsMulti` — multi-memory-aware host functions (HostFuncMulti).
+    // A name present in both maps resolves to the multi-memory form;
+    // single-memory functions are normalised by wrapping at resolution
+    // time so the interpreter's HostBound dispatch path is uniform
+    // (always HostFuncMulti). WASI and EnvModule predate this surface
+    // and continue to expose only `functions` — they take memidx 0
+    // implicitly through the wrapper below.
+    val hostsSingle: Map[String, Map[String, HostFunc]] =
       hostModules.iterator.map(m => m.name -> m.functions).toMap
+    val hostsMulti: Map[String, Map[String, HostFuncMulti]] =
+      hostModules.iterator.map(m => m.name -> m.functionsMulti).toMap
 
     val funcs = ArrayBuffer.empty[Interpreter.ResolvedFunc]
 
     // === imports ============================================================
     module.imports.foreach { imp =>
-      val fn = hosts.get(imp.module).flatMap(_.get(imp.name))
-        .getOrElse(fail(WasmError.UnknownImport(imp.module, imp.name)))
+      val multi  = hostsMulti.get(imp.module).flatMap(_.get(imp.name))
+      val single = hostsSingle.get(imp.module).flatMap(_.get(imp.name))
+      val resolved: HostFuncMulti = (multi, single) match
+        case (Some(m), _) => m
+        case (_, Some(s)) =>
+          // Wrap a single-memory function so the interpreter sees the
+          // uniform multi-memory shape. memoriesView.head is always the
+          // first memory (and the only memory in any single-memory
+          // module — which is what `s` was written against).
+          (mems, args) => s(mems.head, args)
+        case _ => fail(WasmError.UnknownImport(imp.module, imp.name))
       if imp.typeIdx < 0 || imp.typeIdx >= module.types.length then
         fail(WasmError.InvalidModule(
           s"import ${imp.module}.${imp.name} references type ${imp.typeIdx}",
         ))
-      funcs += Interpreter.HostBound(module.types(imp.typeIdx), fn)
+      funcs += Interpreter.HostBound(module.types(imp.typeIdx), resolved)
     }
 
     // === defined functions ==================================================
