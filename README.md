@@ -2,9 +2,12 @@
 
 A WebAssembly interpreter for Scala 3 with a WASI Preview 1 host shim and a small CLI. All three pieces are cross-platform (JVM, Scala.js, Scala Native) and share one codebase.
 
+![Maven Central](https://img.shields.io/maven-central/v/io.github.edadma/wasm_sjs1_3)
 [![Last Commit](https://img.shields.io/github/last-commit/edadma/wasm)](https://github.com/edadma/wasm/commits)
 ![GitHub](https://img.shields.io/github/license/edadma/wasm)
 ![Scala Version](https://img.shields.io/badge/Scala-3.8.3-blue.svg)
+![ScalaJS Version](https://img.shields.io/badge/Scala.js-1.21.0-blue.svg)
+![Scala Native Version](https://img.shields.io/badge/Scala_Native-0.5.11-blue.svg)
 
 ## Documentation
 
