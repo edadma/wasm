@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, and D are shipped.** Chunks E..I add shifts + min/max, float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, and E are shipped.** Chunks F..I add float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, and the special dot/lane mem ops.
 
 ### Foundations (Chunk A — done)
 
@@ -173,6 +173,29 @@ Lane-wise integer arithmetic across every integer shape. Plain `add` / `sub` / `
 
 Sub-opcodes ≥ `0x80` encode as 2-byte LEBs in the binary; `wat2wasm` emits the right shape, and the dispatch's LEB decoder handles either width transparently.
 
+### Shifts + min/max (Chunk E — done)
+
+Lane-wise shifts (`shl`, `shr_s`, `shr_u`) on all four integer shapes, plus per-lane signed and unsigned min/max on `i8x16`, `i16x8`, `i32x4` (the spec excludes `i64x2.min/max`). Shifts pop the i32 count from the operand stack — it's *not* an immediate — and the spec takes `count mod lane_width`, so e.g. `i8x16.shl(_, 8)` is the identity.
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `i8x16.shl` | `0x6B` | Shift left; count mod 8. |
+| `i8x16.shr_s` / `_u` | `0x6C` / `0x6D` | Arithmetic / logical right shift; count mod 8. |
+| `i8x16.min_s` / `_u` | `0x76` / `0x77` | Per-lane signed / unsigned minimum. |
+| `i8x16.max_s` / `_u` | `0x78` / `0x79` | Per-lane signed / unsigned maximum. |
+| `i16x8.shl` | `0x8B` | Shift left; count mod 16. |
+| `i16x8.shr_s` / `_u` | `0x8C` / `0x8D` | Arithmetic / logical right shift; count mod 16. |
+| `i16x8.min_s` / `_u` | `0x96` / `0x97` | Per-lane signed / unsigned minimum. |
+| `i16x8.max_s` / `_u` | `0x98` / `0x99` | Per-lane signed / unsigned maximum. |
+| `i32x4.shl` | `0xAB` | Shift left; count mod 32. |
+| `i32x4.shr_s` / `_u` | `0xAC` / `0xAD` | Arithmetic / logical right shift; count mod 32. |
+| `i32x4.min_s` / `_u` | `0xB6` / `0xB7` | Per-lane signed / unsigned minimum. |
+| `i32x4.max_s` / `_u` | `0xB8` / `0xB9` | Per-lane signed / unsigned maximum. |
+| `i64x2.shl` | `0xCB` | Shift left; count mod 64. |
+| `i64x2.shr_s` / `_u` | `0xCC` / `0xCD` | Arithmetic / logical right shift; count mod 64. |
+
+The signed vs unsigned distinction matters at the lane width: byte `0xFF` is `-1` signed but `255` unsigned, so `i8x16.shr_s` of it stays `-1` while `i8x16.shr_u` of it becomes `0x7F`; `i8x16.min_s` picks `-1` as the minimum but `i8x16.min_u` picks `0`.
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -188,7 +211,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | shifts + min/max, float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks E..I) |
+| SIMD remainder | float arithmetic, bitwise + comparisons + reductions, narrow/widen + conversions, dot product, lane mem ops | in progress (8.E, chunks F..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
