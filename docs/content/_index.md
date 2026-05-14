@@ -2,7 +2,7 @@
 title: wasm
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: WebAssembly Core MVP plus sign-extension, full bulk-memory, and non-trapping float-to-int — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: WebAssembly Core MVP plus sign-extension, full bulk-memory, non-trapping float-to-int, and reference types — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**441 tests** on the JVM (275 interpreter + 157 WASI + 9 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
+**463 tests** on the JVM (297 interpreter + 157 WASI + 9 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
 
 ## Try it
 

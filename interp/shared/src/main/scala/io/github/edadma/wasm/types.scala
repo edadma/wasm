@@ -2,9 +2,11 @@ package io.github.edadma.wasm
 
 /** WebAssembly value types and the runtime values that inhabit them.
   *
-  * `Value` and `ValueType` are sealed hierarchies covering all four MVP
-  * scalar types: I32, I64, F32, F64. Future reference / vector types extend
-  * the hierarchies without breaking the binary API.
+  * `Value` and `ValueType` are sealed hierarchies covering the four MVP
+  * scalar types — I32, I64, F32, F64 — plus the two reference kinds added
+  * by the reference-types proposal (Phase 8.C): funcref and externref.
+  * Vector types (SIMD v128) will extend the hierarchies further without
+  * breaking the binary API.
   */
 
 sealed trait Value
@@ -13,11 +15,59 @@ final case class I64(value: Long)   extends Value
 final case class F32(value: Float)  extends Value
 final case class F64(value: Double) extends Value
 
+/** A typed null reference. `refType` distinguishes a funcref-null from an
+  * externref-null, since the spec's `ref.is_null` is polymorphic over both
+  * but `table.set` is not (an externref-null can't go into a funcref table).
+  */
+final case class RefNull(refType: RefType) extends Value
+
+/** A non-null funcref pointing at the module's `funcIdx`-th function
+  * (imports first, then defined). Comes from `ref.func` and from active /
+  * passive element segments. */
+final case class RefFunc(funcIdx: Int) extends Value
+
+/** A non-null externref carrying an opaque host object. Wasm code can
+  * only move externrefs around (`table.{get,set}`, `local.{get,set}`,
+  * `ref.is_null`) — it can't inspect or call them. The host hands them in
+  * and pulls them back out through the public API. */
+final case class RefExtern(value: AnyRef) extends Value
+
+/** The two reference kinds in the reference-types proposal. The wire
+  * encoding is `0x70` for funcref and `0x6F` for externref (both fit in
+  * the `ValueType` LEB-byte slot). */
+enum RefType:
+  case FuncRef
+  case ExternRef
+
+object RefType:
+  /** Reverse of the wire-byte encoding. Used by the parser when reading
+    * table reftype, element-segment reftype, ref.null immediate, and
+    * blocktype byte. Anything else is the caller's responsibility to
+    * reject — this is a strict mapper. */
+  def fromByte(b: Int): Option[RefType] = b match
+    case 0x70 => Some(FuncRef)
+    case 0x6f => Some(ExternRef)
+    case _    => None
+
+  def toByte(r: RefType): Int = r match
+    case FuncRef   => 0x70
+    case ExternRef => 0x6f
+
 enum ValueType:
   case I32Type
   case I64Type
   case F32Type
   case F64Type
+  case FuncRefType
+  case ExternRefType
+
+object ValueType:
+  /** Convert a [[RefType]] into the matching `ValueType`. The validator's
+    * abstract operand stack uses `ValueType` uniformly, so reftypes need
+    * to be liftable into it. */
+  def fromRef(r: RefType): ValueType = r match
+    case RefType.FuncRef   => FuncRefType
+    case RefType.ExternRef => ExternRefType
 
 /** A function signature — vector of param types in, vector of result types out.
   * MVP allows at most one result type. */
@@ -35,52 +85,53 @@ final case class TableExport(name: String, tableIdx: Int)   extends Export
 
 final case class MemoryLimits(min: Int, max: Option[Int])
 
-/** A module-defined table. MVP allows funcref (`0x70`) only; the `refType`
-  * byte is stored verbatim so a future externref pass can recognise the
-  * historical 0x6f without re-parsing. `min` is the initial slot count;
-  * any slot the element segments don't cover starts as a null funcref
-  * (encoded at the runtime as the int `-1`).
+/** A module-defined table. Phase 8.C surfaces externref tables (`0x6F`)
+  * alongside funcref (`0x70`); the [[RefType]] carries the distinction.
+  * `min` is the initial slot count; any slot the element segments don't
+  * cover starts as a typed null (`RefNull(refType)`).
   *
   * Imported tables are not represented yet (Phase 5 alongside imported
   * globals).
   */
-final case class Table(refType: Int, min: Int, max: Option[Int])
+final case class Table(refType: RefType, min: Int, max: Option[Int])
 
-/** An element segment. Phase 8.B extends the MVP active-only shape with
-  * passive + declarative variants so `table.init` / `elem.drop` have
-  * something to address. The funcref/funcidx encoding is shared by all
-  * three forms (the elemexpr-bearing flags 4..7 are reference-types-
-  * proposal territory and stay rejected by the parser).
+/** An element segment. Phase 8.B added passive + declarative variants
+  * alongside the MVP active form so `table.init` / `elem.drop` had
+  * something to address. Phase 8.C generalises the payload from
+  * `Vector[Int]` (funcidxs only) to `Vector[Value]` carrying typed
+  * reference values — either `RefFunc(idx)` for funcref entries or
+  * `RefNull(refType)` for null entries (externref segments are also
+  * representable). Each segment carries its element [[RefType]] so the
+  * validator can enforce table-vs-segment compatibility on `table.init`.
   *
-  *   Active     — flag 0 / flag 2 in the binary; copied into
-  *                `tables(tableIdx)` at `offset` during instantiation
-  *                (current behaviour). Still referenceable by elemidx
-  *                from `table.init`, but post-instantiation the segment
-  *                is treated as "dropped" — `table.init` with n>0 on
-  *                an active segment traps OOB by design.
-  *   Passive    — flag 1; bytes stay around as an elemidx-addressable
-  *                table fragment. `table.init` copies; `elem.drop`
-  *                marks it as effectively empty.
-  *   Declarative — flag 3; the spec describes this as a "no-op at
-  *                instantiation, no-op at run time" marker used to
-  *                pre-declare funcrefs that `ref.func` would otherwise
-  *                fail to resolve. Until Phase 8.C (reference types)
-  *                lands `ref.func`, declarative segments are
-  *                accepted-and-ignored at the type level. */
+  *   Active      — flag 0 / 2 / 4 / 6: copied into `tables(tableIdx)` at
+  *                 `offset` during instantiation. Post-init the segment
+  *                 is treated as "dropped" — `table.init` with n > 0 on
+  *                 an active segment traps OOB by design.
+  *   Passive     — flag 1 / 5: refs stay addressable by elemidx until
+  *                 `elem.drop`.
+  *   Declarative — flag 3 / 7: pre-declares funcrefs for `ref.func`
+  *                 resolution; runtime treats as dropped. Phase 8.C
+  *                 enforces that any `ref.func funcidx` reference at
+  *                 validation time names a declared funcidx (declared
+  *                 via a declarative segment, an export, the start
+  *                 function, or another element segment's payload).
+  */
 sealed trait ElementSegment:
-  def funcIndices: Vector[Int]
+  def refType: RefType
+  def refs:    Vector[Value]
 
 object ElementSegment:
-  /** Active: copy `funcIndices` into `tables(tableIdx)` at `offset` at
+  /** Active: copy `refs` into `tables(tableIdx)` at `offset` at
     * instantiation. The runtime then marks this segment "dropped" so
     * subsequent `table.init` with n > 0 traps. */
-  final case class Active(tableIdx: Int, offset: Int, funcIndices: Vector[Int]) extends ElementSegment
+  final case class Active(tableIdx: Int, offset: Int, refType: RefType, refs: Vector[Value]) extends ElementSegment
 
-  /** Passive: indices remain addressable by elemidx until `elem.drop`. */
-  final case class Passive(funcIndices: Vector[Int]) extends ElementSegment
+  /** Passive: refs remain addressable by elemidx until `elem.drop`. */
+  final case class Passive(refType: RefType, refs: Vector[Value]) extends ElementSegment
 
   /** Declarative: parsed for `ref.func` pre-declaration; runtime no-op. */
-  final case class Declarative(funcIndices: Vector[Int]) extends ElementSegment
+  final case class Declarative(refType: RefType, refs: Vector[Value]) extends ElementSegment
 
 /** A module-defined global. The init expression is evaluated at parse time
   * for the MVP-style `*.const` form and stored directly here as `initialValue`;

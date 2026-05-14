@@ -46,6 +46,7 @@ object InterpreterTest:
     Leb128Tests.run()
     ParserAndRuntimeTests.run()
     MultiValueAndStartTests.run()
+    RefTypesTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

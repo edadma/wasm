@@ -155,7 +155,21 @@ object Parser:
       case 0x7e => ValueType.I64Type
       case 0x7d => ValueType.F32Type
       case 0x7c => ValueType.F64Type
+      // Reference-types proposal (Phase 8.C): funcref / externref now
+      // appear as valtypes alongside the four scalar types — they're
+      // legal in function signatures, local declarations, and global
+      // value types.
+      case 0x70 => ValueType.FuncRefType
+      case 0x6f => ValueType.ExternRefType
       case b    => fail(WasmError.InvalidModule(s"unknown valtype 0x${b.toHexString}"))
+
+  /** Read a [[RefType]] byte (0x70 funcref / 0x6F externref). Used by
+    * Section 4 (tables), Section 9 (element segments), and `ref.null`'s
+    * immediate. Anything else is an `InvalidModule`. */
+  private def readRefType(c: Cursor, context: String): RefType =
+    val b = c.readByte()
+    RefType.fromByte(b).getOrElse(
+      fail(WasmError.InvalidModule(s"$context: unknown reftype 0x${b.toHexString} (expected 0x70 funcref or 0x6F externref)")))
 
   // === Import section ===
 
@@ -202,18 +216,14 @@ object Parser:
 
   // === Table section ===
 
-  /** Parse Section 4. Per table: reftype byte (MVP funcref 0x70 only — the
-    * future externref form 0x6F is rejected here with a clear diagnostic
-    * until reference types are supported) followed by limits. */
+  /** Parse Section 4. Per table: reftype byte (Phase 8.C accepts funcref
+    * 0x70 + externref 0x6F) followed by limits. */
   private def parseTableSection(c: Cursor): Vector[Table] =
     val n = c.readU32()
     Vector.tabulate(n) { _ =>
-      val refType = c.readByte()
-      if refType != 0x70 then
-        fail(WasmError.InvalidModule(
-          s"unsupported table reftype 0x${refType.toHexString} (MVP supports only funcref 0x70)"))
+      val rt  = readRefType(c, "table section")
       val lim = readLimits(c)
-      Table(refType, lim.min, lim.max)
+      Table(rt, lim.min, lim.max)
     }
 
   // === Memory section ===
@@ -285,15 +295,25 @@ object Parser:
     * (passive, declarative, active-with-elem-expr) are rejected explicitly
     * with a diagnostic naming the flag so a future implementation knows
     * exactly which form surfaced. */
-  /** Phase 8.B extends MVP flag 0 / flag 2 (active) with flag 1 (passive)
-    * and flag 3 (declarative). Flags 4..7 use elemexpr instead of funcidx
-    * and belong to the reference-types proposal — they stay rejected.
+  /** Phase 8.C completes the element-section flag matrix. Flags 0/2/4/6
+    * are active forms; 1/5 are passive; 3/7 are declarative. Flags 0..3
+    * payload-encode as funcidx LEB vectors (implicit funcref); 4..7 use
+    * elemexpr — a constant ref expression per slot (`ref.null reftype`
+    * or `ref.func funcidx`, each terminated by `end`).
     *
-    *   flag 0: active, table 0, offset = i32.const, funcidx vec
-    *   flag 1: passive, elemkind byte (0x00 = funcref), funcidx vec
-    *   flag 2: active, explicit tableidx, offset, elemkind byte, funcidx vec
-    *   flag 3: declarative, elemkind byte, funcidx vec
-    */
+    *   flag 0: active, table 0,    offset = i32.const,                  funcidx vec
+    *   flag 1: passive,            elemkind byte (0x00 = funcref),      funcidx vec
+    *   flag 2: active, tableidx,   offset, elemkind byte,               funcidx vec
+    *   flag 3: declarative,        elemkind byte,                       funcidx vec
+    *   flag 4: active, table 0,    offset = i32.const,                  elemexpr vec  (implicit funcref)
+    *   flag 5: passive,            reftype byte,                        elemexpr vec
+    *   flag 6: active, tableidx,   offset, reftype byte,                elemexpr vec
+    *   flag 7: declarative,        reftype byte,                        elemexpr vec
+    *
+    * All seven forms normalise into the same `refType: RefType` +
+    * `refs: Vector[Value]` shape — funcidxs are lifted to `RefFunc(idx)`
+    * at parse time so the runtime never has to know which flag the
+    * segment originally used. */
   private def parseElementSection(c: Cursor): Vector[ElementSegment] =
     val n = c.readU32()
     Vector.tabulate(n) { _ =>
@@ -302,16 +322,16 @@ object Parser:
         case 0 =>
           val offset = readConstI32Expr(c)
           val cnt    = c.readU32()
-          val idxs   = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment.Active(0, offset, idxs)
+          val refs   = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
+          ElementSegment.Active(0, offset, RefType.FuncRef, refs)
         case 1 =>
           val ek = c.readByte()
           if ek != 0x00 then
             fail(WasmError.InvalidModule(
               s"passive element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
           val cnt  = c.readU32()
-          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment.Passive(idxs)
+          val refs = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
+          ElementSegment.Passive(RefType.FuncRef, refs)
         case 2 =>
           val tableIdx = c.readU32()
           val offset   = readConstI32Expr(c)
@@ -320,20 +340,78 @@ object Parser:
             fail(WasmError.InvalidModule(
               s"element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
           val cnt  = c.readU32()
-          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment.Active(tableIdx, offset, idxs)
+          val refs = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
+          ElementSegment.Active(tableIdx, offset, RefType.FuncRef, refs)
         case 3 =>
           val ek = c.readByte()
           if ek != 0x00 then
             fail(WasmError.InvalidModule(
               s"declarative element segment elemkind 0x${ek.toHexString} not supported (funcref only)"))
           val cnt  = c.readU32()
-          val idxs = Vector.tabulate(cnt)(_ => c.readU32())
-          ElementSegment.Declarative(idxs)
+          val refs = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
+          ElementSegment.Declarative(RefType.FuncRef, refs)
+        case 4 =>
+          val offset = readConstI32Expr(c)
+          val cnt    = c.readU32()
+          val refs   = Vector.tabulate(cnt)(_ => readElemExpr(c, RefType.FuncRef))
+          ElementSegment.Active(0, offset, RefType.FuncRef, refs)
+        case 5 =>
+          val rt   = readRefType(c, "passive element segment")
+          val cnt  = c.readU32()
+          val refs = Vector.tabulate(cnt)(_ => readElemExpr(c, rt))
+          ElementSegment.Passive(rt, refs)
+        case 6 =>
+          val tableIdx = c.readU32()
+          val offset   = readConstI32Expr(c)
+          val rt       = readRefType(c, "active element segment")
+          val cnt      = c.readU32()
+          val refs     = Vector.tabulate(cnt)(_ => readElemExpr(c, rt))
+          ElementSegment.Active(tableIdx, offset, rt, refs)
+        case 7 =>
+          val rt   = readRefType(c, "declarative element segment")
+          val cnt  = c.readU32()
+          val refs = Vector.tabulate(cnt)(_ => readElemExpr(c, rt))
+          ElementSegment.Declarative(rt, refs)
         case other =>
           fail(WasmError.InvalidModule(
-            s"element segment flag $other not supported (Phase 8.B accepts 0/1/2/3 — funcref kinds only)"))
+            s"element segment flag $other not supported (Phase 8.C accepts 0..7)"))
     }
+
+  /** Read one elemexpr — a constant reference expression terminated by
+    * `end`. Per the wasm-3.0 spec, the legal constant forms producing a
+    * reference value are `ref.null reftype` and `ref.func funcidx` (plus
+    * `global.get` over an imported reftype global, which we don't surface
+    * yet). Each elemexpr also has an expected [[RefType]]; ref.null's
+    * inline reftype byte must match.
+    *
+    * The single-byte opcode + immediates + `end` shape mirrors the
+    * `readConstExpr` helper for scalar constant exprs. */
+  private def readElemExpr(c: Cursor, expected: RefType): Value =
+    val op = c.readByte()
+    val v: Value = op match
+      case 0xd0 =>                                    // ref.null reftype
+        val rt = readRefType(c, "ref.null")
+        if rt != expected then
+          fail(WasmError.InvalidModule(
+            s"elemexpr ref.null reftype mismatch: expected ${expected}, got $rt"))
+        RefNull(rt)
+      case 0xd2 =>                                    // ref.func funcidx
+        // Funcidx range is checked at validation; here we only accept
+        // funcref-typed segments — a ref.func cannot inhabit an externref
+        // segment.
+        if expected != RefType.FuncRef then
+          fail(WasmError.InvalidModule(
+            s"elemexpr ref.func in $expected segment (only legal in funcref segments)"))
+        RefFunc(c.readU32())
+      case 0x23 =>
+        fail(WasmError.InvalidModule(
+          "global.get in elemexpr requires an imported reftype global, which isn't supported yet"))
+      case other =>
+        fail(WasmError.InvalidModule(
+          s"elemexpr: unsupported opcode 0x${other.toHexString} (expected ref.null or ref.func)"))
+    val end = c.readByte()
+    if end != 0x0b then fail(WasmError.InvalidModule(s"expected end after elemexpr, got 0x${end.toHexString}"))
+    v
 
   // === Code section ===
 
@@ -435,20 +513,34 @@ object Parser:
           ((b(6) & 0xffL) << 48) |
           ((b(7) & 0xffL) << 56)
         F64(java.lang.Double.longBitsToDouble(bits))
+      case (0xd0, ValueType.FuncRefType) =>                            // ref.null funcref
+        val rt = readRefType(c, "ref.null")
+        if rt != RefType.FuncRef then
+          fail(WasmError.InvalidModule(s"ref.null reftype mismatch: expected funcref, got $rt"))
+        RefNull(rt)
+      case (0xd0, ValueType.ExternRefType) =>                          // ref.null externref
+        val rt = readRefType(c, "ref.null")
+        if rt != RefType.ExternRef then
+          fail(WasmError.InvalidModule(s"ref.null reftype mismatch: expected externref, got $rt"))
+        RefNull(rt)
+      case (0xd2, ValueType.FuncRefType) =>                            // ref.func funcidx
+        RefFunc(c.readU32())
       case (0x23, _) =>
         fail(WasmError.InvalidModule(
           "global.get in const expr requires an imported global, which isn't supported yet"))
       case (other, _) =>
-        // Phrase the diagnostic in terms of the *.const mnemonic that the
-        // declared type would have required, so it reads the same way the
-        // wat source does.
-        val mnemonic = expected match
-          case ValueType.I32Type => "i32.const"
-          case ValueType.I64Type => "i64.const"
-          case ValueType.F32Type => "f32.const"
-          case ValueType.F64Type => "f64.const"
+        // Phrase the diagnostic in terms of the const form the declared
+        // type would have required, so it reads the same way the wat
+        // source does.
+        val expected_mnemonic = expected match
+          case ValueType.I32Type       => "i32.const"
+          case ValueType.I64Type       => "i64.const"
+          case ValueType.F32Type       => "f32.const"
+          case ValueType.F64Type       => "f64.const"
+          case ValueType.FuncRefType   => "ref.null func / ref.func funcidx"
+          case ValueType.ExternRefType => "ref.null extern"
         fail(WasmError.InvalidModule(
-          s"expected $mnemonic in const expr, got 0x${other.toHexString}"))
+          s"expected $expected_mnemonic in const expr, got 0x${other.toHexString}"))
     val end = c.readByte()
     if end != 0x0b then fail(WasmError.InvalidModule(s"expected end after const expr, got 0x${end.toHexString}"))
     v

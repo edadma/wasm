@@ -87,8 +87,28 @@ object Validator:
           throw new ValFail(WasmError.InvalidModule(
             s"import ${imp.module}.${imp.name}: type index ${imp.typeIdx} out of range"))
         im += 1
-      val funcSigs   = collectFuncSigs(module)
-      val globalSigs = module.globals.map(g => (g.valueType, g.mutable))
+      val funcSigs       = collectFuncSigs(module)
+      val globalSigs     = module.globals.map(g => (g.valueType, g.mutable))
+      val tableRefTypes  = module.tables.map(_.refType)
+      val elemRefTypes   = module.elements.map(_.refType)
+      // Phase 8.C: build the set of "declared" funcidxs — those that may
+      // appear as a ref.func operand. Per the wasm-3.0 spec these are
+      // funcidxs that appear anywhere structural in the module (exports,
+      // start, element segments). The function body's own ref.func
+      // operands don't count (that would be circular). A funcidx that's
+      // never declared rejects with "ref.func: funcidx N not declared".
+      val declaredFuncs = scala.collection.mutable.HashSet.empty[Int]
+      module.exports.foreach {
+        case FuncExport(_, idx) => declaredFuncs += idx
+        case _                  => ()
+      }
+      module.startFunction.foreach(declaredFuncs += _)
+      module.elements.foreach { seg =>
+        seg.refs.foreach {
+          case RefFunc(idx) => declaredFuncs += idx
+          case _            => ()
+        }
+      }
       var i = 0
       while i < module.codes.length do
         val typeIdx = module.functions(i)
@@ -105,9 +125,12 @@ object Validator:
           globalSigs       = globalSigs,
           types            = module.types,
           tableCount       = module.tables.length,
+          tableRefTypes    = tableRefTypes,
           memoryCount      = module.memories.length,
           dataSegmentCount = module.data.length,
           elemSegmentCount = module.elements.length,
+          elemRefTypes     = elemRefTypes,
+          declaredFuncs    = declaredFuncs.toSet,
           dataCountPresent = module.dataCount.isDefined,
         )
         i += 1
@@ -153,9 +176,12 @@ object Validator:
       globalSigs:       Vector[(ValueType, Boolean)],
       types:            Vector[FuncType],
       tableCount:       Int,
+      tableRefTypes:    Vector[RefType],
       memoryCount:      Int,
       dataSegmentCount: Int,
       elemSegmentCount: Int,
+      elemRefTypes:     Vector[RefType],
+      declaredFuncs:    Set[Int],
       dataCountPresent: Boolean,
   ): Unit =
     val state = new State(
@@ -166,9 +192,12 @@ object Validator:
       globalSigs       = globalSigs,
       types            = types,
       tableCount       = tableCount,
+      tableRefTypes    = tableRefTypes,
       memoryCount      = memoryCount,
       dataSegmentCount = dataSegmentCount,
       elemSegmentCount = elemSegmentCount,
+      elemRefTypes     = elemRefTypes,
+      declaredFuncs    = declaredFuncs,
       dataCountPresent = dataCountPresent,
       body             = body,
     )
@@ -188,6 +217,12 @@ object Validator:
       val globalSigs:  Vector[(ValueType, Boolean)],
       val types:       Vector[FuncType],
       val tableCount:  Int,
+      // Phase 8.C: per-table reference type, indexed by tableidx. Used by
+      // `call_indirect` (must be funcref), `table.copy` (matching reftypes),
+      // `table.init` (segment reftype must match table reftype),
+      // `table.get` / `table.set` / `table.grow` / `table.fill` (operand
+      // type is the table's reftype).
+      val tableRefTypes: Vector[RefType],
       val memoryCount: Int,
       // Phase 8.B context for bulk-memory + table ops:
       //   dataSegmentCount — `memory.init` / `data.drop` need their
@@ -199,6 +234,8 @@ object Validator:
       //     (Section 12) per the bulk-memory spec.
       val dataSegmentCount: Int,
       val elemSegmentCount: Int,
+      val elemRefTypes:     Vector[RefType],
+      val declaredFuncs:    Set[Int],
       val dataCountPresent: Boolean,
       val body:        Array[Byte],
   ):
@@ -214,10 +251,12 @@ object Validator:
         s"function $funcIdx: byte offset 0x${opPC.toHexString}: $msg"))
 
     def typeName(t: ValueType): String = t match
-      case ValueType.I32Type => "i32"
-      case ValueType.I64Type => "i64"
-      case ValueType.F32Type => "f32"
-      case ValueType.F64Type => "f64"
+      case ValueType.I32Type       => "i32"
+      case ValueType.I64Type       => "i64"
+      case ValueType.F32Type       => "f32"
+      case ValueType.F64Type       => "f64"
+      case ValueType.FuncRefType   => "funcref"
+      case ValueType.ExternRefType => "externref"
 
     // --- operand stack ----
 
@@ -459,6 +498,11 @@ object Validator:
           fail(s"call_indirect: type index $typeIdx out of range")
         if tableIdx < 0 || tableIdx >= tableCount then
           fail(s"call_indirect: table index $tableIdx out of range (have $tableCount tables)")
+        // Phase 8.C: call_indirect only dispatches through funcref tables.
+        // An externref table doesn't carry callable funcref values; the
+        // spec rejects this at validation time, not at run time.
+        if tableRefTypes(tableIdx) != RefType.FuncRef then
+          fail(s"call_indirect: table $tableIdx is externref (must be funcref)")
         val sig = types(typeIdx)
         popVal(ValueType.I32Type)                                               // slot index
         popVals(sig.params)
@@ -467,20 +511,80 @@ object Validator:
       // === parametric ==================================================
 
       case 0x1a => popVal()                                                     // drop
-      case 0x1b =>                                                              // select (polymorphic)
+      case 0x1b =>                                                              // select (untyped, numeric-only)
         popVal(ValueType.I32Type)
         val t1 = popVal()
         val t2 = popVal()
-        // Both operands must have the same type. With Unknown, pick the
-        // other operand's type (or Unknown if both polymorphic).
+        // Phase 8.C: the untyped `select` (0x1B) is now spec-restricted to
+        // numeric value types — reftype operands must use the typed
+        // `select t*` form (0x1C). Both operands must agree and neither
+        // may be a reftype.
+        def numeric(t: ValueType): Boolean = t match
+          case ValueType.I32Type | ValueType.I64Type |
+               ValueType.F32Type | ValueType.F64Type => true
+          case _                                     => false
         (t1, t2) match
           case (AbsValue.Known(a), AbsValue.Known(b)) =>
             if a != b then
               fail(s"select: operand type mismatch (${typeName(a)} vs ${typeName(b)})")
+            if !numeric(a) then
+              fail(s"select: untyped form rejects reference operand (${typeName(a)}) — use select t* (0x1C)")
             pushVal(a)
-          case (AbsValue.Known(a), AbsValue.Unknown) => pushVal(a)
-          case (AbsValue.Unknown, AbsValue.Known(b)) => pushVal(b)
+          case (AbsValue.Known(a), AbsValue.Unknown) =>
+            if !numeric(a) then
+              fail(s"select: untyped form rejects reference operand (${typeName(a)}) — use select t* (0x1C)")
+            pushVal(a)
+          case (AbsValue.Unknown, AbsValue.Known(b)) =>
+            if !numeric(b) then
+              fail(s"select: untyped form rejects reference operand (${typeName(b)}) — use select t* (0x1C)")
+            pushVal(b)
           case (AbsValue.Unknown, AbsValue.Unknown)  => pushVal(AbsValue.Unknown)
+
+      // === Phase 8.C: reference-types ====================================
+      //
+      // Five new top-level opcodes — ref.null / ref.is_null / ref.func plus
+      // table.get / table.set — and three more under the 0xFC prefix
+      // (table.grow / table.size / table.fill). All ref-typed table ops
+      // pop / push values whose abstract type comes from the named
+      // table's reftype.
+
+      case 0x25 =>                                                              // table.get tableidx
+        val tableIdx = readU32()
+        if tableIdx < 0 || tableIdx >= tableCount then
+          fail(s"table.get: table index $tableIdx out of range (have $tableCount tables)")
+        popVal(ValueType.I32Type)                                               // slot index
+        pushVal(ValueType.fromRef(tableRefTypes(tableIdx)))
+      case 0x26 =>                                                              // table.set tableidx
+        val tableIdx = readU32()
+        if tableIdx < 0 || tableIdx >= tableCount then
+          fail(s"table.set: table index $tableIdx out of range (have $tableCount tables)")
+        popVal(ValueType.fromRef(tableRefTypes(tableIdx)))                      // value
+        popVal(ValueType.I32Type)                                               // slot index
+
+      case 0xd0 =>                                                              // ref.null reftype
+        if pc + 1 > body.length then
+          fail("truncated ref.null reftype immediate")
+        val b = body(pc) & 0xff
+        pc += 1
+        RefType.fromByte(b) match
+          case Some(rt) => pushVal(ValueType.fromRef(rt))
+          case None     => fail(s"ref.null: unknown reftype 0x${b.toHexString}")
+      case 0xd1 =>                                                              // ref.is_null
+        val v = popVal()
+        v match
+          case AbsValue.Known(t) =>
+            t match
+              case ValueType.FuncRefType | ValueType.ExternRefType => ()
+              case other => fail(s"ref.is_null: expected reference, got ${typeName(other)}")
+          case AbsValue.Unknown  => ()
+        pushVal(ValueType.I32Type)
+      case 0xd2 =>                                                              // ref.func funcidx
+        val idx = readU32()
+        if idx < 0 || idx >= funcSigs.length then
+          fail(s"ref.func: function index $idx out of range (have ${funcSigs.length})")
+        if !declaredFuncs.contains(idx) then
+          fail(s"ref.func: funcidx $idx is not declared (must appear in an export, start, or element segment)")
+        pushVal(ValueType.FuncRefType)
 
       // === variables ===================================================
 
@@ -682,6 +786,9 @@ object Validator:
               fail(s"table.init: elem index $elemIdx out of range (have $elemSegmentCount segments)")
             if tableIdx < 0 || tableIdx >= tableCount then
               fail(s"table.init: table index $tableIdx out of range (have $tableCount tables)")
+            // Phase 8.C: the segment's reftype must match the table's.
+            if elemRefTypes(elemIdx) != tableRefTypes(tableIdx) then
+              fail(s"table.init: elem segment $elemIdx (${elemRefTypes(elemIdx)}) doesn't match table $tableIdx (${tableRefTypes(tableIdx)})")
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // src (offset into elem segment)
             popVal(ValueType.I32Type)                                           // dst (offset into table)
@@ -696,8 +803,32 @@ object Validator:
               fail(s"table.copy: dst table index $dstTab out of range (have $tableCount tables)")
             if srcTab < 0 || srcTab >= tableCount then
               fail(s"table.copy: src table index $srcTab out of range (have $tableCount tables)")
+            // Phase 8.C: src and dst must have the same reftype.
+            if tableRefTypes(dstTab) != tableRefTypes(srcTab) then
+              fail(s"table.copy: dst table $dstTab (${tableRefTypes(dstTab)}) and src table $srcTab (${tableRefTypes(srcTab)}) reftype mismatch")
             popVal(ValueType.I32Type)                                           // n
             popVal(ValueType.I32Type)                                           // src
+            popVal(ValueType.I32Type)                                           // dst
+          // Phase 8.C: table.grow / table.size / table.fill. Operand type
+          // for grow/fill comes from the table's reftype.
+          case 15 =>                                                            // table.grow tableidx
+            val tableIdx = readU32()
+            if tableIdx < 0 || tableIdx >= tableCount then
+              fail(s"table.grow: table index $tableIdx out of range (have $tableCount tables)")
+            popVal(ValueType.I32Type)                                           // delta
+            popVal(ValueType.fromRef(tableRefTypes(tableIdx)))                  // fill value
+            pushVal(ValueType.I32Type)                                          // previous size
+          case 16 =>                                                            // table.size tableidx
+            val tableIdx = readU32()
+            if tableIdx < 0 || tableIdx >= tableCount then
+              fail(s"table.size: table index $tableIdx out of range (have $tableCount tables)")
+            pushVal(ValueType.I32Type)
+          case 17 =>                                                            // table.fill tableidx
+            val tableIdx = readU32()
+            if tableIdx < 0 || tableIdx >= tableCount then
+              fail(s"table.fill: table index $tableIdx out of range (have $tableCount tables)")
+            popVal(ValueType.I32Type)                                           // n
+            popVal(ValueType.fromRef(tableRefTypes(tableIdx)))                  // value
             popVal(ValueType.I32Type)                                           // dst
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfc))
@@ -753,6 +884,10 @@ object Validator:
         case 0x7e => FuncType(Vector.empty, Vector(ValueType.I64Type))
         case 0x7d => FuncType(Vector.empty, Vector(ValueType.F32Type))
         case 0x7c => FuncType(Vector.empty, Vector(ValueType.F64Type))
+        // Phase 8.C: reftype-valued blocktypes — `(block (result funcref))`
+        // and `(block (result externref))` are both legal.
+        case 0x70 => FuncType(Vector.empty, Vector(ValueType.FuncRefType))
+        case 0x6f => FuncType(Vector.empty, Vector(ValueType.ExternRefType))
         case _    =>
           Leb128.readS32(body, pos) match
             case Right((idx, _)) if idx >= 0 && idx < types.length =>
