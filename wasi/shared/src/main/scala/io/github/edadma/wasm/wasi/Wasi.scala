@@ -79,6 +79,15 @@ object Wasi:
     * but documented here so future host-backed write impls have a
     * consistent errno to surface. */
   val ENOSPC:       Int = 51
+  /** Permission denied — host filesystem refused access. Surfaced by
+    * host-backed preopens when a host-level read/write/stat / unlink /
+    * mkdir is rejected by the OS (e.g. mode bits, ACLs, read-only
+    * filesystem on Linux). The InMemoryFs never emits this. */
+  val EACCES:       Int = 2
+  /** I/O error — host filesystem returned an unspecified error during
+    * a read / write / open / stat call. Surfaced only by host-backed
+    * preopens (the InMemoryFs cannot fail this way). */
+  val EIO:          Int = 29
   /** File exists — `path_open` with `OFLAGS_CREAT | OFLAGS_EXCL` was
     * asked to create a file that already exists. EXCL is the way
     * userspace asks for "atomic create" semantics. */
@@ -1031,17 +1040,14 @@ object Wasi:
             Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
-  /** Resolve a preopen's filetype byte for `path`. Falls back to
-    * REGULAR_FILE (4) for preopens that don't override `filetypeOf`
-    * (i.e. anything other than [[WasiContext.Preopen.InMemoryPreopen]])
-    * — those preopens can only resolve files via `statPath` anyway,
-    * so the fallback is honest. */
+  /** Resolve a preopen's filetype byte for `path`. Delegates to the
+    * polymorphic [[WasiContext.Preopen.filetypeOf]] hook and falls back
+    * to REGULAR_FILE (4) when the preopen returns `None` — preopens that
+    * can only resolve files via `statPath` (e.g. a hypothetical
+    * read-only-file-only impl) inherit the fallback honestly. */
   private inline def filetypeFor(preopen: WasiContext.Preopen,
                                  path:    String): Byte =
-    preopen match
-      case imp: WasiContext.Preopen.InMemoryPreopen =>
-        imp.filetypeOf(path).getOrElse(4: Byte)
-      case _ => 4: Byte
+    preopen.filetypeOf(path).getOrElse(4: Byte)
 
   // === path_unlink_file =====================================================
 
@@ -1667,6 +1673,14 @@ object WasiContext:
       * returns all entries in insertion order. */
     private[wasi] def readdir: Seq[(String, Byte, Long)] = Seq.empty
 
+    /** Filetype byte for `path`, used by `path_filestat_get` and
+      * `fd_readdir`. Returns `None` for a missing path; otherwise one
+      * of the wasi-preview1 filetype constants (`3` = DIRECTORY,
+      * `4` = REGULAR_FILE, `7` = SYMBOLIC_LINK). Default impl returns
+      * `None` — `path_filestat_get` then falls back to REGULAR_FILE so
+      * file-only preopens stay honest without overriding. */
+    private[wasi] def filetypeOf(path: String): Option[Byte] = None
+
   object Preopen:
     /** A name-only preopen: advertises the directory through the
       * prestat-walk surface but refuses to open anything inside it
@@ -1813,7 +1827,7 @@ object WasiContext:
         * filetype + size) and `fd_readdir` (which needs filetype alone).
         * Returns one of the wasi-preview1 filetype bytes: 3=DIRECTORY,
         * 4=REGULAR_FILE; `None` for a missing path. */
-      private[wasi] def filetypeOf(path: String): Option[Byte] =
+      override private[wasi] def filetypeOf(path: String): Option[Byte] =
         cells.get(path).map {
           case FileEntry(_) => 4: Byte
           case DirEntry     => 3: Byte

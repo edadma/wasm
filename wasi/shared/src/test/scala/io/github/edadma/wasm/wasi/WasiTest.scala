@@ -33,6 +33,7 @@ object WasiTest:
     WasiArgsTests.run()
     WasiClockTests.run()
     WasiFsTests.run()
+    WasiHostFsTests.run()
     WasiRealRustTests.run()
 
     println()
