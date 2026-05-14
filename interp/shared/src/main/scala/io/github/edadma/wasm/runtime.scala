@@ -10,30 +10,33 @@ import scala.collection.mutable.ArrayBuffer
   * exist to provide. Each fresh `Interpreter` shares the same arrays, so a
   * `global.set` in one call is visible to the next.
   *
-  * `tables` is one funcidx-int array per declared table; `-1` marks a null
-  * slot. The arrays are mutable in principle (Phase 8+ adds `table.set`),
-  * but Phase 3 leaves them write-once at instantiation. `types` is the
-  * module's function-type vector — kept on the instance so
-  * `call_indirect`'s dynamic signature check can resolve a typeidx against
-  * the original `FuncType` rather than against the called slot's
-  * `ResolvedFunc.signature` directly.
+  * `tables` is one [[RuntimeTable]] per declared table — each carrying its
+  * own reference-type tag, max-size cap, and a mutable `Array[Value]` of
+  * slot entries (`RefNull` for empty slots, `RefFunc(idx)` / `RefExtern(...)`
+  * for populated funcref / externref slots). Phase 8.C surfaces `table.set`,
+  * `table.grow`, `table.fill`, `table.get`, and `table.size`, all of which
+  * mutate or read this array. `types` is the module's function-type vector
+  * — kept on the instance so `call_indirect`'s dynamic signature check can
+  * resolve a typeidx against the original `FuncType` rather than against
+  * the called slot's `ResolvedFunc.signature` directly.
   */
 final class ModuleInstance private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
     val memory: Memory,
     private val globals: Array[Value],
     private val globalMutable: Array[Boolean],
-    private val tables: Array[Array[Int]],
+    private val tables: Array[RuntimeTable],
     private val types: Vector[FuncType],
     private val exportFuncs: Map[String, Int],
     private val exportGlobals: Map[String, Int],
     // Phase 8.B: bulk-memory state. Both `dataBytes`/`dataDropped` and
-    // `elemFuncs`/`elemDropped` persist across `invoke` calls — `data.drop`
+    // `elemRefs`/`elemDropped` persist across `invoke` calls — `data.drop`
     // / `elem.drop` flips bits that subsequent `memory.init` / `table.init`
-    // calls observe.
+    // calls observe. Phase 8.C widens element segments from `Vector[Int]`
+    // (funcidxs) to `Vector[Value]` (typed refs).
     private val dataBytes:   Array[Array[Byte]],
     private val dataDropped: Array[Boolean],
-    private val elemFuncs:   Array[Vector[Int]],
+    private val elemRefs:    Array[Vector[Value]],
     private val elemDropped: Array[Boolean],
 ):
 
@@ -45,7 +48,7 @@ final class ModuleInstance private[wasm] (
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => new Interpreter(
         funcs, memory, globals, globalMutable, tables, types,
-        dataBytes, dataDropped, elemFuncs, elemDropped,
+        dataBytes, dataDropped, elemRefs, elemDropped,
       ).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
@@ -65,6 +68,46 @@ final class ModuleInstance private[wasm] (
     exportGlobals.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(globals(idx))
+
+/** A runtime-side table. The MVP shape was `Array[Int]` (funcidx, or -1
+  * for null). Phase 8.C generalises slots to typed [[Value]]s — `RefNull`
+  * for empty slots, `RefFunc` / `RefExtern` for populated ones — and adds
+  * runtime-side resizing via `table.grow`.
+  *
+  * `slots` is exposed as a `var` so `table.copy` can run `System.arraycopy`
+  * over the underlying arrays directly. Outside that one path, every
+  * read/write goes through `get` / `set` for consistency. */
+final class RuntimeTable(val refType: RefType, val max: Option[Int]):
+  /** Backing array. `var` because `table.grow` swaps in a larger array;
+    * `table.copy` reads it directly for `System.arraycopy`. */
+  var slots: Array[Value] = Array.empty[Value]
+
+  def size: Int = slots.length
+
+  /** Allocate with `initial` slots prefilled with `fill`. Used by
+    * `Runtime.build` at instantiation; `fill` is the table's typed null. */
+  def allocate(initial: Int, fill: Value): Unit =
+    val arr = new Array[Value](initial)
+    var k = 0
+    while k < initial do { arr(k) = fill; k += 1 }
+    slots = arr
+
+  /** `table.grow` — append `delta` slots, each set to `fill`. Returns the
+    * previous size on success, or `-1` if the grow exceeds the declared
+    * max (or overflows Int range). Caller surfaces -1 via the wasm stack. */
+  def grow(delta: Int, fill: Value): Int =
+    val oldSize = slots.length
+    if delta < 0 then return -1
+    val newSizeL = oldSize.toLong + delta.toLong
+    val capL     = max.map(_.toLong).getOrElse(Int.MaxValue.toLong)
+    if newSizeL > capL || newSizeL > Int.MaxValue then -1
+    else
+      val arr = new Array[Value](newSizeL.toInt)
+      System.arraycopy(slots, 0, arr, 0, oldSize)
+      var k = oldSize
+      while k < arr.length do { arr(k) = fill; k += 1 }
+      slots = arr
+      oldSize
 
 /** Linker / loader. `instantiate` does the four jobs the WASM spec assigns to
   * instantiation: resolve imports, allocate memory, initialize data segments,
@@ -201,84 +244,83 @@ object Runtime:
         case (ValueType.I64Type, _: I64) => true
         case (ValueType.F32Type, _: F32) => true
         case (ValueType.F64Type, _: F64) => true
-        case _                           => false
+        case (ValueType.FuncRefType,   RefNull(RefType.FuncRef))   => true
+        case (ValueType.FuncRefType,   RefFunc(_))                 => true
+        case (ValueType.ExternRefType, RefNull(RefType.ExternRef)) => true
+        case (ValueType.ExternRefType, RefExtern(_))               => true
+        case _                                                     => false
       if !ok then fail(WasmError.InvalidModule(s"global $gi: init value doesn't match declared type"))
       globals(gi)       = g.initialValue
       globalMutable(gi) = g.mutable
       gi += 1
 
     // === tables =============================================================
-    // One int-array per defined table; `-1` = null funcref. Imported tables
-    // aren't surfaced yet (Phase 5), so tableidx N in the binary maps 1:1
-    // to `tables(N)` here. Each segment's `funcIndices` resolve against the
-    // module's whole `funcs` index space (imports + defined), the same way
-    // `call funcidx` does — so a `(elem (i32.const 0) func 0)` referring to
-    // the first imported function resolves correctly.
-    val tables: Array[Array[Int]] = new Array[Array[Int]](module.tables.size)
+    // One [[RuntimeTable]] per defined table. Each slot starts as a typed
+    // null (`RefNull(table.refType)`); element segments then populate the
+    // active subset. Imported tables aren't surfaced yet (Phase 5), so
+    // tableidx N in the binary maps 1:1 to `tables(N)` here. Each segment's
+    // refs resolve against the module's whole `funcs` index space (imports
+    // + defined), the same way `call funcidx` does — so a `(elem
+    // (i32.const 0) func 0)` referring to the first imported function
+    // resolves correctly.
+    val tables: Array[RuntimeTable] = new Array[RuntimeTable](module.tables.size)
     var ti = 0
     while ti < module.tables.size do
       val t = module.tables(ti)
       if t.min < 0 then fail(WasmError.InvalidModule(s"table $ti: negative min size"))
-      val arr = new Array[Int](t.min)
-      var k = 0
-      while k < arr.length do { arr(k) = -1; k += 1 }
-      tables(ti) = arr
+      val rt = new RuntimeTable(t.refType, t.max)
+      rt.allocate(t.min, RefNull(t.refType))
+      tables(ti) = rt
       ti += 1
 
     // === element segments ==================================================
     // Active segments still copy into their declared table at instantiation
     // (failure = `InvalidModule`, matching data-segment trap shape). Passive
-    // and declarative segments stay addressable by elemidx; declarative is
-    // a runtime no-op until Phase 8.C wires `ref.func` to consult them.
-    // All three kinds share one `elemFuncs` array so `table.init` /
-    // `elem.drop` can index uniformly.
-    val nElem      = module.elements.size
-    val elemFuncs  = new Array[Vector[Int]](nElem)
+    // segments stay addressable by elemidx for `table.init`. Declarative
+    // segments are runtime no-ops (their funcidxs are kept in the
+    // declared-funcs set so `ref.func` resolves). All three kinds share
+    // one `elemRefs` array so `table.init` / `elem.drop` can index
+    // uniformly.
+    val nElem       = module.elements.size
+    val elemRefs    = new Array[Vector[Value]](nElem)
     val elemDropped = new Array[Boolean](nElem)
     var ei = 0
     while ei < nElem do
-      module.elements(ei) match
-        case ElementSegment.Active(tableIdx, offset, idxs) =>
+      val seg = module.elements(ei)
+      // Validate each funcidx referenced by a RefFunc up front — applies to
+      // every kind (active, passive, declarative). Externref segments only
+      // contain RefNull / RefExtern, so this is a no-op for those.
+      var k = 0
+      while k < seg.refs.length do
+        seg.refs(k) match
+          case RefFunc(fi) =>
+            if fi < 0 || fi >= funcs.size then
+              fail(WasmError.InvalidModule(s"element segment $ei references invalid function $fi"))
+          case _ => ()
+        k += 1
+      seg match
+        case ElementSegment.Active(tableIdx, offset, segRT, refs) =>
           if tableIdx < 0 || tableIdx >= tables.length then
             fail(WasmError.InvalidModule(s"element segment $ei references invalid table $tableIdx"))
           val tab = tables(tableIdx)
-          val end = offset.toLong + idxs.length
-          if offset < 0 || end > tab.length then
+          if tab.refType != segRT then
             fail(WasmError.InvalidModule(
-              s"element segment $ei overflows table $tableIdx (offset=$offset, len=${idxs.length}, size=${tab.length})"))
-          var k = 0
-          while k < idxs.length do
-            val fi = idxs(k)
-            if fi < 0 || fi >= funcs.size then
-              fail(WasmError.InvalidModule(s"element segment $ei references invalid function $fi"))
-            tab(offset + k) = fi
-            k += 1
-          elemFuncs(ei)   = idxs
+              s"element segment $ei reftype $segRT doesn't match table $tableIdx reftype ${tab.refType}"))
+          val end = offset.toLong + refs.length
+          if offset < 0 || end > tab.size then
+            fail(WasmError.InvalidModule(
+              s"element segment $ei overflows table $tableIdx (offset=$offset, len=${refs.length}, size=${tab.size})"))
+          var j = 0
+          while j < refs.length do
+            tab.slots(offset + j) = refs(j)
+            j += 1
+          elemRefs(ei)    = refs
           elemDropped(ei) = true                                            // active = "dropped right after init"
-        case ElementSegment.Passive(idxs) =>
-          // Validate each funcidx up front — a passive segment may be used
-          // by `table.init` later, but the spec requires funcidxs to be
-          // in-range at instantiation, not at use.
-          var k = 0
-          while k < idxs.length do
-            val fi = idxs(k)
-            if fi < 0 || fi >= funcs.size then
-              fail(WasmError.InvalidModule(s"passive element segment $ei references invalid function $fi"))
-            k += 1
-          elemFuncs(ei)   = idxs
+        case ElementSegment.Passive(_, refs) =>
+          elemRefs(ei)    = refs
           elemDropped(ei) = false
-        case ElementSegment.Declarative(idxs) =>
-          // Same funcidx validation as passive — declarative segments
-          // pre-declare funcrefs for future `ref.func` resolution and
-          // their funcidxs must be in-range. Treated as "dropped" at
-          // runtime: never copied by `table.init`.
-          var k = 0
-          while k < idxs.length do
-            val fi = idxs(k)
-            if fi < 0 || fi >= funcs.size then
-              fail(WasmError.InvalidModule(s"declarative element segment $ei references invalid function $fi"))
-            k += 1
-          elemFuncs(ei)   = idxs
+        case ElementSegment.Declarative(_, refs) =>
+          elemRefs(ei)    = refs
           elemDropped(ei) = true
       ei += 1
 
@@ -330,7 +372,7 @@ object Runtime:
           s"start: function $startIdx has signature $sig, expected () -> ()"))
       val interp = new Interpreter(
         funcs.toIndexedSeq, memory, globals, globalMutable, tables, module.types,
-        dataBytes, dataDropped, elemFuncs, elemDropped,
+        dataBytes, dataDropped, elemRefs, elemDropped,
       )
       interp.invoke(startIdx, Seq.empty) match
         case Right(_) => ()
@@ -348,6 +390,6 @@ object Runtime:
       exportGlobals,
       dataBytes,
       dataDropped,
-      elemFuncs,
+      elemRefs,
       elemDropped,
     )

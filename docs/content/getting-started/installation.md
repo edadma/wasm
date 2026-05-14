@@ -6,7 +6,7 @@ weight: 10
 
 ## Status
 
-The `interp` and `wasi` libraries are designed to publish to Maven Central as `io.github.edadma:wasm` and `io.github.edadma:wasm-wasi`, but no release has been cut yet — the project is still in pre-release while the rest of Phase 8 (reference types, multi-memory, SIMD) lands. Bulk-memory remainder and non-trapping float-to-int are both shipped. The from-source path below is the supported way to use it today.
+The `interp` and `wasi` libraries are designed to publish to Maven Central as `io.github.edadma:wasm` and `io.github.edadma:wasm-wasi`, but no release has been cut yet — the project is still in pre-release while the rest of Phase 8 (multi-memory, SIMD) lands. Bulk-memory remainder, non-trapping float-to-int, and reference types are all shipped. The from-source path below is the supported way to use it today.
 
 ## From source
 
@@ -14,12 +14,12 @@ The `interp` and `wasi` libraries are designed to publish to Maven Central as `i
 git clone https://github.com/edadma/wasm.git
 cd wasm
 sbt test                                              # whole tree, all backends
-sbt 'interpJVM/Test/run'                              # 275 interpreter tests, JVM
+sbt 'interpJVM/Test/run'                              # 297 interpreter tests, JVM
 sbt 'wasiJVM/Test/run'                                # 157 WASI tests, JVM
 sbt 'cliJVM/Test/run'                                 # 9 CLI tests
 ```
 
-The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **441 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
+The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **463 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
 
 ## Linking against a local checkout
 

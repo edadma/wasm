@@ -190,9 +190,21 @@ object ParserAndRuntimeTests:
 
     // Phase 3 — table / element section diagnostics ------------------------
 
-    test("parser: section 4 with non-funcref reftype returns InvalidModule") {
-      // 1 table, reftype 0x6F (externref — reference types), flag 0, min 0.
+    test("parser: section 4 with externref reftype (0x6F) parses to Table(ExternRef, ...) (Phase 8.C)") {
+      // 1 table, reftype 0x6F (externref — Phase 8.C), flag 0, min 0.
+      // Pre-8.C this rejected; 8.C surfaces it as a real externref table.
       val tableSec = b(0x01, 0x6f, 0x00, 0x00)
+      val bad = Header ++ b(0x04, tableSec.length) ++ tableSec
+      Parser.parse(bad) match
+        case Right(m) =>
+          check(m.tables.length == 1, s"expected 1 table, got ${m.tables.length}")
+          check(m.tables.head.refType == RefType.ExternRef, s"expected externref, got ${m.tables.head.refType}")
+          check(m.tables.head.min == 0, s"expected min=0, got ${m.tables.head.min}")
+        case other => check(false, s"expected Right(module), got $other")
+    }
+
+    test("parser: section 4 with unknown reftype (0x42) returns InvalidModule") {
+      val tableSec = b(0x01, 0x42, 0x00, 0x00)
       val bad = Header ++ b(0x04, tableSec.length) ++ tableSec
       Parser.parse(bad) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("reftype"), s"message: $msg")
@@ -208,21 +220,28 @@ object ParserAndRuntimeTests:
         case Right(m) =>
           check(m.elements.length == 1, s"expected 1 element segment, got ${m.elements.length}")
           m.elements.head match
-            case ElementSegment.Passive(idxs) => check(idxs.isEmpty, s"expected empty, got $idxs")
+            case ElementSegment.Passive(rt, refs) =>
+              check(rt == RefType.FuncRef, s"expected funcref, got $rt")
+              check(refs.isEmpty, s"expected empty, got $refs")
             case other => check(false, s"expected ElementSegment.Passive, got $other")
         case other => check(false, s"expected Right(module), got $other")
     }
 
-    test("parser: section 9 with elemexpr flag (5 — reference types) still rejected") {
-      // Flag 5 is passive-with-elemexpr; that's reference-types-proposal
-      // territory and Phase 8.B explicitly leaves it rejected (will land
-      // in 8.C).
-      val elemSec = b(0x01, 0x05)
+    test("parser: section 9 with passive externref flag (5) parses as ElementSegment.Passive (Phase 8.C)") {
+      // Flag 5 = passive-with-elemexpr. Reftype byte = 0x6F (externref).
+      // Body = one elemexpr: ref.null externref (0xD0 0x6F 0x0B). Total
+      // segment count = 1.
+      val elemSec = b(0x01, 0x05, 0x6f, 0x01, 0xd0, 0x6f, 0x0b)
       val bad = Header ++ b(0x09, elemSec.length) ++ elemSec
       Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) =>
-          check(msg.contains("element segment flag"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(element flag), got $other")
+        case Right(m) =>
+          check(m.elements.length == 1, s"expected 1 element segment, got ${m.elements.length}")
+          m.elements.head match
+            case ElementSegment.Passive(rt, refs) =>
+              check(rt == RefType.ExternRef, s"expected externref, got $rt")
+              check(refs == Vector(RefNull(RefType.ExternRef)), s"expected single ref.null extern, got $refs")
+            case other => check(false, s"expected ElementSegment.Passive, got $other")
+        case other => check(false, s"expected Right(module), got $other")
     }
 
   // === Interpreter unsupported-opcode tests ===============================

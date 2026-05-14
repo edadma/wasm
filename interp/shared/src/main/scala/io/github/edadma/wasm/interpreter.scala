@@ -202,6 +202,10 @@ object Interpreter:
       case 0x7e => Right((BlockSig(0, 1), pos + 1))            // i64 result
       case 0x7d => Right((BlockSig(0, 1), pos + 1))            // f32 result
       case 0x7c => Right((BlockSig(0, 1), pos + 1))            // f64 result
+      // Phase 8.C: reftype-valued blocktypes — `(block (result funcref))`
+      // and `(block (result externref))` are both legal.
+      case 0x70 => Right((BlockSig(0, 1), pos + 1))            // funcref result
+      case 0x6f => Right((BlockSig(0, 1), pos + 1))            // externref result
       case _ =>
         // Multi-value form: signed LEB128 typeidx (the spec says s33;
         // readS32 is sufficient because any plausible typeidx fits well
@@ -230,7 +234,20 @@ object Interpreter:
         Right(pc + 1)
       case 0x0c | 0x0d | 0x10 |                            // br, br_if, call
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
-           0x23 | 0x24 =>                                  // global.{get,set}
+           0x23 | 0x24 |                                   // global.{get,set}
+           0x25 | 0x26 =>                                  // table.get, table.set (Phase 8.C)
+        Leb128.readU32(body, pc + 1).map(_._2)
+      // Phase 8.C: reference-typed ops.
+      //   0xD0 ref.null    — single reftype byte (0x70 / 0x6F).
+      //   0xD1 ref.is_null — no immediates.
+      //   0xD2 ref.func    — funcidx LEB.
+      case 0xd0 =>                                         // ref.null reftype
+        if pc + 2 > body.length then
+          Left(WasmError.InvalidModule(s"truncated ref.null reftype at $pc"))
+        else Right(pc + 2)
+      case 0xd1 =>                                         // ref.is_null
+        Right(pc + 1)
+      case 0xd2 =>                                         // ref.func funcidx
         Leb128.readU32(body, pc + 1).map(_._2)
       case 0x0e =>                                         // br_table — vec(labelidx) + default labelidx
         // vec(u32) count, then `count` LEB u32 entries, then one more u32
@@ -358,6 +375,12 @@ object Interpreter:
                     Leb128.readU32(body, p2) match
                       case Left(e)        => Left(e)
                       case Right((_, p3)) => Right(p3)
+              // Phase 8.C: ref-typed table ops, all with a single tableidx
+              // LEB immediate (the new size/grow/fill triple).
+              case 15 | 16 | 17 =>                                             // table.grow / table.size / table.fill
+                Leb128.readU32(body, p1) match
+                  case Left(e)      => Left(e)
+                  case Right((_, p2)) => Right(p2)
               case _  => Left(WasmError.UnknownOpcode(0xfc))
       case other =>
         Left(WasmError.UnknownOpcode(other))
@@ -407,11 +430,12 @@ final class Interpreter private[wasm] (
     /** Parallel to `globals` — true if the corresponding slot is `var`,
       * false if `const`. `global.set` traps if the bit is false. */
     private val globalMutable: Array[Boolean],
-    /** One funcidx-int array per table; `-1` marks a null funcref slot.
-      * Shared across calls. Phase 8.B promotes these from "write-once at
-      * instantiation" to mutable — `table.init` and `table.copy` write
-      * here at run time. */
-    private val tables: Array[Array[Int]],
+    /** One [[RuntimeTable]] per declared table; each carries a typed
+      * `Array[Value]` plus its refType and max. Phase 8.C surfaces
+      * `table.set`, `table.grow`, `table.fill`, `table.get`, and
+      * `table.size`, all of which mutate or read this array; the table
+      * is shared across `invoke` calls. */
+    private val tables: Array[RuntimeTable],
     /** Module function-type vector — `call_indirect`'s dynamic signature
       * check resolves the static typeidx immediate against this. */
     private val types: Vector[FuncType],
@@ -419,12 +443,13 @@ final class Interpreter private[wasm] (
     // byte payload (active or passive); `dataDropped(i)` is the drop flag —
     // active segments start dropped (their bytes already landed in memory at
     // instantiation), passive ones start undropped until `data.drop`. Same
-    // shape for elements: `elemFuncs(i)` is the original funcidx vector,
+    // shape for elements: `elemRefs(i)` is the original ref vector (Phase
+    // 8.C: `RefNull` / `RefFunc` / `RefExtern` values, not bare funcidxs),
     // `elemDropped(i)` the drop flag (active + declarative start dropped,
     // passive starts undropped).
     private val dataBytes:   Array[Array[Byte]],
     private val dataDropped: Array[Boolean],
-    private val elemFuncs:   Array[Vector[Int]],
+    private val elemRefs:    Array[Vector[Value]],
     private val elemDropped: Array[Boolean],
 ):
   import Interpreter.*
@@ -604,9 +629,10 @@ final class Interpreter private[wasm] (
       case 0x11 =>                                                                        // call_indirect typeidx tableidx
         // Two LEB u32 immediates: the declared function type and the table
         // to dispatch through. The stack carries an i32 slot index; the slot
-        // must be in-range, non-null, and the slot's signature must match
-        // `types(typeidx)` exactly. All three trap classes surface here as
-        // InvalidModule until Phase 6 lifts the type check into validation.
+        // must be in-range, hold a non-null funcref, and the slot's
+        // signature must match `types(typeidx)` exactly. The validator
+        // already rejected externref-typed tables here, so the slot is
+        // guaranteed to be `RefNull(FuncRef)` or `RefFunc(_)`.
         val (typeIdx, p1)  = readU32At(f, f.pc + 1)
         val (tableIdx, p2) = readU32At(f, p1)
         f.pc = p2
@@ -616,20 +642,21 @@ final class Interpreter private[wasm] (
           fail(WasmError.InvalidModule(s"call_indirect: invalid table index $tableIdx"))
         val tab  = tables(tableIdx)
         val slot = popI32()
-        // Slot index is a wasm i32; signed values < 0 are also out-of-range
-        // (a future negative slot from arithmetic would never have been a
-        // valid funcref index in the first place).
-        if slot < 0 || slot >= tab.length then
-          fail(WasmError.InvalidModule(s"call_indirect: index $slot out of table bounds (size ${tab.length})"))
-        val fi = tab(slot)
-        if fi < 0 then
-          fail(WasmError.InvalidModule(s"call_indirect: null funcref at index $slot"))
-        val expected = types(typeIdx)
-        val actual   = funcs(fi).signature
-        if expected != actual then
-          fail(WasmError.InvalidModule(
-            s"call_indirect: signature mismatch at index $slot (expected $expected, got $actual)"))
-        callFunction(fi)
+        if slot < 0 || slot >= tab.size then
+          fail(WasmError.InvalidModule(s"call_indirect: index $slot out of table bounds (size ${tab.size})"))
+        tab.slots(slot) match
+          case RefFunc(fi) =>
+            val expected = types(typeIdx)
+            val actual   = funcs(fi).signature
+            if expected != actual then
+              fail(WasmError.InvalidModule(
+                s"call_indirect: signature mismatch at index $slot (expected $expected, got $actual)"))
+            callFunction(fi)
+          case RefNull(_) =>
+            fail(WasmError.InvalidModule(s"call_indirect: null funcref at index $slot"))
+          case other =>
+            // Externref / non-ref types are caught at validation; defensive.
+            fail(WasmError.InvalidModule(s"call_indirect: non-funcref slot at index $slot: $other"))
 
       // === parametric ====================================================
 
@@ -1342,228 +1369,322 @@ final class Interpreter private[wasm] (
       // past 2^63.
 
       case 0xfc =>
-        val (sub, p1) = readU32At(f, f.pc + 1)
-        sub match
-          case 0 =>                                                                         // i32.trunc_sat_f32_s
-            val v = popF32()
-            val r =
-              if jl.Float.isNaN(v)              then 0
-              else if v < -2147483648.0f        then Int.MinValue
-              else if v >=  2147483648.0f       then Int.MaxValue
-              else                                   v.toInt
-            pushI32(r)
-            f.pc = p1
+        // The 0xFC sub-dispatch was extracted into its own method when its
+        // body got large enough to push `step` past the JVM 64KB-method
+        // ceiling. Phase 8.A (8 trunc_sat sub-opcodes) + Phase 8.B (5
+        // bulk-memory sub-opcodes) + Phase 8.C (3 ref-typed table sub-
+        // opcodes) brought the cumulative case down here past the limit;
+        // factoring it out is a no-op semantically.
+        stepFc(f)
 
-          case 1 =>                                                                         // i32.trunc_sat_f32_u
-            val v = popF32()
-            val r =
-              if jl.Float.isNaN(v)              then 0
-              else if v <= -1.0f                then 0
-              else if v >=  4294967296.0f       then -1                                    // 0xFFFFFFFF as signed Int
-              else                                   v.toLong.toInt
-            pushI32(r)
-            f.pc = p1
+      // === Phase 8.C: reference-types ====================================
+      //
+      // Five new top-level opcodes: two table accessors (0x25 / 0x26) and
+      // three ref ops (0xD0 / 0xD1 / 0xD2). Validator enforced operand
+      // types and table-index range; here we trust both.
 
-          case 2 =>                                                                         // i32.trunc_sat_f64_s
-            val v = popF64()
-            val r =
-              if jl.Double.isNaN(v)             then 0
-              else if v < -2147483648.0         then Int.MinValue
-              else if v >=  2147483648.0        then Int.MaxValue
-              else                                   v.toInt
-            pushI32(r)
-            f.pc = p1
+      case 0x25 =>                                                                          // table.get tableidx
+        val (tableIdx, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        val tab  = tables(tableIdx)
+        val slot = popI32()
+        if slot < 0 || slot >= tab.size then
+          fail(WasmError.MemoryOutOfBounds)
+        valueStack += tab.slots(slot)
 
-          case 3 =>                                                                         // i32.trunc_sat_f64_u
-            val v = popF64()
-            val r =
-              if jl.Double.isNaN(v)             then 0
-              else if v <= -1.0                 then 0
-              else if v >=  4294967296.0        then -1
-              else                                   v.toLong.toInt
-            pushI32(r)
-            f.pc = p1
+      case 0x26 =>                                                                          // table.set tableidx
+        val (tableIdx, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        val tab  = tables(tableIdx)
+        val v    = popValue()
+        val slot = popI32()
+        if slot < 0 || slot >= tab.size then
+          fail(WasmError.MemoryOutOfBounds)
+        tab.slots(slot) = v
 
-          case 4 =>                                                                         // i64.trunc_sat_f32_s
-            val v = popF32()
-            val r =
-              if jl.Float.isNaN(v)              then 0L
-              else if v < -9223372036854775808.0f  then Long.MinValue
-              else if v >=  9223372036854775808.0f then Long.MaxValue
-              else                                   v.toLong
-            pushI64(r)
-            f.pc = p1
+      case 0xd0 =>                                                                          // ref.null reftype
+        val b = body(f.pc + 1) & 0xff
+        f.pc += 2
+        val rt = RefType.fromByte(b).getOrElse(
+          fail(WasmError.InvalidModule(s"ref.null: unknown reftype 0x${b.toHexString}")))
+        valueStack += RefNull(rt)
 
-          case 5 =>                                                                         // i64.trunc_sat_f32_u
-            val v = popF32()
-            val r =
-              if jl.Float.isNaN(v)              then 0L
-              else if v <= -1.0f                then 0L
-              else if v >= 18446744073709551616.0f then -1L                                // UInt64.MaxValue
-              else if v < 9223372036854775808.0f   then v.toLong
-              else (v - 9223372036854775808.0f).toLong | Long.MinValue
-            pushI64(r)
-            f.pc = p1
+      case 0xd1 =>                                                                          // ref.is_null
+        f.pc += 1
+        val v = popValue()
+        pushI32(v match
+          case _: RefNull => 1
+          case _          => 0)
 
-          case 6 =>                                                                         // i64.trunc_sat_f64_s
-            val v = popF64()
-            val r =
-              if jl.Double.isNaN(v)             then 0L
-              else if v < -9223372036854775808.0  then Long.MinValue
-              else if v >=  9223372036854775808.0 then Long.MaxValue
-              else                                   v.toLong
-            pushI64(r)
-            f.pc = p1
-
-          case 7 =>                                                                         // i64.trunc_sat_f64_u
-            val v = popF64()
-            val r =
-              if jl.Double.isNaN(v)             then 0L
-              else if v <= -1.0                 then 0L
-              else if v >= 18446744073709551616.0 then -1L
-              else if v < 9223372036854775808.0   then v.toLong
-              else (v - 9223372036854775808.0).toLong | Long.MinValue
-            pushI64(r)
-            f.pc = p1
-
-          // ===== Phase 8.B bulk-memory remainder =================================
-          //
-          // memory.init / data.drop reference one data segment by dataidx;
-          // table.init / elem.drop reference one element segment by elemidx;
-          // table.copy references two tables (dst, src). All five share the
-          // unsigned-Long bounds check pattern used by memory.copy/fill.
-          // The validator has already range-checked the static immediates
-          // (dataidx, elemidx, tableidx, reserved memidx); the interpreter
-          // re-reads them via readU32At for the dispatch.
-
-          case 8 =>                                                                         // memory.init dataidx, memidx-reserved-byte
-            val (dataIdx, p2) = readU32At(f, p1)
-            val mem = body(p2) & 0xff
-            if mem != 0 then
-              fail(WasmError.InvalidModule(s"memory.init: non-zero reserved memidx $mem"))
-            f.pc = p2 + 1
-            val n   = popI32()
-            val src = popI32()                                                              // offset into data segment
-            val dst = popI32()                                                              // offset into memory
-            val nL   = n.toLong   & 0xffffffffL
-            val srcL = src.toLong & 0xffffffffL
-            val dstL = dst.toLong & 0xffffffffL
-            // A dropped segment is treated as an empty byte vector — the
-            // OOB check uses its effective length (0 if dropped, else
-            // original byte-count). The dataDropped flag is set both for
-            // active segments post-instantiation and for passive segments
-            // that have been explicitly `data.drop`'d.
-            val segLen =
-              if dataDropped(dataIdx) then 0L else dataBytes(dataIdx).length.toLong
-            if srcL + nL > segLen || dstL + nL > memory.data.length.toLong then
-              fail(WasmError.MemoryOutOfBounds)
-            if nL > 0L then
-              System.arraycopy(dataBytes(dataIdx), srcL.toInt, memory.data, dstL.toInt, nL.toInt)
-
-          case 9 =>                                                                         // data.drop dataidx
-            val (dataIdx, p2) = readU32At(f, p1)
-            f.pc = p2
-            // Idempotent — dropping a dropped (or originally-active) segment
-            // is a no-op, not an error. The bit stays set.
-            dataDropped(dataIdx) = true
-
-          case 10 =>                                                                        // memory.copy dst-memidx src-memidx
-            val dstMem = body(p1)     & 0xff
-            val srcMem = body(p1 + 1) & 0xff
-            if dstMem != 0 || srcMem != 0 then
-              fail(WasmError.InvalidModule(
-                s"memory.copy: non-zero reserved memidx ($dstMem, $srcMem)"))
-            f.pc = p1 + 2
-            val n   = popI32()
-            val src = popI32()
-            val dst = popI32()
-            // All three operands are wasm i32 — but the bounds check needs
-            // unsigned semantics because a high-bit-set address is a real
-            // address in the upper 2 GiB. Long arithmetic defeats wrap.
-            val nL   = n.toLong   & 0xffffffffL
-            val srcL = src.toLong & 0xffffffffL
-            val dstL = dst.toLong & 0xffffffffL
-            val len  = memory.data.length.toLong
-            if srcL + nL > len || dstL + nL > len then
-              fail(WasmError.MemoryOutOfBounds)
-            if nL > 0L then
-              // System.arraycopy handles overlapping copies correctly in both
-              // directions, matching the spec's required semantics.
-              System.arraycopy(memory.data, srcL.toInt, memory.data, dstL.toInt, nL.toInt)
-
-          case 11 =>                                                                        // memory.fill memidx
-            val mem = body(p1) & 0xff
-            if mem != 0 then
-              fail(WasmError.InvalidModule(s"memory.fill: non-zero reserved memidx $mem"))
-            f.pc = p1 + 1
-            val n   = popI32()
-            val v   = popI32()
-            val dst = popI32()
-            val nL   = n.toLong   & 0xffffffffL
-            val dstL = dst.toLong & 0xffffffffL
-            val len  = memory.data.length.toLong
-            if dstL + nL > len then
-              fail(WasmError.MemoryOutOfBounds)
-            if nL > 0L then
-              java.util.Arrays.fill(memory.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
-
-          case 12 =>                                                                        // table.init elemidx, tableidx
-            val (elemIdx, p2) = readU32At(f, p1)
-            val (tableIdx, p3) = readU32At(f, p2)
-            f.pc = p3
-            val n   = popI32()
-            val src = popI32()                                                              // offset into elem segment
-            val dst = popI32()                                                              // offset into table
-            val nL   = n.toLong   & 0xffffffffL
-            val srcL = src.toLong & 0xffffffffL
-            val dstL = dst.toLong & 0xffffffffL
-            val tab    = tables(tableIdx)
-            val segLen = if elemDropped(elemIdx) then 0L else elemFuncs(elemIdx).length.toLong
-            // tables are funcidx-int arrays — same unsigned-Long bounds check
-            // pattern as memory.init. We reuse the MemoryOutOfBounds error
-            // variant because no Table-specific one exists yet; the
-            // diagnostic message disambiguates.
-            if srcL + nL > segLen || dstL + nL > tab.length.toLong then
-              fail(WasmError.MemoryOutOfBounds)
-            if nL > 0L then
-              val src0  = srcL.toInt
-              val dst0  = dstL.toInt
-              val funcs = elemFuncs(elemIdx)
-              var k = 0
-              while k < nL.toInt do
-                tab(dst0 + k) = funcs(src0 + k)
-                k += 1
-
-          case 13 =>                                                                        // elem.drop elemidx
-            val (elemIdx, p2) = readU32At(f, p1)
-            f.pc = p2
-            elemDropped(elemIdx) = true
-
-          case 14 =>                                                                        // table.copy dst-tableidx, src-tableidx
-            val (dstTab, p2) = readU32At(f, p1)
-            val (srcTab, p3) = readU32At(f, p2)
-            f.pc = p3
-            val n   = popI32()
-            val src = popI32()
-            val dst = popI32()
-            val nL   = n.toLong   & 0xffffffffL
-            val srcL = src.toLong & 0xffffffffL
-            val dstL = dst.toLong & 0xffffffffL
-            val sTab = tables(srcTab)
-            val dTab = tables(dstTab)
-            if srcL + nL > sTab.length.toLong || dstL + nL > dTab.length.toLong then
-              fail(WasmError.MemoryOutOfBounds)
-            if nL > 0L then
-              // System.arraycopy handles overlapping copies correctly,
-              // including same-table self-copy (dstTab == srcTab).
-              System.arraycopy(sTab, srcL.toInt, dTab, dstL.toInt, nL.toInt)
-
-          case _ =>
-            fail(WasmError.UnknownOpcode(0xfc))
+      case 0xd2 =>                                                                          // ref.func funcidx
+        val (idx, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        valueStack += RefFunc(idx)
 
       // === unsupported ===================================================
 
       case other => fail(WasmError.UnknownOpcode(other))
+
+  /** Dispatch one 0xFC sub-opcode. Pulled out of `step` to keep that
+    * method under the JVM's 64KB ceiling — the cumulative trunc_sat (8.A)
+    * + bulk-memory remainder (8.B) + table grow/size/fill (8.C) arms add
+    * up to roughly 16 sub-cases of non-trivial length. The body is
+    * otherwise structurally identical to what `step` would have done. */
+  private def stepFc(f: Frame): Unit =
+    val body = f.func.body
+    val (sub, p1) = readU32At(f, f.pc + 1)
+    sub match
+      case 0 =>                                                                         // i32.trunc_sat_f32_s
+        val v = popF32()
+        val r =
+          if jl.Float.isNaN(v)              then 0
+          else if v < -2147483648.0f        then Int.MinValue
+          else if v >=  2147483648.0f       then Int.MaxValue
+          else                                   v.toInt
+        pushI32(r)
+        f.pc = p1
+
+      case 1 =>                                                                         // i32.trunc_sat_f32_u
+        val v = popF32()
+        val r =
+          if jl.Float.isNaN(v)              then 0
+          else if v <= -1.0f                then 0
+          else if v >=  4294967296.0f       then -1                                    // 0xFFFFFFFF as signed Int
+          else                                   v.toLong.toInt
+        pushI32(r)
+        f.pc = p1
+
+      case 2 =>                                                                         // i32.trunc_sat_f64_s
+        val v = popF64()
+        val r =
+          if jl.Double.isNaN(v)             then 0
+          else if v < -2147483648.0         then Int.MinValue
+          else if v >=  2147483648.0        then Int.MaxValue
+          else                                   v.toInt
+        pushI32(r)
+        f.pc = p1
+
+      case 3 =>                                                                         // i32.trunc_sat_f64_u
+        val v = popF64()
+        val r =
+          if jl.Double.isNaN(v)             then 0
+          else if v <= -1.0                 then 0
+          else if v >=  4294967296.0        then -1
+          else                                   v.toLong.toInt
+        pushI32(r)
+        f.pc = p1
+
+      case 4 =>                                                                         // i64.trunc_sat_f32_s
+        val v = popF32()
+        val r =
+          if jl.Float.isNaN(v)              then 0L
+          else if v < -9223372036854775808.0f  then Long.MinValue
+          else if v >=  9223372036854775808.0f then Long.MaxValue
+          else                                   v.toLong
+        pushI64(r)
+        f.pc = p1
+
+      case 5 =>                                                                         // i64.trunc_sat_f32_u
+        val v = popF32()
+        val r =
+          if jl.Float.isNaN(v)              then 0L
+          else if v <= -1.0f                then 0L
+          else if v >= 18446744073709551616.0f then -1L                                // UInt64.MaxValue
+          else if v < 9223372036854775808.0f   then v.toLong
+          else (v - 9223372036854775808.0f).toLong | Long.MinValue
+        pushI64(r)
+        f.pc = p1
+
+      case 6 =>                                                                         // i64.trunc_sat_f64_s
+        val v = popF64()
+        val r =
+          if jl.Double.isNaN(v)             then 0L
+          else if v < -9223372036854775808.0  then Long.MinValue
+          else if v >=  9223372036854775808.0 then Long.MaxValue
+          else                                   v.toLong
+        pushI64(r)
+        f.pc = p1
+
+      case 7 =>                                                                         // i64.trunc_sat_f64_u
+        val v = popF64()
+        val r =
+          if jl.Double.isNaN(v)             then 0L
+          else if v <= -1.0                 then 0L
+          else if v >= 18446744073709551616.0 then -1L
+          else if v < 9223372036854775808.0   then v.toLong
+          else (v - 9223372036854775808.0).toLong | Long.MinValue
+        pushI64(r)
+        f.pc = p1
+
+      // ===== Phase 8.B bulk-memory remainder =================================
+      //
+      // memory.init / data.drop reference one data segment by dataidx;
+      // table.init / elem.drop reference one element segment by elemidx;
+      // table.copy references two tables (dst, src). All five share the
+      // unsigned-Long bounds check pattern used by memory.copy/fill.
+      // The validator has already range-checked the static immediates
+      // (dataidx, elemidx, tableidx, reserved memidx); the interpreter
+      // re-reads them via readU32At for the dispatch.
+
+      case 8 =>                                                                         // memory.init dataidx, memidx-reserved-byte
+        val (dataIdx, p2) = readU32At(f, p1)
+        val mem = body(p2) & 0xff
+        if mem != 0 then
+          fail(WasmError.InvalidModule(s"memory.init: non-zero reserved memidx $mem"))
+        f.pc = p2 + 1
+        val n   = popI32()
+        val src = popI32()                                                              // offset into data segment
+        val dst = popI32()                                                              // offset into memory
+        val nL   = n.toLong   & 0xffffffffL
+        val srcL = src.toLong & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        // A dropped segment is treated as an empty byte vector — the
+        // OOB check uses its effective length (0 if dropped, else
+        // original byte-count). The dataDropped flag is set both for
+        // active segments post-instantiation and for passive segments
+        // that have been explicitly `data.drop`'d.
+        val segLen =
+          if dataDropped(dataIdx) then 0L else dataBytes(dataIdx).length.toLong
+        if srcL + nL > segLen || dstL + nL > memory.data.length.toLong then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          System.arraycopy(dataBytes(dataIdx), srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+
+      case 9 =>                                                                         // data.drop dataidx
+        val (dataIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        // Idempotent — dropping a dropped (or originally-active) segment
+        // is a no-op, not an error. The bit stays set.
+        dataDropped(dataIdx) = true
+
+      case 10 =>                                                                        // memory.copy dst-memidx src-memidx
+        val dstMem = body(p1)     & 0xff
+        val srcMem = body(p1 + 1) & 0xff
+        if dstMem != 0 || srcMem != 0 then
+          fail(WasmError.InvalidModule(
+            s"memory.copy: non-zero reserved memidx ($dstMem, $srcMem)"))
+        f.pc = p1 + 2
+        val n   = popI32()
+        val src = popI32()
+        val dst = popI32()
+        // All three operands are wasm i32 — but the bounds check needs
+        // unsigned semantics because a high-bit-set address is a real
+        // address in the upper 2 GiB. Long arithmetic defeats wrap.
+        val nL   = n.toLong   & 0xffffffffL
+        val srcL = src.toLong & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        val len  = memory.data.length.toLong
+        if srcL + nL > len || dstL + nL > len then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          // System.arraycopy handles overlapping copies correctly in both
+          // directions, matching the spec's required semantics.
+          System.arraycopy(memory.data, srcL.toInt, memory.data, dstL.toInt, nL.toInt)
+
+      case 11 =>                                                                        // memory.fill memidx
+        val mem = body(p1) & 0xff
+        if mem != 0 then
+          fail(WasmError.InvalidModule(s"memory.fill: non-zero reserved memidx $mem"))
+        f.pc = p1 + 1
+        val n   = popI32()
+        val v   = popI32()
+        val dst = popI32()
+        val nL   = n.toLong   & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        val len  = memory.data.length.toLong
+        if dstL + nL > len then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          java.util.Arrays.fill(memory.data, dstL.toInt, (dstL + nL).toInt, (v & 0xff).toByte)
+
+      case 12 =>                                                                        // table.init elemidx, tableidx
+        val (elemIdx, p2) = readU32At(f, p1)
+        val (tableIdx, p3) = readU32At(f, p2)
+        f.pc = p3
+        val n   = popI32()
+        val src = popI32()                                                              // offset into elem segment
+        val dst = popI32()                                                              // offset into table
+        val nL   = n.toLong   & 0xffffffffL
+        val srcL = src.toLong & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        val tab    = tables(tableIdx)
+        val segLen = if elemDropped(elemIdx) then 0L else elemRefs(elemIdx).length.toLong
+        // Same unsigned-Long bounds-check pattern as memory.init. We
+        // reuse the MemoryOutOfBounds error variant because no
+        // Table-specific one exists yet; the diagnostic message
+        // disambiguates.
+        if srcL + nL > segLen || dstL + nL > tab.size.toLong then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          val src0 = srcL.toInt
+          val dst0 = dstL.toInt
+          val segRefs = elemRefs(elemIdx)
+          var k = 0
+          while k < nL.toInt do
+            tab.slots(dst0 + k) = segRefs(src0 + k)
+            k += 1
+
+      case 13 =>                                                                        // elem.drop elemidx
+        val (elemIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        elemDropped(elemIdx) = true
+
+      case 14 =>                                                                        // table.copy dst-tableidx, src-tableidx
+        val (dstTab, p2) = readU32At(f, p1)
+        val (srcTab, p3) = readU32At(f, p2)
+        f.pc = p3
+        val n   = popI32()
+        val src = popI32()
+        val dst = popI32()
+        val nL   = n.toLong   & 0xffffffffL
+        val srcL = src.toLong & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        val sTab = tables(srcTab)
+        val dTab = tables(dstTab)
+        if srcL + nL > sTab.size.toLong || dstL + nL > dTab.size.toLong then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          // System.arraycopy handles overlapping copies correctly,
+          // including same-table self-copy (dstTab == srcTab).
+          System.arraycopy(sTab.slots, srcL.toInt, dTab.slots, dstL.toInt, nL.toInt)
+
+      // Phase 8.C: ref-typed table ops. table.grow / table.size /
+      // table.fill all take a single tableidx LEB. operand types come
+      // from the table's reftype (the validator already enforced that
+      // the fill / value popped here has the right type).
+      case 15 =>                                                                        // table.grow tableidx
+        val (tableIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        val n    = popI32()
+        val fill = popValue()
+        val tab  = tables(tableIdx)
+        pushI32(tab.grow(n, fill))
+
+      case 16 =>                                                                        // table.size tableidx
+        val (tableIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        pushI32(tables(tableIdx).size)
+
+      case 17 =>                                                                        // table.fill tableidx
+        val (tableIdx, p2) = readU32At(f, p1)
+        f.pc = p2
+        val n   = popI32()
+        val v   = popValue()
+        val dst = popI32()
+        val nL   = n.toLong   & 0xffffffffL
+        val dstL = dst.toLong & 0xffffffffL
+        val tab  = tables(tableIdx)
+        if dstL + nL > tab.size.toLong then
+          fail(WasmError.MemoryOutOfBounds)
+        if nL > 0L then
+          val dst0 = dstL.toInt
+          var k = 0
+          while k < nL.toInt do
+            tab.slots(dst0 + k) = v
+            k += 1
+
+      case _ =>
+        fail(WasmError.UnknownOpcode(0xfc))
 
   // === Control-flow helpers ===============================================
 
@@ -1638,14 +1759,17 @@ final class Interpreter private[wasm] (
         // Declared locals zero-initialize. Pick the right `Value` variant for
         // each slot — `I32(0)` for i32, `I64(0L)` for i64, `F32(0.0f)` for
         // f32, `F64(0.0)` for f64. (WASM mandates positive zero for floats;
-        // Java's `0.0f`/`0.0` defaults match.)
+        // Java's `0.0f`/`0.0` defaults match.) Phase 8.C: reftype locals
+        // zero-init to a typed null.
         var j = paramCount
         while j < localCount do
           locals(j) = localTypes(j) match
-            case ValueType.I32Type => I32(0)
-            case ValueType.I64Type => I64(0L)
-            case ValueType.F32Type => F32(0.0f)
-            case ValueType.F64Type => F64(0.0)
+            case ValueType.I32Type       => I32(0)
+            case ValueType.I64Type       => I64(0L)
+            case ValueType.F32Type       => F32(0.0f)
+            case ValueType.F64Type       => F64(0.0)
+            case ValueType.FuncRefType   => RefNull(RefType.FuncRef)
+            case ValueType.ExternRefType => RefNull(RefType.ExternRef)
           j += 1
         frames += new Frame(wf, locals, stackBase = valueStack.size)
 
