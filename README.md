@@ -6,6 +6,13 @@ A WebAssembly interpreter for Scala 3 with a WASI Preview 1 host shim and a smal
 ![GitHub](https://img.shields.io/github/license/edadma/wasm)
 ![Scala Version](https://img.shields.io/badge/Scala-3.8.3-blue.svg)
 
+## Documentation
+
+Full reference, getting-started guide, WASI surface, CLI flags, and supported-opcode list:
+**https://edadma.github.io/wasm/**
+
+## Sub-projects
+
 The repo splits into three sub-projects so the published libraries stay dependency-free:
 
 - **`interp/`** — the interpreter itself. **Zero external dependencies** (Scala stdlib only). Published to Maven Central as `wasm`.
