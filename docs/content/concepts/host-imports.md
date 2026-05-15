@@ -18,7 +18,7 @@ type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
 
 A `HostFunc` takes the guest's `Memory` instance (memidx 0) plus a sequence of `Value` arguments matching the import's declared signature, and returns a sequence of `Value` results matching the import's declared results. Pure functions, no `Future` / `IO` wrapping.
 
-A `HostFuncMulti` takes the guest's full vector of memories (length ≥ 1) instead of just memidx 0 — useful only for multi-memory modules (the multi-memory proposal landed in Phase 8.D). Single-memory programs should stay on `HostFunc`; multi-memory hosts that need to inspect or write a non-zero memidx use `HostFuncMulti`. A name registered in *both* maps resolves to the multi-memory form.
+A `HostFuncMulti` takes the guest's full vector of memories (length ≥ 1) instead of just memidx 0 — useful only for multi-memory modules. Single-memory programs should stay on `HostFunc`; multi-memory hosts that need to inspect or write a non-zero memidx use `HostFuncMulti`. A name registered in *both* maps resolves to the multi-memory form.
 
 ## EnvModule.default
 

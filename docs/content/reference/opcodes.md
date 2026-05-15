@@ -1,6 +1,6 @@
 ---
 title: Opcodes
-summary: Every WebAssembly opcode group the interpreter handles, plus what's coming in Phase 8.
+summary: Every WebAssembly opcode group the interpreter handles, plus what's intentionally out of scope.
 weight: 10
 ---
 
@@ -24,7 +24,7 @@ IEEE-754 results are deterministic across JVM, Scala.js, and Scala Native — in
 
 `i32.extend8_s`, `i32.extend16_s`, `i64.extend8_s`, `i64.extend16_s`, `i64.extend32_s`. Lifts a narrow signed value into the full operand-stack width. Required by rustc-built binaries.
 
-## Non-trapping float-to-int (Phase 8.A)
+## Non-trapping float-to-int
 
 The eight `trunc_sat_*` sub-opcodes under the `0xFC` prefix (sub-opcodes 0..7):
 
@@ -48,9 +48,9 @@ Multi-value blocks, loops, and ifs are supported — block parameters get re-fed
 - **Load/store** — every width variant: `i32.load`, `i32.load8_s`/`_u`, `i32.load16_s`/`_u`, `i64.load`, `i64.load8_s`/…/`load32_s`/`_u`, `f32.load`, `f64.load`, plus all matching stores.
 - **Sizing** — `memory.size` and `memory.grow`. The optional `max` from section 5 is honoured: `grow` past it returns `-1` rather than expanding.
 - **Bulk-memory** — the full proposal, all seven ops under the `0xFC` prefix:
-    - `memory.copy` (sub `0x0A`), `memory.fill` (sub `0x0B`) — Phase 7.B.
-    - `memory.init` (sub `0x08`), `data.drop` (sub `0x09`) — Phase 8.B.
-    - `table.init` (sub `0x0C`), `elem.drop` (sub `0x0D`), `table.copy` (sub `0x0E`) — Phase 8.B.
+    - `memory.copy` (sub `0x0A`), `memory.fill` (sub `0x0B`).
+    - `memory.init` (sub `0x08`), `data.drop` (sub `0x09`).
+    - `table.init` (sub `0x0C`), `elem.drop` (sub `0x0D`), `table.copy` (sub `0x0E`).
 
   `memory.init` / `table.init` copy from passive data / element segments;
   `data.drop` / `elem.drop` mark a segment as zero-length (idempotent).
@@ -62,7 +62,7 @@ Multi-value blocks, loops, and ifs are supported — block parameters get re-fed
 
 Section 11 (data) and section 9 (element) carry sealed-trait segment kinds. Active segments behave as before (copied at instantiation). Passive segments stay addressable by `dataidx` / `elemidx` until the matching `.drop`. Declarative element segments pre-declare funcrefs for `ref.func`. Element-expression-bearing forms (flags 4..7) parse `ref.null` and `ref.func` as their constant expressions; segments may carry either funcref or externref payloads.
 
-## Reference types (Phase 8.C)
+## Reference types
 
 Funcref + externref ride on a small set of new opcodes:
 
@@ -87,9 +87,9 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 - **Untyped `select`** (`0x1B`) — operand types are inferred. Spec-restricted to numeric value types when reference types are present; a reftype operand is rejected at validation with a "use select t*" diagnostic.
 - **Typed `select t*`** (`0x1C`) — explicit operand type, encoded as `0x1C u32:count valtype[count]` with `count == 1` (multi-value `select` isn't enabled by any shipped proposal). Required for funcref / externref operands; also accepts the four numeric scalars.
 
-## SIMD (Phase 8.E — complete)
+## SIMD
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). The full surface — Chunks A through I — is now shipped.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). The full surface is implemented.
 
 ### The `V128` value type (host side)
 
@@ -126,7 +126,7 @@ The test suite's `TestSupport.simd` object has helpers (`fromI8`, `fromI16`, `fr
 
 **`V128` equality:** the case class derives `equals` from `Array[Byte]` reference equality (Scala's `Array` doesn't define structural `equals`). So `V128(a) == V128(b)` is true only if `a eq b`. Compare the bytes directly if you want value equality.
 
-### Foundations (Chunk A — done)
+### Foundations
 
 - **`V128` value type** (wire byte `0x7B`). First-class in function params, results, locals, globals, and blocktypes. Locals zero-init to 16 zero bytes.
 - **`v128.const`** (`0xFD 0x0C` + 16 raw little-endian bytes). The wat-side annotations (`i32x4 1 2 3 4`, `i16x8 ...`, etc.) are text-form only; the binary just sees 16 opaque bytes.
@@ -134,9 +134,9 @@ The test suite's `TestSupport.simd` object has helpers (`fromI8`, `fromI16`, `fr
 
 Tests cover raw byte round-trips, parameter / local / block-result plumbing, zero-init, and the wat-form lane-annotation equivalence (`v128.const i8x16` and `v128.const i16x8` of the same byte payload produce identical V128 values).
 
-### Loads + stores (Chunk B — done)
+### Loads + stores
 
-Every load is `[i32 addr] → [v128]`; the store is `[i32 addr, v128 value] → []`. All ops carry a Phase-8.D-shaped memarg (the alignment LEB's bit 6 flags an optional memidx LEB; offset follows).
+Every load is `[i32 addr] → [v128]`; the store is `[i32 addr, v128 value] → []`. All ops carry a multi-memory-shaped memarg (the alignment LEB's bit 6 flags an optional memidx LEB; offset follows).
 
 | Opcode | Sub | What it does |
 |---|---|---|
@@ -154,7 +154,7 @@ Every load is `[i32 addr] → [v128]`; the store is `[i32 addr, v128 value] → 
 
 Out-of-bounds (addr + offset + width past memory end) traps with `MemoryOutOfBounds`, same shape as the scalar memory ops.
 
-### Lane access (Chunk C — done)
+### Lane access
 
 Every "build / inspect / rearrange a v128 lane-by-lane" surface lives here. Lane shapes — `i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2` — pick the lane width (1/2/4/8 bytes) and the count (16/8/4/2 lanes). Lane immediates are validated `< lane_count` at compile time.
 
@@ -183,7 +183,7 @@ Every "build / inspect / rearrange a v128 lane-by-lane" surface lives here. Lane
 
 `extract_lane` / `replace_lane` carry a 1-byte lane immediate after the sub-opcode; `i8x16.shuffle` carries a 16-byte laneidx vector. `splat` and `swizzle` have no immediate beyond the sub-opcode.
 
-### Integer arithmetic (Chunk D — done)
+### Integer arithmetic
 
 Lane-wise integer arithmetic across every integer shape. Plain `add` / `sub` / `mul` wrap modulo 2^lane_width; `_sat_s` / `_sat_u` clamp at the signed / unsigned bounds; `avgr_u` is the rounding unsigned average `(a + b + 1) / 2`. No `i8x16.mul` in the spec, no saturating variants past `i16x8`, no `avgr_u` past `i16x8`. All ops have no immediate.
 
@@ -208,7 +208,7 @@ Lane-wise integer arithmetic across every integer shape. Plain `add` / `sub` / `
 
 Sub-opcodes ≥ `0x80` encode as 2-byte LEBs in the binary; `wat2wasm` emits the right shape, and the dispatch's LEB decoder handles either width transparently.
 
-### Shifts + min/max (Chunk E — done)
+### Shifts + min/max
 
 Lane-wise shifts (`shl`, `shr_s`, `shr_u`) on all four integer shapes, plus per-lane signed and unsigned min/max on `i8x16`, `i16x8`, `i32x4` (the spec excludes `i64x2.min/max`). Shifts pop the i32 count from the operand stack — it's *not* an immediate — and the spec takes `count mod lane_width`, so e.g. `i8x16.shl(_, 8)` is the identity.
 
@@ -231,7 +231,7 @@ Lane-wise shifts (`shl`, `shr_s`, `shr_u`) on all four integer shapes, plus per-
 
 The signed vs unsigned distinction matters at the lane width: byte `0xFF` is `-1` signed but `255` unsigned, so `i8x16.shr_s` of it stays `-1` while `i8x16.shr_u` of it becomes `0x7F`; `i8x16.min_s` picks `-1` as the minimum but `i8x16.min_u` picks `0`.
 
-### Float arithmetic (Chunk F — done)
+### Float arithmetic
 
 Lane-wise IEEE-754 arithmetic across `f32x4` and `f64x2`. Rounding (`ceil`, `floor`, `trunc`, `nearest`) and `abs` / `neg` / `sqrt` are unary; `add` / `sub` / `mul` / `div` and `min` / `max` / `pmin` / `pmax` are binary. All ops have no immediate.
 
@@ -259,7 +259,7 @@ Lane-wise IEEE-754 arithmetic across `f32x4` and `f64x2`. Rounding (`ceil`, `flo
 | `f64x2.min` / `max` | `0xF4` / `0xF5` | |
 | `f64x2.pmin` / `pmax` | `0xF6` / `0xF7` | |
 
-### Bitwise + reductions (Chunk G.1 — done)
+### Bitwise + reductions
 
 Six bitwise ops that ignore lane shape (the v128 is just 16 raw bytes), plus nine v128 → i32 reductions. `v128.bitselect` is the only SIMD ternary op — it takes three v128 operands `(a, b, c)` and returns `(a AND c) OR (b AND NOT c)`, where `c` is the selector mask. All 15 ops have no immediate past the sub-opcode.
 
@@ -283,7 +283,7 @@ Six bitwise ops that ignore lane shape (the v128 is just 16 raw bytes), plus nin
 | `i32x4.bitmask` | `0xA4` | Top bit of each i32 lane → 4-bit mask. |
 | `i64x2.bitmask` | `0xC4` | Top bit of each i64 lane → 2-bit mask. |
 
-### Comparisons (Chunk G.2 — done)
+### Comparisons
 
 Lane-wise compare ops produce a result lane that is all-1s on true (`0xFF…` — the bitmask shape `v128.bitselect` consumes natively) and all-0s on false, in the same lane width as the inputs. Every op is `v128 × v128 → v128`, no immediate past the sub-opcode. 48 ops in total — three full integer shapes (i8x16 / i16x8 / i32x4) get the full `eq, ne, lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u` set; i64x2 gets the six signed forms only (the spec defines no `_u` variants for i64); f32x4 and f64x2 each get `eq, ne, lt, gt, le, ge` (no signedness — floats are inherently signed).
 
@@ -316,7 +316,7 @@ IEEE-754 NaN: every f32/f64 compare returns false when either operand is NaN, ex
 | `f64x2.lt` / `gt` | `0x49` / `0x4A` | |
 | `f64x2.le` / `ge` | `0x4B` / `0x4C` | |
 
-### Narrow / extend / extadd_pairwise / extmul + float-int conv + demote / promote (Chunk H — done)
+### Narrow / extend / extadd_pairwise / extmul + float-int conv + demote / promote
 
 42 ops covering everything that changes lane width or moves between integer and float lanes. Mechanically: narrow takes two source v128s and packs them into one with saturating clamps; extend (the spec's name for "widen") pulls half the source lanes and sign- or zero-extends each into the wider lane width; extadd_pairwise pairs adjacent narrower lanes and sums each pair (with extension) into one wider lane; extmul fuses extend + multiply at the wider lane width so the product fits exactly. The 8 float↔int conversions follow the scalar `trunc_sat_*` / `convert_*` rules per lane (NaN → 0, ±overflow saturates). The `_zero` suffix on the f64x2 / i32x4 form means "result has 4 lanes but only the first 2 carry data, the rest are 0"; `_low` on the inverse direction means "read only lanes 0..1 of the source".
 
@@ -339,9 +339,9 @@ IEEE-754 NaN: every f32/f64 compare returns false when either operand is NaN, ex
 | `i32x4.trunc_sat_f64x2_s_zero` / `_u_zero` | `0xFC` / `0xFD` | 2 f64 → i32 lanes 0..1; lanes 2 + 3 zero-filled. |
 | `f64x2.convert_low_i32x4_s` / `_u` | `0xFE` / `0xFF` | Read i32 lanes 0..1 of source, widen to f64. |
 
-### Dot product + load_lane / store_lane (Chunk I — done)
+### Dot product + load_lane / store_lane
 
-The last chunk in Phase 8.E. Nine ops: one pairwise multiply-add at i32 precision, and eight partial memory accesses that touch a single lane.
+Nine ops: one pairwise multiply-add at i32 precision, and eight partial memory accesses that touch a single lane.
 
 `i32x4.dot_i16x8_s` (the only "wider lane multiply-add" op in the spec) reads two i16x8 vectors, pairs up adjacent lanes (`a[2k] * b[2k] + a[2k+1] * b[2k+1]`), and produces an i32x4. The i16 lanes are sign-extended to i32 before multiplying, so each product fits exact in i32; the pair-sum can overflow only at `-32768² + -32768² = 2³¹`, which wraps to `Int.MinValue` per the spec's two's-complement rule. No immediate past the sub-opcode.
 
@@ -359,11 +359,11 @@ The last chunk in Phase 8.E. Nine ops: one pairwise multiply-add at i32 precisio
 | `v128.store32_lane` | `0x5A` | Write 4 LE bytes of lane (< 4) to memory. |
 | `v128.store64_lane` | `0x5B` | Write 8 LE bytes of lane (< 2) to memory. |
 
-## Multi-memory (Phase 8.D)
+## Multi-memory
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
 
-- **Load/store memarg** — Phase 8.D repurposes bit 6 of the alignment LEB as a "memidx-present" flag. When set, a memidx LEB follows; alignment is the LEB with that bit cleared. Single-memory modules emit the original shape (no flag, memidx = 0 implicit).
+- **Load/store memarg** — the multi-memory encoding repurposes bit 6 of the alignment LEB as a "memidx-present" flag. When set, a memidx LEB follows; alignment is the LEB with that bit cleared. Single-memory modules emit the original shape (no flag, memidx = 0 implicit).
 - **`memory.size` / `memory.grow` / `memory.fill`** — the byte that was a must-be-zero reserved slot becomes a memidx LEB.
 - **`memory.copy`** — two memidx LEBs (dst, src), allowing memory-to-memory copies between distinct memories.
 - **`memory.init`** — second immediate is a memidx LEB (was reserved).

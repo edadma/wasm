@@ -32,18 +32,18 @@ The matching `examples/c/hello.c` source and `Makefile` are committed alongside;
 
 ## Real WASI binary with a host-backed preopen
 
-`examples/rust/word_count.wasm` is a rustc-built `wasm32-wasip1` binary that reads `/data/input.txt` from a wasi preopen and prints `wc -lwc`-style counts:
+`examples/rust/word_count.wasm` is a rustc-built `wasm32-wasip1` binary that reads a path passed as `argv[1]` from a wasi preopen and prints `wc -lwc`-style counts:
 
 ```bash
 mkdir -p ./data
 echo "The quick brown fox jumps over the lazy dog." > ./data/input.txt
 echo "Pack my box with five dozen liquor jugs."    >> ./data/input.txt
 
-sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm'
+sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm /data/input.txt'
 #        2       17       86 /data/input.txt
 ```
 
-The `--preopen` flag points the wasi-libc startup walk at the host's `./data` directory and tells the guest the visible name is `/data`. From the rust binary's perspective, `/data/input.txt` resolves; absolute paths outside `/data` don't.
+The `--preopen` flag points the wasi-libc startup walk at the host's `./data` directory and tells the guest the visible name is `/data`. The trailing `/data/input.txt` is forwarded to the program as `argv[1]` — wasm-cli treats any positional args after the wasm file as WASI argv. From the rust binary's perspective, `/data/input.txt` resolves; absolute paths outside `/data` don't.
 
 The matching `examples/rust/src/main.rs` source and `Cargo.toml` are committed; rebuild with `cargo build --release --target=wasm32-wasip1 --manifest-path=examples/rust/Cargo.toml`.
 

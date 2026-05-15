@@ -14,8 +14,7 @@ This page covers the full public surface — what you can read, what you can cal
 final class ModuleInstance:
   /** All linear memories the module declared, indexed by memidx.
     * Always at least length 1 (zero-memory modules get a synthetic placeholder
-    * at index 0). Phase 8.D multi-memory modules carry one entry per declared
-    * memory. */
+    * at index 0). Multi-memory modules carry one entry per declared memory. */
   val memories: Array[Memory]
 
   /** Convenience accessor for `memories(0)`. Most modules have exactly one

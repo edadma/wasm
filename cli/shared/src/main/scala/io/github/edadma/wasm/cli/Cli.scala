@@ -56,6 +56,7 @@ object Cli:
       file:         String                = "",
       invoke:       Option[String]        = None,
       args:         Seq[Int]              = Nil,
+      wasiArgs:     Seq[String]           = Nil,
       listExports:  Boolean               = false,
       preopens:     Seq[(String, String)] = Nil,
   )
@@ -70,6 +71,15 @@ object Cli:
         .required()
         .action((p, c) => c.copy(file = p))
         .text("path to a .wasm module"),
+      // Trailing positional args after <file> become the WASI argv[1..].
+      // argv[0] is synthesised from the file basename in `execute`. Use
+      // `--` ahead of these if any value starts with `-` to keep scopt
+      // from interpreting it as a flag (POSIX convention).
+      arg[String]("<wasi-args>...")
+        .optional()
+        .unbounded()
+        .action((a, c) => c.copy(wasiArgs = c.wasiArgs :+ a))
+        .text("arguments passed to a WASI program's `_start` as argv[1..]; use `--` to separate from CLI flags"),
       opt[String]('i', "invoke")
         .valueName("<export>")
         .action((n, c) => c.copy(invoke = Some(n)))
@@ -133,7 +143,17 @@ object Cli:
     // inert. `WasiContext.default` sends fd 1 / fd 2 to System.out /
     // System.err — exactly what `wasm <file>` users expect; any `--preopen`
     // flags add real on-disk directories on top.
-    val ctx         = WasiContext.default.copy(preopens = preopens)
+    //
+    // argv[0] is the file basename stripped of any `.wasm` suffix so a
+    // wasi program calling `env::args().next()` sees a sensible program
+    // name (matches wasmtime / wasmer convention). cfg.wasiArgs fills
+    // argv[1..]. Non-WASI modules never read this — `args_get` /
+    // `args_sizes_get` are only called by WASI programs.
+    val argv0 = basenameWithoutWasmSuffix(cfg.file)
+    val ctx = WasiContext.default.copy(
+      args     = Seq(argv0) ++ cfg.wasiArgs,
+      preopens = preopens,
+    )
     val hostModules = Seq(EnvModule.default, Wasi.preview1(ctx))
     Runtime.instantiate(bytes, hostModules) match
       case Left(err)   =>
@@ -189,3 +209,13 @@ object Cli:
         platform.exit(1)
       case Right(Seq())   => ()                                            // void export — nothing to print
       case Right(results) => results.foreach(println)
+
+  /** Derive a program-name argv[0] from the wasm file path. Strips any
+    * leading directory component (handles both `/` and `\` separators so
+    * Windows-style paths round-trip on JS / Native) and removes a single
+    * `.wasm` suffix. Pure string manipulation — no `java.nio.file` so it
+    * stays callable from Scala.js. */
+  private def basenameWithoutWasmSuffix(path: String): String =
+    val lastSlash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+    val base      = if lastSlash < 0 then path else path.substring(lastSlash + 1)
+    base.stripSuffix(".wasm")

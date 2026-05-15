@@ -8,6 +8,24 @@ weight: 10
 
 Path to the `.wasm` binary to run. Required. The file is read as raw bytes; nothing about the path matters beyond that — there's no virtual-fs lookup, no env-var substitution.
 
+## `<wasi-args>...` (trailing positional)
+
+Anything positional after `<file>` is captured and passed to the WASI program's `_start` as `argv[1..]`. `argv[0]` is synthesised from the file basename (stripped of any `.wasm` suffix), matching the wasmtime / wasmer convention.
+
+```bash
+sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm /data/input.txt'
+# argv inside word_count.wasm: ["word_count", "/data/input.txt"]
+```
+
+If any value starts with `-` it would otherwise be parsed as a CLI flag — use the standard POSIX `--` separator to stop option parsing:
+
+```bash
+sbt 'cliJVM/run examples/rust/word_count.wasm -- -v --quiet /data/input.txt'
+# argv: ["word_count", "-v", "--quiet", "/data/input.txt"]
+```
+
+Non-WASI modules (`main` or `--invoke`-named exports) don't see these args — `argv` is a WASI concept; non-WASI exports take `i32` operands through [`--args`](#--a---args-n1n2) instead.
+
 ## `-i`, `--invoke <export>`
 
 Name of the export to invoke. Overrides the default dispatch. Use this when the module exports neither `_start` nor `main`, or when you want to run a specific function instead of the default entry point:
@@ -21,7 +39,7 @@ sbt 'cliJVM/run --invoke fact -a 5 examples/fact.wasm'
 
 Comma-separated decimal `i32` values to pass as arguments to the invoked export. Each `n` is parsed as `Int.parseInt(_)`, so values must fit in a signed 32-bit int. Negative numbers, hex, and floats are not accepted.
 
-`--args` only applies when the dispatch is not `_start` (the WASI command-mode entry point takes no wasm-level arguments — its argv comes from the WASI context, set via `--args`-the-export's-args is meaningless there). When dispatch is `main` or an `--invoke`-named export, the values are pushed onto the operand stack in order before the call.
+`--args` only applies when the dispatch is not `_start` (the WASI command-mode entry point takes no wasm-level arguments — its argv comes from the WASI context, populated by trailing positional args after `<file>`; see [`<wasi-args>...`](#wasi-args-trailing-positional) above). When dispatch is `main` or an `--invoke`-named export, the `--args` values are pushed onto the operand stack in order before the call.
 
 ## `--list-exports`
 
@@ -54,8 +72,8 @@ Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.1.1` an
 The CLI picks what to invoke based on what's exported:
 
 1. If `--invoke` is given, that export is invoked. `_start` and WASI dispatch are bypassed.
-2. Otherwise, if the module exports `_start`, it's treated as a WASI command-mode binary. The CLI runs it through `Wasi.run`, so `proc_exit(N)` becomes the process exit code, args/envs/preopens go through `WasiContext`, and `--args` is ignored.
-3. Otherwise, if the module exports `main`, that's invoked. `--args` is passed to it as `i32` operands.
+2. Otherwise, if the module exports `_start`, it's treated as a WASI command-mode binary. The CLI runs it through `Wasi.run`, so `proc_exit(N)` becomes the process exit code, args/envs/preopens go through `WasiContext`, trailing positional args become `argv[1..]`, and `--args` is ignored.
+3. Otherwise, if the module exports `main`, that's invoked. `--args` is passed to it as `i32` operands; trailing positional args are ignored.
 4. Otherwise, the CLI exits with `ExportNotFound("_start")` (the default it tried first).
 
 ## Exit codes

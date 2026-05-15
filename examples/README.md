@@ -24,14 +24,14 @@ sbt 'cliJVM/run examples/c/hello.wasm'
 # Hello from freestanding C!
 ```
 
-The Rust example needs a host directory mounted as a WASI preopen, with an input file inside:
+The Rust example needs a host directory mounted as a WASI preopen, with an input file inside. The path is passed to the program as `argv[1]`:
 
 ```bash
 mkdir -p ./data
 echo "The quick brown fox jumps over the lazy dog." > ./data/input.txt
 echo "Pack my box with five dozen liquor jugs."    >> ./data/input.txt
 
-sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm'
+sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm /data/input.txt'
 #        2       17       86 /data/input.txt
 ```
 
