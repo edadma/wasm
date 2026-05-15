@@ -46,12 +46,11 @@ final class ModuleInstance private[wasm] (
     private val elemDropped: Array[Boolean],
 ):
 
-  /** Public access to memory 0. Most callers only have one memory (the
-    * single-memory MVP shape) and don't need to distinguish; for those
-    * this stays the friendly accessor it always was. Multi-memory modules
-    * should reach for `.memories` directly. If the module has *no*
-    * memory, returns a zero-page placeholder so callers don't have to
-    * handle Option themselves. */
+  /** Public access to memory 0. Most callers only have one memory and
+    * don't need to distinguish; for those this stays the friendly accessor
+    * it always was. Multi-memory modules should reach for `.memories`
+    * directly. If the module has *no* memory, returns a zero-page
+    * placeholder so callers don't have to handle Option themselves. */
   val memory: Memory =
     if memories.length > 0 then memories(0) else new Memory(0)
 
@@ -93,10 +92,9 @@ final class ModuleInstance private[wasm] (
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(memories(idx))
 
-/** A runtime-side table. The MVP shape was `Array[Int]` (funcidx, or -1
-  * for null). Phase 8.C generalises slots to typed [[Value]]s — `RefNull`
-  * for empty slots, `RefFunc` / `RefExtern` for populated ones — and adds
-  * runtime-side resizing via `table.grow`.
+/** A runtime-side table. Slots are typed [[Value]]s — `RefNull` for empty
+  * slots, `RefFunc` / `RefExtern` for populated ones — and the table
+  * supports runtime-side resizing via `table.grow` (Phase 8.C).
   *
   * `slots` is exposed as a `var` so `table.copy` can run `System.arraycopy`
   * over the underlying arrays directly. Outside that one path, every
@@ -226,11 +224,10 @@ object Runtime:
     }
 
     // === memories ===========================================================
-    // Phase 8.D: surface multiple memories per module. The MVP shape was a
-    // single memory (any module without a memory section still got an
-    // implicit zero-page placeholder so `i32.load`/`i32.store` validation
-    // wouldn't crash); we keep that placeholder behaviour for zero-memory
-    // modules and otherwise allocate one `Memory` per binary entry.
+    // Phase 8.D: surface multiple memories per module. Zero-memory modules
+    // still get an implicit zero-page placeholder so `i32.load` / `i32.store`
+    // validation doesn't crash; otherwise allocate one `Memory` per binary
+    // entry.
     val memories =
       if module.memories.isEmpty then Array(new Memory(0))
       else

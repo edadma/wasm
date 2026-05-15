@@ -6,8 +6,9 @@ package io.github.edadma.wasm
   * Both decoders return the new cursor position alongside the value so callers
   * can chain reads without managing a separate counter.
   *
-  * For MVP everything fits in 32 bits; the readers cap at five bytes (the most
-  * a 32-bit value can occupy) to avoid runaway scans on malformed input.
+  * Every WebAssembly index and immediate fits in 32 bits; the readers cap at
+  * five bytes (the most a 32-bit value can occupy) to avoid runaway scans on
+  * malformed input.
   */
 object Leb128:
 

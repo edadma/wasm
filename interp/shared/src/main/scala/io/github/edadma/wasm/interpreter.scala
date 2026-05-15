@@ -73,7 +73,7 @@ object Interpreter:
     *               and as the fall-through position on normal end)
     *   - `elsePC` = byte just past the matching `else` (jumped to on a false `if` condition), or -1
     *   - `paramArity` = number of values popped from the stack at block entry (always 0 for the
-    *                    MVP inline blocktypes — only the multi-value typeidx form has > 0)
+    *                    inline blocktypes — only the multi-value typeidx form has > 0)
     *   - `resultArity` = number of values produced at block end / fall-through; carried across
     *                     `br` for Block/If (loops use `paramArity` as the branch arity instead)
     */
@@ -114,11 +114,11 @@ object Interpreter:
 
   // === Phase 8.D: multi-memory memarg ======================================
 
-  /** One memarg immediate for a load/store opcode. The reference-types-era
-    * encoding extends the MVP `(align, offset)` pair with an optional
+  /** One memarg immediate for a load/store opcode. The multi-memory
+    * encoding extends the original `(align, offset)` pair with an optional
     * memidx, signalled by bit 6 of the alignment LEB:
     *
-    *   align-LEB-byte0 & 0x40  == 0 → MVP: just align + offset; memIdx = 0.
+    *   align-LEB-byte0 & 0x40  == 0 → single-memory shape: just align + offset; memIdx = 0.
     *   align-LEB-byte0 & 0x40  != 0 → bit 6 is a "memidx-present" flag;
     *                                  alignment value is the LEB with that
     *                                  bit cleared, then a memidx LEB
@@ -215,7 +215,7 @@ object Interpreter:
     *
     *   - `0x40` → empty (no params, no results)
     *   - one of `0x7F` / `0x7E` / `0x7D` / `0x7C` → no params, one result
-    *     of the named scalar type (the MVP inline form)
+    *     of the named scalar type (the inline single-result form)
     *   - anything else → a signed-LEB128 typeidx (the multi-value form);
     *     the resulting value must be non-negative and index into `types`,
     *     and the block's params/results are copied from that `FuncType`.
@@ -329,9 +329,9 @@ object Interpreter:
         readMemArg(body, pc + 1).map(_._2)
       case 0x3f | 0x40 =>                                  // memory.size / memory.grow
         // Phase 8.D: the slot that was a "must-be-zero reserved byte"
-        // in the MVP is now a memidx LEB. For single-memory modules
-        // it's still always 0x00, but we read it as a u32 LEB so any
-        // memidx value parses cleanly.
+        // in the single-memory encoding is now a memidx LEB. For
+        // single-memory modules it's still always 0x00, but we read
+        // it as a u32 LEB so any memidx value parses cleanly.
         Leb128.readU32(body, pc + 1).map(_._2)
       case 0x41 =>                                         // i32.const
         Leb128.readS32(body, pc + 1).map(_._2)
@@ -476,9 +476,9 @@ end Interpreter
   */
 final class Interpreter private[wasm] (
     private val funcs: IndexedSeq[Interpreter.ResolvedFunc],
-    /** Phase 8.D: linear memories indexed by memidx. The MVP single-memory
-      * shape just makes this an `Array[Memory]` of length 1; multi-memory
-      * modules carry one entry per declared memory. Load/store paths read
+    /** Phase 8.D: linear memories indexed by memidx. Single-memory modules
+      * just make this an `Array[Memory]` of length 1; multi-memory modules
+      * carry one entry per declared memory. Load/store paths read
       * `memories(memArg.memIdx)` per opcode. */
     private val memories: Array[Memory],
     /** Module-instance globals (shared across calls — that persistence is
@@ -862,9 +862,9 @@ final class Interpreter private[wasm] (
 
       case 0x3f =>                                                                        // memory.size memidx
         // Phase 8.D: the byte that was a must-be-zero reserved slot in the
-        // MVP is now a memidx LEB. Single-memory modules still encode 0x00
-        // (one LEB byte = 0) and read the only memory; multi-memory
-        // modules can target memidx 1, 2, ... here.
+        // single-memory encoding is now a memidx LEB. Single-memory modules
+        // still encode 0x00 (one LEB byte = 0) and read the only memory;
+        // multi-memory modules can target memidx 1, 2, ... here.
         val mem = readMemIdxMemory(f)
         pushI32(mem.currentPages)
 
@@ -1404,9 +1404,9 @@ final class Interpreter private[wasm] (
 
       // === sign-extension proposal =======================================
       //
-      // Five opcodes added by the post-MVP sign-extension proposal. rustc
-      // emits 0xC0 (i32.extend8_s) from `as i8 as i32`, `i64 << 56 >> 56`,
-      // etc. — common enough to land alongside MVP. All single-byte.
+      // Five opcodes added by the sign-extension proposal. rustc emits 0xC0
+      // (i32.extend8_s) from `as i8 as i32`, `i64 << 56 >> 56`, etc. —
+      // common enough that every modern toolchain emits them. All single-byte.
 
       case 0xc0 => unop  (a => (a << 24) >> 24); f.pc += 1                                  // i32.extend8_s
       case 0xc1 => unop  (a => (a << 16) >> 16); f.pc += 1                                  // i32.extend16_s

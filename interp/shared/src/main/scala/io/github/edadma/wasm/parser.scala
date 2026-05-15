@@ -2,7 +2,7 @@ package io.github.edadma.wasm
 
 import scala.collection.mutable.ArrayBuffer
 
-/** Parser for the WebAssembly binary format (MVP subset).
+/** Parser for the WebAssembly binary format.
   *
   * Recognised sections: Type (1), Import (2), Function (3), Table (4),
   * Memory (5), Global (6), Export (7), Start (8), Element (9), Code (10),
@@ -66,7 +66,7 @@ object Parser:
 
     def readName(): String =
       val n = readU32()
-      // The MVP encoding is UTF-8; new String(bytes, "UTF-8") works on all three backends.
+      // WebAssembly names are UTF-8; new String(bytes, "UTF-8") works on all three backends.
       new String(readBytes(n), "UTF-8")
 
   private def parseInternal(bytes: Array[Byte]): WasmModule =
@@ -193,8 +193,8 @@ object Parser:
           // ahead of any defined tables. Until then, a module that mixes
           // imported and defined tables would see its `call_indirect`
           // tableidx immediates misalign against our `tables` array. The
-          // MVP allows at most one table, so single-defined-table modules
-          // remain correct.
+          // Core spec allows at most one table per module, so single-
+          // defined-table modules remain correct.
           val _ = c.readByte()                           // elem reftype
           skipLimits(c)
         case 0x02 =>                                     // memory — skip
@@ -247,11 +247,12 @@ object Parser:
 
   /** Parse Section 6. Per global: valtype byte, mutability byte, init-expr.
     *
-    * In MVP the init-expr is a single `*.const` instruction followed by the
-    * `end` byte. `global.get` against an imported global is also legal here
-    * per the spec, but we don't surface global imports yet (Phase 5), so the
-    * `global.get` form is rejected with a clear diagnostic rather than
-    * silently accepted with no live binding.
+    * For the scalar global types the init-expr is a single `*.const`
+    * instruction followed by the `end` byte. `global.get` against an
+    * imported global is also legal here per the spec, but we don't
+    * surface global imports yet (Phase 5), so the `global.get` form is
+    * rejected with a clear diagnostic rather than silently accepted with
+    * no live binding.
     */
   private def parseGlobalSection(c: Cursor): Vector[Global] =
     val n = c.readU32()
@@ -446,7 +447,7 @@ object Parser:
   /** Phase 8.B promotes flag 1 (passive) from "rejected" to a real
     * `DataSegment.Passive` carrying the bytes for `memory.init` /
     * `data.drop`. Flags 0 / 2 keep the active shape and now carry an
-    * explicit memIdx (always 0 in the single-memory MVP, but plumbed
+    * explicit memIdx (always 0 for single-memory modules, but plumbed
     * through so multi-memory Phase 8.D doesn't have to re-touch the
     * type).
     *

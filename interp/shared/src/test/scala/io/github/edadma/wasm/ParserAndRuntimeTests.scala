@@ -249,7 +249,7 @@ object ParserAndRuntimeTests:
   private def unsupportedOpcodes(): Unit =
 
     /** Patch the first i32.const opcode (0x41) in arith.wasm to a different
-      * opcode that isn't in the MVP subset. The pre-scan in
+      * opcode that isn't in the supported instruction set. The pre-scan in
       * `computeBodyMeta` runs during instantiation and surfaces the error. */
     def assertUnknownOpcode(patched: Array[Byte], opcode: Int, label: String): Unit =
       Runtime.instantiate(patched, Seq(EnvModule.default)) match
@@ -258,26 +258,28 @@ object ParserAndRuntimeTests:
         case other => check(false, s"$label: expected UnknownOpcode(0x${opcode.toHexString}), got $other")
 
     // Retargeted from 0x11 (formerly call_indirect, now supported in Phase 3)
-    // to 0x12 — a reserved byte immediately after call_indirect with no MVP
-    // meaning. Same code path through `skipImmediates`'s default branch.
+    // to 0x12 — a reserved byte immediately after call_indirect with no
+    // spec-assigned meaning. Same code path through `skipImmediates`'s
+    // default branch.
     test("interpreter: 0x12 (reserved, post-call_indirect) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x12), 0x12, "0x12 (reserved)")
     }
     // Retargeted from 0xC4 (now i64.extend32_s in the sign-extension proposal,
-    // Phase 7.D) to 0xC5 — also reserved, no MVP meaning, and not a prefix
-    // byte of any instruction set we currently parse. Same code path through
-    // `skipImmediates`'s default branch.
+    // Phase 7.D) to 0xC5 — also reserved, no spec-assigned meaning, and not
+    // a prefix byte of any instruction set we currently parse. Same code
+    // path through `skipImmediates`'s default branch.
     test("interpreter: 0xC5 (unassigned) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc5), 0xc5, "0xC5 (reserved)")
     }
     // Retargeted from 0x3F / 0x40 (formerly memory.size / memory.grow,
     // now supported in Phase 4) to 0x06 and 0x07 — both belong to the
-    // exception-handling proposal (try / catch) and are firmly post-MVP.
-    // Same code path through `skipImmediates`'s default branch.
-    test("interpreter: 0x06 (try, post-MVP) reported as UnknownOpcode") {
+    // exception-handling proposal (try / catch), which the interpreter
+    // doesn't implement. Same code path through `skipImmediates`'s
+    // default branch.
+    test("interpreter: 0x06 (try, unimplemented) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x06), 0x06, "0x06 (try)")
     }
-    test("interpreter: 0x07 (catch, post-MVP) reported as UnknownOpcode") {
+    test("interpreter: 0x07 (catch, unimplemented) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x07), 0x07, "0x07 (catch)")
     }
     test("interpreter: completely unused opcode (0xFF) reported as UnknownOpcode") {
