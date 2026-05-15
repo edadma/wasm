@@ -1060,6 +1060,30 @@ object Validator:
                0x47 | 0x48 | 0x49 | 0x4A | 0x4B | 0x4C =>                         // f64x2   6 cmps
             binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
 
+          // --- Chunk H — narrow / extend / extadd_pairwise / extmul + ---
+          // ---           f-i conv / demote / promote  (42 ops)        ---
+          //
+          // Two sub-groups by operand stack shape:
+          //   * binary v128×v128 → v128: narrow (4) + extmul (12) = 16.
+          //   * unary v128 → v128: extend (12) + extadd_pairwise (4) +
+          //                       trunc_sat / convert (8) + demote /
+          //                       promote (2) = 26.
+
+          case 0x65 | 0x66 | 0x85 | 0x86 |                                        // narrow
+               0x9C | 0x9D | 0x9E | 0x9F |                                        // extmul i8→i16
+               0xBC | 0xBD | 0xBE | 0xBF |                                        // extmul i16→i32
+               0xDC | 0xDD | 0xDE | 0xDF =>                                       // extmul i32→i64
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
+          case 0x87 | 0x88 | 0x89 | 0x8A |                                        // extend i8→i16
+               0xA7 | 0xA8 | 0xA9 | 0xAA |                                        // extend i16→i32
+               0xC7 | 0xC8 | 0xC9 | 0xCA |                                        // extend i32→i64
+               0x7C | 0x7D | 0x7E | 0x7F |                                        // extadd_pairwise
+               0x5E | 0x5F |                                                      // demote / promote
+               0xF8 | 0xF9 | 0xFA | 0xFB |                                        // trunc_sat / convert (f32x4 forms)
+               0xFC | 0xFD | 0xFE | 0xFF =>                                       // trunc_sat / convert (f64x2 forms)
+            unop(ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 

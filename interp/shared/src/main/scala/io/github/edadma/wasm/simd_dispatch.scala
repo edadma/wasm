@@ -40,9 +40,16 @@ import java.lang as jl
   *     shapes — signed + unsigned for i8x16/i16x8/i32x4, signed-only
   *     for i64x2 — and both float shapes. Subs 0x23..0x40 (i8x16/i16x8/i32x4),
   *     0xD6..0xDB (i64x2 signed), 0x41..0x4C (f32x4/f64x2)).
+  *   - H: 42 narrow / extend (widen) / extadd_pairwise / extmul / float-int
+  *     conv / demote / promote. Saturating narrow (4 subs 0x65/0x66/0x85/0x86);
+  *     extend low/high _s/_u across three shape pairs (12 subs 0x87..0x8A,
+  *     0xA7..0xAA, 0xC7..0xCA); pairwise widening sum (4 subs 0x7C..0x7F);
+  *     widening multiply across three shape pairs (12 subs 0x9C..0x9F,
+  *     0xBC..0xBF, 0xDC..0xDF); float↔int conv with NaN/range saturation
+  *     and the `_zero` half-fill suffix (8 subs 0xF8..0xFF); f32 ↔ f64
+  *     demote/promote with the same half-fill semantics (subs 0x5E/0x5F).
   *
-  * Chunks remaining: H (narrow/widen + float conversions), I (special —
-  * dot product + load_lane / store_lane).
+  * Chunks remaining: I (special — dot product + load_lane / store_lane).
   * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
@@ -1228,6 +1235,234 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(f64x2Cmp(a, b, (x, y) => x >= y))
 
+      // === Chunk H — narrow / extend / extadd_pairwise / extmul + conv ====
+      //
+      // Mechanically grouped by op family. All ops have no immediate past
+      // the sub-opcode; narrow + extmul pop two v128 operands, everything
+      // else pops one.
+
+      // --- narrow (0x65/0x66/0x85/0x86) ----------------------------------
+
+      case 0x65 =>                                                                        // i8x16.narrow_i16x8_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16NarrowI16x8S(a, b))
+
+      case 0x66 =>                                                                        // i8x16.narrow_i16x8_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16NarrowI16x8U(a, b))
+
+      case 0x85 =>                                                                        // i16x8.narrow_i32x4_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8NarrowI32x4S(a, b))
+
+      case 0x86 =>                                                                        // i16x8.narrow_i32x4_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8NarrowI32x4U(a, b))
+
+      // --- extend (= widen) — 12 ops -------------------------------------
+
+      case 0x87 =>                                                                        // i16x8.extend_low_i8x16_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtendI8x16(a, high = false, signed = true))
+
+      case 0x88 =>                                                                        // i16x8.extend_high_i8x16_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtendI8x16(a, high = true,  signed = true))
+
+      case 0x89 =>                                                                        // i16x8.extend_low_i8x16_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtendI8x16(a, high = false, signed = false))
+
+      case 0x8A =>                                                                        // i16x8.extend_high_i8x16_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtendI8x16(a, high = true,  signed = false))
+
+      case 0xA7 =>                                                                        // i32x4.extend_low_i16x8_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtendI16x8(a, high = false, signed = true))
+
+      case 0xA8 =>                                                                        // i32x4.extend_high_i16x8_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtendI16x8(a, high = true,  signed = true))
+
+      case 0xA9 =>                                                                        // i32x4.extend_low_i16x8_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtendI16x8(a, high = false, signed = false))
+
+      case 0xAA =>                                                                        // i32x4.extend_high_i16x8_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtendI16x8(a, high = true,  signed = false))
+
+      case 0xC7 =>                                                                        // i64x2.extend_low_i32x4_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtendI32x4(a, high = false, signed = true))
+
+      case 0xC8 =>                                                                        // i64x2.extend_high_i32x4_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtendI32x4(a, high = true,  signed = true))
+
+      case 0xC9 =>                                                                        // i64x2.extend_low_i32x4_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtendI32x4(a, high = false, signed = false))
+
+      case 0xCA =>                                                                        // i64x2.extend_high_i32x4_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtendI32x4(a, high = true,  signed = false))
+
+      // --- extadd_pairwise (0x7C..0x7F) ----------------------------------
+
+      case 0x7C =>                                                                        // i16x8.extadd_pairwise_i8x16_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtAddPairwiseI8x16(a, signed = true))
+
+      case 0x7D =>                                                                        // i16x8.extadd_pairwise_i8x16_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtAddPairwiseI8x16(a, signed = false))
+
+      case 0x7E =>                                                                        // i32x4.extadd_pairwise_i16x8_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtAddPairwiseI16x8(a, signed = true))
+
+      case 0x7F =>                                                                        // i32x4.extadd_pairwise_i16x8_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtAddPairwiseI16x8(a, signed = false))
+
+      // --- extmul — 12 ops -----------------------------------------------
+
+      case 0x9C =>                                                                        // i16x8.extmul_low_i8x16_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtMulI8x16(a, b, high = false, signed = true))
+
+      case 0x9D =>                                                                        // i16x8.extmul_high_i8x16_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtMulI8x16(a, b, high = true,  signed = true))
+
+      case 0x9E =>                                                                        // i16x8.extmul_low_i8x16_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtMulI8x16(a, b, high = false, signed = false))
+
+      case 0x9F =>                                                                        // i16x8.extmul_high_i8x16_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8ExtMulI8x16(a, b, high = true,  signed = false))
+
+      case 0xBC =>                                                                        // i32x4.extmul_low_i16x8_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtMulI16x8(a, b, high = false, signed = true))
+
+      case 0xBD =>                                                                        // i32x4.extmul_high_i16x8_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtMulI16x8(a, b, high = true,  signed = true))
+
+      case 0xBE =>                                                                        // i32x4.extmul_low_i16x8_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtMulI16x8(a, b, high = false, signed = false))
+
+      case 0xBF =>                                                                        // i32x4.extmul_high_i16x8_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4ExtMulI16x8(a, b, high = true,  signed = false))
+
+      case 0xDC =>                                                                        // i64x2.extmul_low_i32x4_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtMulI32x4(a, b, high = false, signed = true))
+
+      case 0xDD =>                                                                        // i64x2.extmul_high_i32x4_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtMulI32x4(a, b, high = true,  signed = true))
+
+      case 0xDE =>                                                                        // i64x2.extmul_low_i32x4_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtMulI32x4(a, b, high = false, signed = false))
+
+      case 0xDF =>                                                                        // i64x2.extmul_high_i32x4_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2ExtMulI32x4(a, b, high = true,  signed = false))
+
+      // --- demote / promote (0x5E/0x5F) ----------------------------------
+
+      case 0x5E =>                                                                        // f32x4.demote_f64x2_zero
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4DemoteF64x2Zero(a))
+
+      case 0x5F =>                                                                        // f64x2.promote_low_f32x4
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2PromoteLowF32x4(a))
+
+      // --- trunc_sat / convert (0xF8..0xFF) ------------------------------
+
+      case 0xF8 =>                                                                        // i32x4.trunc_sat_f32x4_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4TruncSatF32x4S(a))
+
+      case 0xF9 =>                                                                        // i32x4.trunc_sat_f32x4_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4TruncSatF32x4U(a))
+
+      case 0xFA =>                                                                        // f32x4.convert_i32x4_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4ConvertI32x4S(a))
+
+      case 0xFB =>                                                                        // f32x4.convert_i32x4_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4ConvertI32x4U(a))
+
+      case 0xFC =>                                                                        // i32x4.trunc_sat_f64x2_s_zero
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4TruncSatF64x2SZero(a))
+
+      case 0xFD =>                                                                        // i32x4.trunc_sat_f64x2_u_zero
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4TruncSatF64x2UZero(a))
+
+      case 0xFE =>                                                                        // f64x2.convert_low_i32x4_s
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2ConvertLowI32x4S(a))
+
+      case 0xFF =>                                                                        // f64x2.convert_low_i32x4_u
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2ConvertLowI32x4U(a))
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -1626,6 +1861,307 @@ private[wasm] trait SimdDispatch:
       ln += 1
     r
 
+  // === Chunk H — narrow/extend/extadd_pairwise/extmul/conv helpers =========
+  //
+  // Narrow: pack two source v128s (`a` low half / `b` high half) into one
+  // result, clamping each lane to the destination lane width's signed or
+  // unsigned range. The spec calls the output ordering "concatenate the
+  // saturated lanes of a and b" — bytes 0..7 of the result come from a's 8
+  // i16 lanes, bytes 8..15 from b's. Same shape one level up for the
+  // i16x8 ← i32x4 narrow.
+  //
+  // Extend (= widen): pull half the lanes of the source (low half = lanes
+  // 0..N/2-1, high half = lanes N/2..N-1) and sign- or zero-extend each
+  // into the wider lane width. `low_s` / `low_u` / `high_s` / `high_u` for
+  // each shape pair.
+  //
+  // extadd_pairwise: sum two adjacent narrower lanes (with extension) into
+  // one wider output lane. Output lane count is half the input lane count.
+  //
+  // extmul: like extend + multiply, fused. `extmul_low_*` multiplies the
+  // extended low halves of the two operands; `_high_*` the high halves.
+  // The result is the full-width product (no overflow at the wider lane).
+
+  /** Read a signed i16 lane (LE) from `a` at lane `ln`. */
+  private def readLaneI16Signed(a: Array[Byte], ln: Int): Int =
+    val raw = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+    (raw << 16) >> 16
+
+  /** Read an unsigned i16 lane (LE) from `a` at lane `ln`, in 0..65535. */
+  private def readLaneI16Unsigned(a: Array[Byte], ln: Int): Int =
+    (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+
+  /** Saturating narrow Short → signed Byte (`-128..127`). */
+  private inline def satS8(x: Int): Int =
+    if x > 127 then 127 else if x < -128 then -128 else x
+
+  /** Saturating narrow Short → unsigned Byte (`0..255`). */
+  private inline def satU8(x: Int): Int =
+    if x > 255 then 255 else if x < 0 then 0 else x
+
+  /** Saturating narrow Int → signed Short (`-32768..32767`). */
+  private inline def satS16(x: Int): Int =
+    if x > 32767 then 32767 else if x < -32768 then -32768 else x
+
+  /** Saturating narrow Int → unsigned Short (`0..65535`). */
+  private inline def satU16(x: Int): Int =
+    if x > 65535 then 65535 else if x < 0 then 0 else x
+
+  /** i8x16.narrow_i16x8_s: a's 8 i16 → bytes 0..7 (signed-clamp), b's → 8..15. */
+  private def i8x16NarrowI16x8S(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var i = 0
+    while i < 8 do
+      r(i)     = satS8(readLaneI16Signed(a, i)).toByte
+      r(i + 8) = satS8(readLaneI16Signed(b, i)).toByte
+      i += 1
+    r
+
+  /** i8x16.narrow_i16x8_u: signed Short → unsigned Byte (negative clamps to 0). */
+  private def i8x16NarrowI16x8U(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var i = 0
+    while i < 8 do
+      r(i)     = satU8(readLaneI16Signed(a, i)).toByte
+      r(i + 8) = satU8(readLaneI16Signed(b, i)).toByte
+      i += 1
+    r
+
+  /** i16x8.narrow_i32x4_s: a's 4 i32 → i16 lanes 0..3, b's → 4..7. */
+  private def i16x8NarrowI32x4S(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var i = 0
+    while i < 4 do
+      writeLaneI16(r, i,     satS16(readLaneI32(a, i)))
+      writeLaneI16(r, i + 4, satS16(readLaneI32(b, i)))
+      i += 1
+    r
+
+  /** i16x8.narrow_i32x4_u: signed Int → unsigned Short (negative clamps to 0). */
+  private def i16x8NarrowI32x4U(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var i = 0
+    while i < 4 do
+      writeLaneI16(r, i,     satU16(readLaneI32(a, i)))
+      writeLaneI16(r, i + 4, satU16(readLaneI32(b, i)))
+      i += 1
+    r
+
+  /** i16x8.extend_low_i8x16_s: bytes 0..7 of `a`, sign-extended to 8 i16 lanes. */
+  private def i16x8ExtendI8x16(a: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcOff = if high then 8 else 0
+    while ln < 8 do
+      val byte = a(srcOff + ln)
+      val v    = if signed then byte.toInt else byte & 0xff
+      writeLaneI16(r, ln, v)
+      ln += 1
+    r
+
+  /** i32x4.extend_low/high_i16x8_s/u. */
+  private def i32x4ExtendI16x8(a: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcLane0 = if high then 4 else 0
+    while ln < 4 do
+      val v =
+        if signed then readLaneI16Signed(a, srcLane0 + ln)
+        else readLaneI16Unsigned(a, srcLane0 + ln)
+      writeLaneI32(r, ln, v)
+      ln += 1
+    r
+
+  /** i64x2.extend_low/high_i32x4_s/u. */
+  private def i64x2ExtendI32x4(a: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcLane0 = if high then 2 else 0
+    while ln < 2 do
+      val srcI32 = readLaneI32(a, srcLane0 + ln)
+      val v: Long =
+        if signed then srcI32.toLong
+        else srcI32.toLong & 0xffffffffL
+      writeLaneI64(r, ln, v)
+      ln += 1
+    r
+
+  /** i16x8.extadd_pairwise_i8x16_{s,u}: pair (a[2k], a[2k+1]) and sum with
+    * extension into output i16 lane k. */
+  private def i16x8ExtAddPairwiseI8x16(a: Array[Byte], signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 8 do
+      val lo = if signed then a(ln * 2).toInt     else a(ln * 2)     & 0xff
+      val hi = if signed then a(ln * 2 + 1).toInt else a(ln * 2 + 1) & 0xff
+      writeLaneI16(r, ln, lo + hi)
+      ln += 1
+    r
+
+  /** i32x4.extadd_pairwise_i16x8_{s,u}. */
+  private def i32x4ExtAddPairwiseI16x8(a: Array[Byte], signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 4 do
+      val srcLo = ln * 2
+      val srcHi = ln * 2 + 1
+      val lo =
+        if signed then readLaneI16Signed(a, srcLo)
+        else readLaneI16Unsigned(a, srcLo)
+      val hi =
+        if signed then readLaneI16Signed(a, srcHi)
+        else readLaneI16Unsigned(a, srcHi)
+      writeLaneI32(r, ln, lo + hi)
+      ln += 1
+    r
+
+  /** i16x8.extmul_{low,high}_i8x16_{s,u}: extend half the source bytes from
+    * each operand, multiply at i32 precision, write back as i16. */
+  private def i16x8ExtMulI8x16(a: Array[Byte], b: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcOff = if high then 8 else 0
+    while ln < 8 do
+      val ax = if signed then a(srcOff + ln).toInt else a(srcOff + ln) & 0xff
+      val bx = if signed then b(srcOff + ln).toInt else b(srcOff + ln) & 0xff
+      writeLaneI16(r, ln, ax * bx)
+      ln += 1
+    r
+
+  /** i32x4.extmul_{low,high}_i16x8_{s,u}. */
+  private def i32x4ExtMulI16x8(a: Array[Byte], b: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcLane0 = if high then 4 else 0
+    while ln < 4 do
+      val ax =
+        if signed then readLaneI16Signed(a, srcLane0 + ln)
+        else readLaneI16Unsigned(a, srcLane0 + ln)
+      val bx =
+        if signed then readLaneI16Signed(b, srcLane0 + ln)
+        else readLaneI16Unsigned(b, srcLane0 + ln)
+      writeLaneI32(r, ln, ax * bx)
+      ln += 1
+    r
+
+  /** i64x2.extmul_{low,high}_i32x4_{s,u}: multiply at i64 precision so the
+    * full-width product is exact. */
+  private def i64x2ExtMulI32x4(a: Array[Byte], b: Array[Byte], high: Boolean, signed: Boolean): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    val srcLane0 = if high then 2 else 0
+    while ln < 2 do
+      val ax =
+        if signed then readLaneI32(a, srcLane0 + ln).toLong
+        else readLaneI32(a, srcLane0 + ln).toLong & 0xffffffffL
+      val bx =
+        if signed then readLaneI32(b, srcLane0 + ln).toLong
+        else readLaneI32(b, srcLane0 + ln).toLong & 0xffffffffL
+      writeLaneI64(r, ln, ax * bx)
+      ln += 1
+    r
+
+  /** i32x4.trunc_sat_f32x4_s — per-lane scalar trunc_sat semantics:
+    * NaN → 0, below-range → Int.MinValue, above-range → Int.MaxValue. */
+  private def i32x4TruncSatF32x4S(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 4 do
+      val v = jl.Float.intBitsToFloat(readLaneI32(a, ln))
+      val out =
+        if jl.Float.isNaN(v)        then 0
+        else if v < -2147483648.0f  then Int.MinValue
+        else if v >= 2147483648.0f  then Int.MaxValue
+        else                             v.toInt
+      writeLaneI32(r, ln, out)
+      ln += 1
+    r
+
+  /** i32x4.trunc_sat_f32x4_u — clamp to UInt32 range (0..0xFFFFFFFF; bit
+    * pattern stored as signed Int with -1 = 0xFFFFFFFF). */
+  private def i32x4TruncSatF32x4U(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 4 do
+      val v = jl.Float.intBitsToFloat(readLaneI32(a, ln))
+      val out =
+        if jl.Float.isNaN(v)        then 0
+        else if v <= -1.0f          then 0
+        else if v >= 4294967296.0f  then -1
+        else                             v.toLong.toInt
+      writeLaneI32(r, ln, out)
+      ln += 1
+    r
+
+  /** i32x4.trunc_sat_f64x2_s_zero — 2 f64 input lanes → i32 lanes 0..1;
+    * lanes 2 + 3 zero-filled per the `_zero` suffix. */
+  private def i32x4TruncSatF64x2SZero(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val v = jl.Double.longBitsToDouble(readLaneI64(a, ln))
+      val out =
+        if jl.Double.isNaN(v)       then 0
+        else if v < -2147483648.0   then Int.MinValue
+        else if v >= 2147483648.0   then Int.MaxValue
+        else                             v.toInt
+      writeLaneI32(r, ln, out)
+      ln += 1
+    r                                                                                   // lanes 2 + 3 stay 0 from `new Array`
+
+  /** i32x4.trunc_sat_f64x2_u_zero. */
+  private def i32x4TruncSatF64x2UZero(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val v = jl.Double.longBitsToDouble(readLaneI64(a, ln))
+      val out =
+        if jl.Double.isNaN(v)       then 0
+        else if v <= -1.0           then 0
+        else if v >= 4294967296.0   then -1
+        else                             v.toLong.toInt
+      writeLaneI32(r, ln, out)
+      ln += 1
+    r
+
+  /** f32x4.convert_i32x4_s. */
+  private def f32x4ConvertI32x4S(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 4 do
+      val v = readLaneI32(a, ln).toFloat
+      writeLaneI32(r, ln, jl.Float.floatToRawIntBits(v))
+      ln += 1
+    r
+
+  /** f32x4.convert_i32x4_u — zero-extend the signed Int lane to UInt32. */
+  private def f32x4ConvertI32x4U(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 4 do
+      val u = readLaneI32(a, ln).toLong & 0xffffffffL
+      writeLaneI32(r, ln, jl.Float.floatToRawIntBits(u.toFloat))
+      ln += 1
+    r
+
+  /** f64x2.convert_low_i32x4_s — reads only lanes 0..1 of the source. */
+  private def f64x2ConvertLowI32x4S(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val v = readLaneI32(a, ln).toDouble
+      writeLaneI64(r, ln, jl.Double.doubleToRawLongBits(v))
+      ln += 1
+    r
+
+  /** f64x2.convert_low_i32x4_u. */
+  private def f64x2ConvertLowI32x4U(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val u = readLaneI32(a, ln).toLong & 0xffffffffL
+      writeLaneI64(r, ln, jl.Double.doubleToRawLongBits(u.toDouble))
+      ln += 1
+    r
+
+  /** f32x4.demote_f64x2_zero — 2 f64 lanes → f32 lanes 0..1; lanes 2/3 zero. */
+  private def f32x4DemoteF64x2Zero(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val v = jl.Double.longBitsToDouble(readLaneI64(a, ln)).toFloat
+      writeLaneI32(r, ln, jl.Float.floatToRawIntBits(v))
+      ln += 1
+    r
+
+  /** f64x2.promote_low_f32x4 — read f32 lanes 0..1 of source, widen to f64. */
+  private def f64x2PromoteLowF32x4(a: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var ln = 0
+    while ln < 2 do
+      val v = jl.Float.intBitsToFloat(readLaneI32(a, ln)).toDouble
+      writeLaneI64(r, ln, jl.Double.doubleToRawLongBits(v))
+      ln += 1
+    r
+
   /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
     * 8/width source lanes, and widen each into a `outLaneBytes`-byte
     * destination lane. `width` ∈ {1,2,4}, `outLaneBytes = width * 2`. */
@@ -1776,6 +2312,30 @@ private[wasm] object SimdDispatch:
            0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDA | 0xDB |                              // i64x2   6 cmps (signed-only)
            0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x46 |                              // f32x4   6 cmps
            0x47 | 0x48 | 0x49 | 0x4A | 0x4B | 0x4C =>                             // f64x2   6 cmps
+        Right(p1)
+
+      // Chunk H — narrow / extend / extadd_pairwise / extmul + float-int
+      // conv + demote / promote (42 ops, all no-immediate past the
+      // sub-opcode; the validator handles unary vs binary operand stack
+      // shape). Grouped:
+      //   - 0x65/0x66/0x85/0x86 — narrow (signed/unsigned saturating)
+      //   - 0x87..0x8A, 0xA7..0xAA, 0xC7..0xCA — extend low/high _s/_u
+      //   - 0x7C..0x7F — extadd_pairwise _s/_u (i16x8 + i32x4)
+      //   - 0x9C..0x9F, 0xBC..0xBF, 0xDC..0xDF — extmul low/high _s/_u
+      //   - 0x5E/0x5F — f32x4.demote / f64x2.promote
+      //   - 0xF8..0xFF — trunc_sat / convert (signed + unsigned, both
+      //                   f32x4 and f64x2-low forms)
+      case 0x65 | 0x66 | 0x85 | 0x86 |                                            // narrow
+           0x87 | 0x88 | 0x89 | 0x8A |                                            // extend i8→i16
+           0xA7 | 0xA8 | 0xA9 | 0xAA |                                            // extend i16→i32
+           0xC7 | 0xC8 | 0xC9 | 0xCA |                                            // extend i32→i64
+           0x7C | 0x7D | 0x7E | 0x7F |                                            // extadd_pairwise
+           0x9C | 0x9D | 0x9E | 0x9F |                                            // extmul i8→i16
+           0xBC | 0xBD | 0xBE | 0xBF |                                            // extmul i16→i32
+           0xDC | 0xDD | 0xDE | 0xDF |                                            // extmul i32→i64
+           0x5E | 0x5F |                                                          // demote / promote
+           0xF8 | 0xF9 | 0xFA | 0xFB |                                            // trunc_sat / convert (f32x4 forms)
+           0xFC | 0xFD | 0xFE | 0xFF =>                                           // trunc_sat / convert (f64x2 forms)
         Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))
