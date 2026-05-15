@@ -19,7 +19,7 @@ import scopt.OParser
   * == Default dispatch (no `--invoke`) ==
   *
   *   1. If the module exports `_start`, treat it as a WASI command-mode
-  *      module: invoke `_start` via [[Wasi.run]] so a `proc_exit(N)` call
+  *      module: invoke `_start` via `Wasi.run` so a `proc_exit(N)` call
   *      propagates as the process exit code. This is the convention
   *      wasmtime uses, and what clang `--target=wasm32-unknown-wasi`
   *      produces.
@@ -29,7 +29,7 @@ import scopt.OParser
   *      `examples/hello.wat`).
   *
   * Both `env` (interp's tiny default host) and `wasi_snapshot_preview1`
-  * (the [[Wasi]] shim) are wired unconditionally; a module that imports
+  * (the `Wasi` shim) are wired unconditionally; a module that imports
   * neither sees them as no-ops, and a module that imports one but not the
   * other gets only the imports it declared resolved. `WasiContext.default`
   * routes fd 1 / fd 2 to `System.out` / `System.err`, which is what end
@@ -42,7 +42,7 @@ object Cli:
     *
     * `openPreopen` constructs a host-backed preopen from a real on-disk
     * directory. Each platform's `Main.scala` wires it to its own
-    * [[HostPreopen.fromDir]] factory (JVM/Native go through `java.nio.file`
+    * `HostPreopen.fromDir` factory (JVM/Native go through `java.nio.file`
     * + `FileChannel`; JS goes through Node `fs.*Sync`). Constructor throws
     * `IllegalArgumentException` if `hostPath` isn't an existing directory;
     * [[execute]] catches that and exits with a clear error before

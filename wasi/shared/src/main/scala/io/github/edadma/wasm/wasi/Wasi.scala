@@ -1600,9 +1600,9 @@ object WasiContext:
     *
     * Phase 7.E.2 extends the trait with [[open]], which `path_open`
     * dispatches to. The default impl returns `Left(Wasi.ENOTCAPABLE)`,
-    * so the [[named]] factory keeps working as a "name-only" preopen
+    * so the [[Preopen.named]] factory keeps working as a "name-only" preopen
     * (advertises a directory, refuses to open anything inside it). The
-    * [[inMemory]] factory returns a Preopen backed by an in-memory
+    * [[Preopen.inMemory]] factory returns a Preopen backed by an in-memory
     * `Map[String, Array[Byte]]`, which is what tests use.
     *
     * `name` is interpreted as UTF-8 — `fd_prestat_get`'s `pr_name_len`
@@ -1618,13 +1618,13 @@ object WasiContext:
       * pointers — that's done before dispatch).
       *
       * `oflags` and `fdflags` are passed through verbatim. Read-only
-      * impls like [[inMemory]] ignore them; future write-capable impls
+      * impls like [[Preopen.inMemory]] ignore them; future write-capable impls
       * will act on `OFLAGS_CREAT` (1), `OFLAGS_DIRECTORY` (2),
       * `OFLAGS_EXCL` (4), `OFLAGS_TRUNC` (8), and the `FDFLAGS_*` bits.
       *
       * The default impl returns `Left(Wasi.ENOTCAPABLE)`: the preopen
       * advertises its name through the prestat-walk surface but has no
-      * FS capability behind it. This is what [[named]] inherits — a
+      * FS capability behind it. This is what [[Preopen.named]] inherits — a
       * test that constructs `Preopen.named("/sandbox")` and then tries
       * to `path_open` against fd 3 gets ENOTCAPABLE rather than ENOENT,
       * because the distinction matters (ENOENT says "no such path",
