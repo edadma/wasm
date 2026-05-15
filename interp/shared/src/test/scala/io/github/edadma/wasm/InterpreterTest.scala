@@ -59,6 +59,7 @@ object InterpreterTest:
     SimdBitwiseReductionsTests.run()
     SimdComparesTests.run()
     SimdNarrowWidenConvTests.run()
+    SimdDotLaneMemTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size
