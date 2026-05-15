@@ -662,7 +662,7 @@ final class Interpreter private[wasm] (
 
       case 0x0b =>                                                                        // end
         if f.labels.nonEmpty then
-          f.labels.remove(f.labels.size - 1)
+          val _ = f.labels.remove(f.labels.size - 1)
           f.pc += 1
         else
           // function-level end — fall through into return semantics
@@ -743,7 +743,9 @@ final class Interpreter private[wasm] (
 
       // === parametric ====================================================
 
-      case 0x1a => popValue(); f.pc += 1                                                  // drop
+      case 0x1a =>                                                                        // drop
+        val _ = popValue()
+        f.pc += 1
       case 0x1b =>                                                                        // select
         val cond = popI32()
         val b    = popValue()
@@ -1511,7 +1513,6 @@ final class Interpreter private[wasm] (
     * up to roughly 16 sub-cases of non-trivial length. The body is
     * otherwise structurally identical to what `step` would have done. */
   private def stepFc(f: Frame): Unit =
-    val body = f.func.body
     val (sub, p1) = readU32At(f, f.pc + 1)
     sub match
       case 0 =>                                                                         // i32.trunc_sat_f32_s
@@ -1788,13 +1789,14 @@ final class Interpreter private[wasm] (
         saved(k) = valueStack.remove(valueStack.size - 1)
         k -= 1
       // Clear back to the label's entry stack height.
-      while valueStack.size > target.stackHeight do valueStack.remove(valueStack.size - 1)
+      while valueStack.size > target.stackHeight do
+        val _ = valueStack.remove(valueStack.size - 1)
       // Restore the carried values.
       var j = 0
       while j < saved.length do { valueStack += saved(j); j += 1 }
       // Pop labels above and including the target.
       var pops = n + 1
-      while pops > 0 do { f.labels.remove(f.labels.size - 1); pops -= 1 }
+      while pops > 0 do { val _ = f.labels.remove(f.labels.size - 1); pops -= 1 }
       // Re-enter loops by re-pushing the label (loops branch to their start).
       if target.kind == BlockKind.Loop then f.labels += target
       f.pc = target.targetPC
@@ -1808,10 +1810,11 @@ final class Interpreter private[wasm] (
       if valueStack.isEmpty then fail(WasmError.TypeMismatch)
       results(k) = valueStack.remove(valueStack.size - 1)
       k -= 1
-    while valueStack.size > f.stackBase do valueStack.remove(valueStack.size - 1)
+    while valueStack.size > f.stackBase do
+      val _ = valueStack.remove(valueStack.size - 1)
     var j = 0
     while j < results.length do { valueStack += results(j); j += 1 }
-    frames.remove(frames.size - 1)
+    val _ = frames.remove(frames.size - 1)
 
   // === call ================================================================
 

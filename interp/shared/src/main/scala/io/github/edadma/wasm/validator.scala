@@ -286,15 +286,14 @@ object Validator:
         operandStack.remove(operandStack.size - 1)
 
     /** Pop one value and check it matches `expected`. `Unknown`
-      * matches any expected type (synthesises it for diagnostics). */
-    def popVal(expected: ValueType): AbsValue =
-      val v = popVal()
-      v match
-        case AbsValue.Unknown   => AbsValue.Known(expected)
+      * matches any expected type. The popped value isn't returned —
+      * every caller just wants the side-effect of pop + type-check. */
+    def popVal(expected: ValueType): Unit =
+      popVal() match
+        case AbsValue.Unknown   => ()
         case AbsValue.Known(t)  =>
           if t != expected then
             fail(s"type mismatch: expected ${typeName(expected)}, got ${typeName(t)}")
-          v
 
     /** Pop a vector of values in REVERSE order so the bottom of
       * `ts` matches the top of the stack — consumer semantics. */
@@ -323,13 +322,13 @@ object Validator:
       popVals(frame.endTypes)
       if operandStack.size != frame.baseHeight then
         fail(s"end of ${frame.kind}: stack height ${operandStack.size}, expected ${frame.baseHeight} (extra values on stack)")
-      ctrlStack.remove(ctrlStack.size - 1)
+      val _ = ctrlStack.remove(ctrlStack.size - 1)
       frame
 
     def unreachable(): Unit =
       val frame = topFrame
       while operandStack.size > frame.baseHeight do
-        operandStack.remove(operandStack.size - 1)
+        val _ = operandStack.remove(operandStack.size - 1)
       frame.unreachable = true
 
     /** Label-types of a control frame — what `br N` to it carries.
@@ -385,7 +384,7 @@ object Validator:
         else 0
       if memIdx < 0 || memIdx >= memoryCount then
         fail(s"$label: memidx $memIdx out of range (have $memoryCount memories)")
-      readU32() // offset (discarded)
+      val _ = readU32() // offset (discarded)
       ()
 
     /** Read + validate a single memidx LEB immediate. Phase 8.D-shaped
@@ -453,11 +452,11 @@ object Validator:
       case 0x00 => unreachable()                                                // unreachable
       case 0x01 => ()                                                           // nop
       case 0x02 | 0x03 | 0x04 =>                                                // block / loop / if
-        val (sig, np) = Interpreter.readBlocktype(body, pc, types) match
+        val (_, np) = Interpreter.readBlocktype(body, pc, types) match
           case Right(t) => t
           case Left(e)  => throw new ValFail(e)
         pc = np
-        val ft = resolveBlockSig(sig)
+        val ft = resolveBlockSig()
         op match
           case 0x02 =>
             popVals(ft.params)
@@ -543,7 +542,7 @@ object Validator:
 
       // === parametric ==================================================
 
-      case 0x1a => popVal()                                                     // drop
+      case 0x1a => val _ = popVal()                                             // drop
       case 0x1b =>                                                              // select (untyped, numeric-only)
         popVal(ValueType.I32Type)
         val t1 = popVal()
@@ -703,8 +702,8 @@ object Validator:
 
       // === const ========================================================
 
-      case 0x41 => readS32();         pushVal(ValueType.I32Type)                // i32.const
-      case 0x42 => readS64();         pushVal(ValueType.I64Type)                // i64.const
+      case 0x41 => val _ = readS32(); pushVal(ValueType.I32Type)                // i32.const
+      case 0x42 => val _ = readS64(); pushVal(ValueType.I64Type)                // i64.const
       case 0x43 => skipRaw(4);        pushVal(ValueType.F32Type)                // f32.const
       case 0x44 => skipRaw(8);        pushVal(ValueType.F64Type)                // f64.const
 
@@ -1202,14 +1201,12 @@ object Validator:
       popVal(ValueType.V128Type)
       popVal(ValueType.I32Type)
 
-    /** Resolve a [[Interpreter.BlockSig]] (arity-only) into a full
-      * `FuncType` so we can pop+push the actual types. For the inline
-      * blocktype forms the arity tells us everything: empty (0,0) is
-      * `FuncType([], [])`; single-result (0,1) types arrive ambiguous
-      * — we re-decode the byte to pick the type. Multi-value
-      * blocktypes (`paramArity > 0` or `resultArity > 1`) cache the
-      * original typeidx via a second decode pass on the same offset. */
-    def resolveBlockSig(sig: Interpreter.BlockSig): FuncType =
+    /** Resolve the blocktype at `opPC + 1` into a full `FuncType` so
+      * we can pop+push the actual types. For the inline blocktype
+      * forms (empty / single-result) we re-decode the byte to pick
+      * the type. Multi-value blocktypes resolve their typeidx via a
+      * second decode pass on the same offset. */
+    def resolveBlockSig(): FuncType =
       // The blocktype byte sat at `opPC + 1`. Re-decode to get the
       // actual types. (Cheap — one byte, occasionally a few-byte SLEB.)
       val pos = opPC + 1

@@ -57,7 +57,7 @@ object HostMultiMemoryTests:
       val collected = new StringBuilder
       val env       = EnvModule.withWriter(c => collected.append(c.toChar))
       val inst      = instantiate(Fixtures.putchar, env)
-      runRight(inst.invoke("hello"))
+      runOk(inst.invoke("hello"))
       check(collected.toString == "Hi!", s"single-memory HostFunc regression — got '${collected}'")
     }
 

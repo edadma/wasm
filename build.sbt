@@ -45,6 +45,9 @@ val commonScalacOptions = Seq(
   "-deprecation",
   "-feature",
   "-unchecked",
+  "-Wunused:all",
+  "-Wnonunit-statement",
+  "-Wvalue-discard",
 )
 
 // ============================================================================

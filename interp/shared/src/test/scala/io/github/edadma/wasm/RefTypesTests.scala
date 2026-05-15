@@ -156,7 +156,7 @@ object RefTypesTests:
 
     test("table.grow newly-added funcref slots read back as null") {
       val inst = instantiate(Fixtures.ref_types)
-      callI32(inst, "tfunc_grow_null", 2)
+      val _ = callI32(inst, "tfunc_grow_null", 2)
       // Slot 9 is one of the newly-added; it should be a null funcref.
       check(callI32(inst, "funcref_slot_is_null", 9) == 1, "new slot 9 should be null")
     }

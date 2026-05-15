@@ -2,7 +2,7 @@ package io.github.edadma.wasm.wasi
 
 import scala.collection.mutable.ArrayBuffer
 
-import io.github.edadma.wasm.{I32, ModuleInstance, Runtime}
+import io.github.edadma.wasm.{I32, ModuleInstance, Runtime, WasmError}
 
 /** Shared framework + helpers for the wasi test suite. Mirrors `interp`'s
   * `TestSupport`: a single object that holds the `passed` / `failures`
@@ -38,6 +38,14 @@ object WasiTestSupport:
 
   def check(cond: Boolean, msg: => String): Unit =
     if !cond then throw new AssertionError(msg)
+
+  /** Invoke for side-effect, discarding the success value but asserting
+    * it wasn't a Left(error). Tests reach for this when seeding memory
+    * via `write_i32` / `write_byte` helpers exported by the fixture —
+    * they care that the write happened, not what the export returned. */
+  def runOk[A](e: Either[WasmError, A]): Unit = e match
+    case Right(_)  => ()
+    case Left(err) => throw new AssertionError(s"unexpected error: $err")
 
   // === Instantiation helpers =============================================
 

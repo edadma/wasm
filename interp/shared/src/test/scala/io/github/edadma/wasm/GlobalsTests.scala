@@ -42,7 +42,7 @@ object GlobalsTests:
       inst.globalValue("counter") match
         case Right(I32(0)) => ()
         case other         => check(false, s"`counter` should start at 0: $other")
-      runRight(inst.invoke("bump"))
+      runOk(inst.invoke("bump"))
       inst.globalValue("counter") match
         case Right(I32(1)) => ()
         case other         => check(false, s"`counter` should now be 1: $other")
@@ -57,10 +57,10 @@ object GlobalsTests:
       check(callF64(inst, "get_f64") == -2.5,                  "f64 init")
 
       // set, then read back — confirms `global.set` is type-stable for each type.
-      runRight(inst.invoke("set_i32", Seq(I32(-7))))
-      runRight(inst.invoke("set_i64", Seq(I64(Long.MinValue))))
-      runRight(inst.invoke("set_f32", Seq(F32(Float.NaN))))
-      runRight(inst.invoke("set_f64", Seq(F64(Double.PositiveInfinity))))
+      runOk(inst.invoke("set_i32", Seq(I32(-7))))
+      runOk(inst.invoke("set_i64", Seq(I64(Long.MinValue))))
+      runOk(inst.invoke("set_f32", Seq(F32(Float.NaN))))
+      runOk(inst.invoke("set_f64", Seq(F64(Double.PositiveInfinity))))
 
       check(callI32(inst, "get_i32") == -7,                            "i32 round-trip")
       check(callI64(inst, "get_i64") == Long.MinValue,                 "i64 round-trip")
@@ -91,20 +91,20 @@ object GlobalsTests:
       // must to keep arithmetic semantics intact.
       val inst = instantiate(Fixtures.globals_types)
 
-      runRight(inst.invoke("set_f32", Seq(F32(-0.0f))))
+      runOk(inst.invoke("set_f32", Seq(F32(-0.0f))))
       check(jl.Float.floatToRawIntBits(callF32(inst, "get_f32"))
               == jl.Float.floatToRawIntBits(-0.0f),
             "f32 -0 sign bit preserved across set/get")
 
-      runRight(inst.invoke("set_f32", Seq(F32(Float.NegativeInfinity))))
+      runOk(inst.invoke("set_f32", Seq(F32(Float.NegativeInfinity))))
       check(callF32(inst, "get_f32") == Float.NegativeInfinity, "f32 -Inf survives")
 
-      runRight(inst.invoke("set_f64", Seq(F64(-0.0))))
+      runOk(inst.invoke("set_f64", Seq(F64(-0.0))))
       check(jl.Double.doubleToRawLongBits(callF64(inst, "get_f64"))
               == jl.Double.doubleToRawLongBits(-0.0),
             "f64 -0 sign bit preserved across set/get")
 
-      runRight(inst.invoke("set_f64", Seq(F64(Double.NegativeInfinity))))
+      runOk(inst.invoke("set_f64", Seq(F64(Double.NegativeInfinity))))
       check(callF64(inst, "get_f64") == Double.NegativeInfinity, "f64 -Inf survives")
     }
 

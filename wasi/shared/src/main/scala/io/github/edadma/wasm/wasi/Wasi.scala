@@ -1,5 +1,6 @@
 package io.github.edadma.wasm.wasi
 
+import scala.annotation.unused
 import scala.collection.mutable.ArrayBuffer
 
 import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInstance, Value, WasmError}
@@ -414,7 +415,7 @@ object Wasi:
             case None =>
               // `file` is known non-empty here because the upfront
               // dispatch returned EBADF otherwise. `.get` is safe.
-              file.get.write(data, buf, len)
+              val _ = file.get.write(data, buf, len)
           total += len
           i     += 1
 
@@ -922,7 +923,7 @@ object Wasi:
           fdTable.lookup(fd) match
             case Some(file) =>
               file.close()
-              fdTable.release(fd)
+              val _ = fdTable.release(fd)
               Seq(I32(ESUCCESS))
             case None => Seq(I32(EBADF))
       case _ => Seq(I32(EINVAL))
@@ -1005,7 +1006,7 @@ object Wasi:
   private def pathFilestatGet(memory: Memory, args: Seq[Value],
                               ctx: WasiContext): Seq[Value] =
     args match
-      case Seq(I32(fd), I32(_lookupflags), I32(pathPtr), I32(pathLen),
+      case Seq(I32(fd), I32(_), I32(pathPtr), I32(pathLen),
                I32(bufPtr)) =>
         val idx = fd - 3
         if idx < 0 || idx >= ctx.preopens.length then
@@ -1208,13 +1209,10 @@ object Wasi:
             // we can — userspace observes `bufused < bufLen` and knows
             // to allocate a larger buffer.
             val dirNext: Long = (i + 1).toLong   // cookie of NEXT entry
-            // Header — up to 24 bytes of it.
-            val headerEnd = math.min(DIRENT_HEADER_SIZE, remaining)
             writeDirentHeader(data, bufPtr + written, dirNext, ino, namlen, ft)
-            // Zero out anything we don't naturally write (padding bytes
-            // 21..23). writeDirentHeader handles that itself.
             // Decide how many of the 24 header bytes "land" in the
-            // user buffer.
+            // user buffer (writeDirentHeader zero-fills padding bytes
+            // 21..23 itself).
             val headerInBuf = math.min(DIRENT_HEADER_SIZE, remaining)
             // Name bytes.
             val nameRemaining = remaining - headerInBuf
@@ -1399,7 +1397,7 @@ object Wasi:
   private def pathOpen(memory: Memory, args: Seq[Value],
                        ctx: WasiContext, fdTable: FdTable): Seq[Value] =
     args match
-      case Seq(I32(dirfd), I32(_dirflags), I32(pathPtr), I32(pathLen),
+      case Seq(I32(dirfd), I32(_), I32(pathPtr), I32(pathLen),
                I32(oflags), _, _ /* rights i64s, ignored */, I32(fdflags),
                I32(openedFdOut)) =>
         val idx = dirfd - 3
@@ -1631,7 +1629,7 @@ object WasiContext:
       * to `path_open` against fd 3 gets ENOTCAPABLE rather than ENOENT,
       * because the distinction matters (ENOENT says "no such path",
       * ENOTCAPABLE says "you can't even ask through this preopen"). */
-    def open(path: String, oflags: Int, fdflags: Int): Either[Int, Wasi.FsFile] =
+    def open(@unused path: String, @unused oflags: Int, @unused fdflags: Int): Either[Int, Wasi.FsFile] =
       Left(Wasi.ENOTCAPABLE)
 
     /** Stat a path within this preopen WITHOUT opening it. Called by
@@ -1644,7 +1642,7 @@ object WasiContext:
       * Default impl returns `Left(Wasi.ENOTCAPABLE)` for consistency
       * with [[open]] — a name-only preopen refuses path-resolved
       * lookups the same way it refuses opens. */
-    def statPath(path: String): Either[Int, Long] =
+    def statPath(@unused path: String): Either[Int, Long] =
       Left(Wasi.ENOTCAPABLE)
 
     /** Remove `path` from this preopen. Called by `path_unlink_file`.
@@ -1656,7 +1654,7 @@ object WasiContext:
       * impl overrides to actually drop the path from its backing
       * map; any already-open handles keep their own cell reference
       * (POSIX unlink-while-open). */
-    private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
+    private[wasi] def unlinkPath(@unused path: String): Either[Int, Unit] =
       Left(Wasi.ENOTCAPABLE)
 
     /** Create a directory entry at `path`. Called by
@@ -1664,7 +1662,7 @@ object WasiContext:
       * `Left(Wasi.EEXIST)` if anything (file or dir) already exists
       * at that path, `Left(Wasi.ENOTCAPABLE)` for a preopen with no
       * FS capability. */
-    private[wasi] def mkdir(path: String): Either[Int, Unit] =
+    private[wasi] def mkdir(@unused path: String): Either[Int, Unit] =
       Left(Wasi.ENOTCAPABLE)
 
     /** Enumerate directory entries for `fd_readdir`. Each tuple is
@@ -1812,7 +1810,7 @@ object WasiContext:
       override private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
         cells.get(path) match
           case Some(FileEntry(_)) =>
-            cells.remove(path)
+            val _ = cells.remove(path)
             Right(())
           case Some(DirEntry) => Left(Wasi.EISDIR)
           case None           => Left(Wasi.ENOENT)

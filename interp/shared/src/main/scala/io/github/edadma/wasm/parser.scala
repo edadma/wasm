@@ -195,13 +195,13 @@ object Parser:
           // tableidx immediates misalign against our `tables` array. The
           // MVP allows at most one table, so single-defined-table modules
           // remain correct.
-          c.readByte()                                   // elem reftype
+          val _ = c.readByte()                           // elem reftype
           skipLimits(c)
         case 0x02 =>                                     // memory — skip
           skipLimits(c)
         case 0x03 =>                                     // global — skip (Phase 5)
-          c.readByte()                                   // valtype
-          c.readByte()                                   // mut
+          val _ = c.readByte()                           // valtype
+          val _ = c.readByte()                           // mut
         case other =>
           fail(WasmError.InvalidModule(s"unknown import kind 0x${other.toHexString}"))
       i += 1
@@ -209,8 +209,9 @@ object Parser:
 
   private def skipLimits(c: Cursor): Unit =
     val flag = c.readByte()
-    c.readU32() // min
-    if (flag & 0x01) != 0 then c.readU32() // max
+    val _ = c.readU32() // min
+    if (flag & 0x01) != 0 then
+      val _ = c.readU32() // max
 
   // === Function section ===
 

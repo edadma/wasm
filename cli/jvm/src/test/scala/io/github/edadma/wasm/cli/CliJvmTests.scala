@@ -6,6 +6,7 @@ import java.io.{ByteArrayOutputStream, PrintStream}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 
+import scala.annotation.unused
 import scala.collection.mutable.ArrayBuffer
 
 /** Hand-rolled JVM tests for the `wasm` CLI dispatcher.
@@ -62,7 +63,7 @@ object CliJvmTests:
   private final class Exited(val code: Int)
       extends RuntimeException(null, null, false, false)
 
-  private final class CapturingPlatform(fixturePath: String) extends Cli.Platform:
+  private final class CapturingPlatform(@unused fixturePath: String) extends Cli.Platform:
     def readFile(path: String): Array[Byte] = Files.readAllBytes(Paths.get(path))
     def exit(code: Int): Nothing            = throw new Exited(code)
     // Delegate to the real JVM HostPreopen factory; the test suite drives
@@ -180,8 +181,8 @@ object CliJvmTests:
           s"expected stdout to contain 'from the host', was:\n$out")
       finally
         // Best-effort cleanup; tests must not leak temp dirs.
-        Files.deleteIfExists(tmp.toPath.resolve("hello.txt"))
-        Files.deleteIfExists(tmp.toPath)
+        val _ = Files.deleteIfExists(tmp.toPath.resolve("hello.txt"))
+        val _ = Files.deleteIfExists(tmp.toPath)
     }
 
     test("--preopen with a non-existent host directory fails cleanly with exit 1") {

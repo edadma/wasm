@@ -1,6 +1,6 @@
 package io.github.edadma.wasm.wasi
 
-import io.github.edadma.wasm.{I32, Runtime}
+import io.github.edadma.wasm.Runtime
 
 import WasiTestSupport.{check, test}
 

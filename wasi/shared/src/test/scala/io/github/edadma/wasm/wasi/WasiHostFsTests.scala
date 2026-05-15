@@ -39,7 +39,7 @@ object WasiHostFsTests:
     test("fromDir: missing host path throws IllegalArgumentException") {
       val ok =
         try
-          HostPreopen.fromDir("/this/path/does/not/exist/wasm-test", "/x")
+          val _ = HostPreopen.fromDir("/this/path/does/not/exist/wasm-test", "/x")
           false
         catch case _: IllegalArgumentException => true
       check(ok, "expected IllegalArgumentException for missing hostPath")
@@ -51,7 +51,7 @@ object WasiHostFsTests:
         TempDir.writeFile(root, "afile", Array[Byte](1, 2, 3))
         val ok =
           try
-            HostPreopen.fromDir(s"$root/afile", "/x")
+            val _ = HostPreopen.fromDir(s"$root/afile", "/x")
             false
           catch case _: IllegalArgumentException => true
         check(ok, "expected IllegalArgumentException for file hostPath")
