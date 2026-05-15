@@ -4,9 +4,9 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0), and **the full SIMD proposal** (`V128` value type plumbed end-to-end; all ~236 opcodes under the `0xFD` prefix — `v128.const`, the 14 loads + 8 stores including `load*_lane` / `store*_lane`, lane access, integer + float arithmetic, shifts, min/max, bitwise + reductions, comparisons, narrow / extend / extadd_pairwise / extmul, float ↔ int conv, demote / promote, and `i32x4.dot_i16x8_s`). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
+The interpreter implements every WebAssembly Core opcode plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0), and **the full SIMD proposal** (`V128` value type plumbed end-to-end; all ~236 opcodes under the `0xFD` prefix — `v128.const`, the 14 loads + 8 stores including `load*_lane` / `store*_lane`, lane access, integer + float arithmetic, shifts, min/max, bitwise + reductions, comparisons, narrow / extend / extadd_pairwise / extmul, float ↔ int conv, demote / promote, and `i32x4.dot_i16x8_s`). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
-## Numeric (full MVP, all four scalar types)
+## Numeric (all four scalar types)
 
 Every `i32` / `i64` / `f32` / `f64` opcode:
 
@@ -15,7 +15,7 @@ Every `i32` / `i64` / `f32` / `f64` opcode:
 - **Arithmetic** — `add`, `sub`, `mul`, `div_s` / `div_u` (ints), `div` (floats), `rem_s` / `rem_u`.
 - **Bitwise** — `and`, `or`, `xor` (ints).
 - **Shifts** — `shl`, `shr_s`, `shr_u`, `rotl`, `rotr` (ints).
-- **Conversion** — every cross-type cast in the MVP (`i32.wrap_i64`, `i64.extend_i32_s`/`_u`, `i32.trunc_f32_s`/`_u`/…, `f32.convert_i32_s`/`_u`/…, `f32.demote_f64`, `f64.promote_f32`).
+- **Conversion** — every cross-type cast in the Core spec (`i32.wrap_i64`, `i64.extend_i32_s`/`_u`, `i32.trunc_f32_s`/`_u`/…, `f32.convert_i32_s`/`_u`/…, `f32.demote_f64`, `f64.promote_f32`).
 - **Reinterpretation** — `i32.reinterpret_f32`, `f64.reinterpret_i64`, etc. (bit-level recasts that don't change the value's bits).
 
 IEEE-754 results are deterministic across JVM, Scala.js, and Scala Native — including NaN bit patterns, signed-zero, and subnormal edges.
@@ -328,7 +328,7 @@ The last chunk in Phase 8.E. Nine ops: one pairwise multiply-add at i32 precisio
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
 
-- **Load/store memarg** — Phase 8.D repurposes bit 6 of the alignment LEB as a "memidx-present" flag. When set, a memidx LEB follows; alignment is the LEB with that bit cleared. Single-memory modules emit the MVP shape (no flag, memidx = 0 implicit).
+- **Load/store memarg** — Phase 8.D repurposes bit 6 of the alignment LEB as a "memidx-present" flag. When set, a memidx LEB follows; alignment is the LEB with that bit cleared. Single-memory modules emit the original shape (no flag, memidx = 0 implicit).
 - **`memory.size` / `memory.grow` / `memory.fill`** — the byte that was a must-be-zero reserved slot becomes a memidx LEB.
 - **`memory.copy`** — two memidx LEBs (dst, src), allowing memory-to-memory copies between distinct memories.
 - **`memory.init`** — second immediate is a memidx LEB (was reserved).
@@ -342,7 +342,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
-| Component model | the post-MVP packaging surface | out of scope |
+| Component model | the packaging proposal | out of scope |
 
 Each missing group is independently scoped — adding any one of them is a self-contained piece of work that doesn't touch the others. See the project [roadmap on GitHub](https://github.com/edadma/wasm) for the active Phase-8 plan.
 

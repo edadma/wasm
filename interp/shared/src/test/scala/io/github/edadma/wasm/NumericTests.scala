@@ -681,8 +681,9 @@ object NumericTests:
     }
 
     test("f32 select (polymorphic): select with f32 operands picks the right one") {
-      // The `select` opcode (0x1B) is polymorphic in MVP; this verifies it
-      // works at f32 width too, not just i32. We don't need a dedicated
+      // The `select` opcode (0x1B) is polymorphic across the four scalar
+      // types; this verifies it works at f32 width too, not just i32. We
+      // don't need a dedicated
       // fixture — the existing stack_ops fixture only tests i32 select, so
       // we synthesise a tiny inline-bytes module here.
       val typeSec = b(0x02) ++                                          // 2 functype entries

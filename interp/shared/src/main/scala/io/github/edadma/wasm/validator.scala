@@ -387,10 +387,10 @@ object Validator:
       val _ = readU32() // offset (discarded)
       ()
 
-    /** Read + validate a single memidx LEB immediate. Phase 8.D-shaped
-      * replacement for the MVP's "skip one must-be-zero reserved byte" —
-      * memory.size, memory.grow, memory.fill, and (the second immediate
-      * of) memory.init all take this shape. */
+    /** Read + validate a single memidx LEB immediate. Phase 8.D introduced
+      * this shape in place of the single-memory "must-be-zero reserved
+      * byte" — memory.size, memory.grow, memory.fill, and (the second
+      * immediate of) memory.init all take this form. */
     def readAndValidateMemIdx(label: String): Unit =
       val m = readU32()
       if m < 0 || m >= memoryCount then

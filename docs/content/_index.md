@@ -2,7 +2,7 @@
 title: wasm
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: WebAssembly Core MVP plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select), multi-memory (with a multi-memory host-function surface), and the complete SIMD proposal — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select), multi-memory (with a multi-memory host-function surface), and the complete SIMD proposal — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 24-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is

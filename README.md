@@ -26,7 +26,7 @@ The repo splits into three sub-projects so the published libraries stay dependen
 
 Enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end. Three rustc-built integration fixtures are committed and pass in CI: a `Hello, WASI!` program, a `std::fs::read_to_string` reader, and a `std::fs::write` writer.
 
-**Numeric (full MVP, all four scalar types):** every `i32` / `i64` / `f32` / `f64` opcode — const, all compares (signed and unsigned for ints, ordered for floats), full arithmetic + bitwise + shift + rotate, conversion + reinterpret, IEEE-754 deterministic across JVM/JS/Native.
+**Numeric (all four scalar types):** every `i32` / `i64` / `f32` / `f64` opcode — const, all compares (signed and unsigned for ints, ordered for floats), full arithmetic + bitwise + shift + rotate, conversion + reinterpret, IEEE-754 deterministic across JVM/JS/Native.
 
 **Variables:** `local.get`, `local.set`, `local.tee`, `global.get`, `global.set` (mutable and immutable globals).
 

@@ -2,11 +2,10 @@ package io.github.edadma.wasm
 
 /** WebAssembly value types and the runtime values that inhabit them.
   *
-  * `Value` and `ValueType` are sealed hierarchies covering the four MVP
-  * scalar types — I32, I64, F32, F64 — plus the two reference kinds added
-  * by the reference-types proposal (Phase 8.C): funcref and externref.
-  * Vector types (SIMD v128) will extend the hierarchies further without
-  * breaking the binary API.
+  * `Value` and `ValueType` are sealed hierarchies covering the four
+  * scalar types — I32, I64, F32, F64 — plus the two reference kinds
+  * added by the reference-types proposal (Phase 8.C): funcref and
+  * externref, and the v128 vector type from the SIMD proposal.
   */
 
 sealed trait Value
@@ -90,11 +89,12 @@ object ValueType:
     case RefType.ExternRef => ExternRefType
 
 /** A function signature — vector of param types in, vector of result types out.
-  * MVP allows at most one result type. */
+  * The multi-value proposal allows more than one result; the Core spec capped
+  * it at one. */
 final case class FuncType(params: Vector[ValueType], results: Vector[ValueType])
 
-/** An imported function. MVP ignores table/memory/global imports during parse;
-  * if the module needed them it will fail at instantiation or use. */
+/** An imported function. Table / memory / global imports aren't surfaced yet
+  * (Phase 5); if the module needs them it will fail at instantiation or use. */
 final case class FuncImport(module: String, name: String, typeIdx: Int)
 
 sealed trait Export { def name: String }
@@ -116,8 +116,8 @@ final case class MemoryLimits(min: Int, max: Option[Int])
 final case class Table(refType: RefType, min: Int, max: Option[Int])
 
 /** An element segment. Phase 8.B added passive + declarative variants
-  * alongside the MVP active form so `table.init` / `elem.drop` had
-  * something to address. Phase 8.C generalises the payload from
+  * alongside the original active form so `table.init` / `elem.drop`
+  * had something to address. Phase 8.C generalises the payload from
   * `Vector[Int]` (funcidxs only) to `Vector[Value]` carrying typed
   * reference values — either `RefFunc(idx)` for funcref entries or
   * `RefNull(refType)` for null entries (externref segments are also
@@ -154,7 +154,7 @@ object ElementSegment:
   final case class Declarative(refType: RefType, refs: Vector[Value]) extends ElementSegment
 
 /** A module-defined global. The init expression is evaluated at parse time
-  * for the MVP-style `*.const` form and stored directly here as `initialValue`;
+  * for the `*.const` form and stored directly here as `initialValue`;
   * `Runtime.instantiate` copies that into the live globals array. `mutable` is
   * the section-6 mutability byte (0x00 = const, 0x01 = var) — `global.set` on
   * an immutable global traps at run time (and once Phase 6 ships, at
@@ -165,8 +165,8 @@ object ElementSegment:
   */
 final case class Global(valueType: ValueType, mutable: Boolean, initialValue: Value)
 
-/** A data segment. Phase 8.B extends the MVP active-only shape with a
-  * passive variant so `memory.init` / `data.drop` have something to
+/** A data segment. Phase 8.B extends the original active-only shape with
+  * a passive variant so `memory.init` / `data.drop` have something to
   * address. Active and passive both carry a `bytes` payload; passive
   * has no offset (it's set by `memory.init` at run time). */
 sealed trait DataSegment:

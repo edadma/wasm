@@ -8,7 +8,7 @@ import TestSupport.*
   *
   * The two surfaces are normalised at import-resolution time into a
   * single internal HostFuncMulti shape — single-memory hosts (the
-  * MVP HostFunc) are wrapped so they see only `mems.head`. This file
+  * plain HostFunc) are wrapped so they see only `mems.head`. This file
   * covers:
   *
   *   - a HostFuncMulti can read AND write a memory other than memidx 0;

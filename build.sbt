@@ -37,7 +37,7 @@ ThisBuild / developers := List(
 )
 
 ThisBuild / homepage    := Some(url("https://github.com/edadma/wasm"))
-ThisBuild / description := "Zero-dependency WebAssembly MVP interpreter for Scala 3 (JVM, Scala.js, Scala Native)."
+ThisBuild / description := "Zero-dependency WebAssembly interpreter for Scala 3 (JVM, Scala.js, Scala Native)."
 
 ThisBuild / publishTo := sonatypePublishToBundle.value
 

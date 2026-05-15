@@ -1,9 +1,10 @@
 package io.github.edadma.wasm
 
 /** A host function takes a reference to linear memory plus its declared
-  * arguments, and returns its declared results. MVP host functions either
-  * take 0/1 i32 in and return 0/1 i32 out; signatures are checked against
-  * the WebAssembly type signature at instantiation.
+  * arguments, and returns its declared results. Single-memory host
+  * functions typically take 0/1 i32 in and return 0/1 i32 out;
+  * signatures are checked against the WebAssembly type signature at
+  * instantiation.
   *
   * Receives the module's *first* memory (memidx 0). Hosts that need to
   * inspect memidx > 0 (only meaningful with multi-memory modules — the
@@ -37,7 +38,7 @@ trait HostModule:
     * single-memory access can ignore this surface entirely. */
   def functionsMulti: Map[String, HostFuncMulti] = Map.empty
 
-/** The single host module the MVP interpreter ships with.
+/** The single host module the interpreter ships with.
   *
   * Exposes `env.putchar(i32) -> ()`. By default it writes the low 8 bits of
   * the argument as a character to `System.out`. Tests pass a collecting

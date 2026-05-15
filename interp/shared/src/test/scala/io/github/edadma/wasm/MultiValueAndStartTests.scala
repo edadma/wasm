@@ -2,7 +2,7 @@ package io.github.edadma.wasm
 
 import TestSupport.*
 
-/** Tests for two post-MVP features added together:
+/** Tests for two features added together:
   *
   *   1. **Section 8 (Start)** — the WASM binary's hook for an
   *      automatically-invoked initialiser. The parser now recognises
@@ -12,8 +12,8 @@ import TestSupport.*
   *      before constructing the `ModuleInstance` (so side effects on
   *      memory / globals are visible to the first user call).
   *
-  *   2. **Multi-value** — the post-MVP relaxation of "blocks and
-  *      functions return ≤ 1 value." Function signatures already
+  *   2. **Multi-value** — relaxes the original "blocks and
+  *      functions return ≤ 1 value" rule. Function signatures already
   *      carried `Vector[ValueType]` for results; what changed is the
   *      blocktype encoding, which now accepts a positive-SLEB typeidx
   *      in addition to the inline empty/i32/i64/f32/f64 bytes. The
