@@ -62,6 +62,14 @@
     (func $fd_readdir (param i32 i32 i32 i64 i32) (result i32)))
   (import "wasi_snapshot_preview1" "poll_oneoff"
     (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_accept"
+    (func $sock_accept (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_recv"
+    (func $sock_recv (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_send"
+    (func $sock_send (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_shutdown"
+    (func $sock_shutdown (param i32 i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -256,6 +264,44 @@
     local.get $nsubs
     local.get $nevents_out
     call $poll_oneoff)
+
+  (func (export "call_sock_accept")
+        (param $fd i32) (param $fdflags i32) (param $retfd_out i32)
+        (result i32)
+    local.get $fd
+    local.get $fdflags
+    local.get $retfd_out
+    call $sock_accept)
+
+  (func (export "call_sock_recv")
+        (param $fd i32) (param $ri_data i32) (param $ri_data_len i32)
+        (param $ri_flags i32)
+        (param $ro_datalen_out i32) (param $ro_flags_out i32)
+        (result i32)
+    local.get $fd
+    local.get $ri_data
+    local.get $ri_data_len
+    local.get $ri_flags
+    local.get $ro_datalen_out
+    local.get $ro_flags_out
+    call $sock_recv)
+
+  (func (export "call_sock_send")
+        (param $fd i32) (param $si_data i32) (param $si_data_len i32)
+        (param $si_flags i32) (param $so_datalen_out i32)
+        (result i32)
+    local.get $fd
+    local.get $si_data
+    local.get $si_data_len
+    local.get $si_flags
+    local.get $so_datalen_out
+    call $sock_send)
+
+  (func (export "call_sock_shutdown")
+        (param $fd i32) (param $how i32) (result i32)
+    local.get $fd
+    local.get $how
+    call $sock_shutdown)
 
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)

@@ -54,13 +54,15 @@ object WasiTestSupport:
     * back the captured stdout/stderr. */
   def instantiate(
       bytes:    Array[Byte],
-      args:     Seq[String]                  = Seq.empty,
-      envs:     Seq[(String, String)]        = Seq.empty,
-      clock:    WasiContext.Clock            = WasiContext.systemClock,
-      random:   Int => Array[Byte]           = WasiContext.defaultRandom,
-      preopens: Seq[WasiContext.Preopen]     = Seq.empty,
+      args:     Seq[String]                       = Seq.empty,
+      envs:     Seq[(String, String)]             = Seq.empty,
+      clock:    WasiContext.Clock                 = WasiContext.systemClock,
+      random:   Int => Array[Byte]                = WasiContext.defaultRandom,
+      preopens: Seq[WasiContext.Preopen]          = Seq.empty,
+      sockets:  Seq[WasiContext.ServerSocket]     = Seq.empty,
   ): (ModuleInstance, WasiContext.Collecting) =
-    val collecting = WasiContext.collecting(args, envs, clock, random, preopens)
+    val collecting =
+      WasiContext.collecting(args, envs, clock, random, preopens, sockets)
     Runtime.instantiate(bytes, Seq(Wasi.preview1(collecting.context))) match
       case Right(inst) => (inst, collecting)
       case Left(err)   => throw new AssertionError(s"instantiate failed: $err")

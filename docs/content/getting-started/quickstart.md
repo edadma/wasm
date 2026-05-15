@@ -88,6 +88,6 @@ val ctx = WasiContext.default.copy(
 - [Concepts → Validation](/concepts/validation/) — what the validator catches and what it doesn't.
 - [Concepts → Host imports](/concepts/host-imports/) — wire your own functions into a module.
 - [WASI → WasiContext](/wasi/context/) — the configuration record `Wasi.preview1` takes.
-- [WASI → Syscalls](/wasi/syscalls/) — the 24 syscalls implemented and their semantics.
+- [WASI → Syscalls](/wasi/syscalls/) — the 29 syscalls implemented and their semantics.
 - [CLI](/cli/) — when you want a runner more than a library.
 - [Reference → Errors](/reference/errors/) — every `WasmError` variant and what causes it.

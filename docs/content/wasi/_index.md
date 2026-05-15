@@ -1,6 +1,6 @@
 ---
 title: WASI
-summary: The WASI Preview 1 host shim — 24 syscalls, three preopen flavours, no thrown exceptions.
+summary: The WASI Preview 1 host shim — 29 syscalls, three preopen flavours, no thrown exceptions.
 weight: 30
 ---
 
@@ -18,4 +18,4 @@ The `wasi/` sub-project (`io.github.edadma.wasm.wasi`) implements `wasi_snapshot
 
 - [WasiContext](/wasi/context/) — args, envs, stdio sinks, clock, random source, preopens; `default` and `collecting` factories.
 - [Preopens](/wasi/preopens/) — `WasiContext.Preopen`, `HostPreopen.fromDir`, and the sandboxing model.
-- [Syscalls](/wasi/syscalls/) — the 24 syscalls in five groups.
+- [Syscalls](/wasi/syscalls/) — the 29 syscalls grouped by purpose (process, clock + entropy, stdio + preopens, file I/O, filesystem, polling, sockets).
