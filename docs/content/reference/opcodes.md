@@ -4,7 +4,7 @@ summary: Every WebAssembly opcode group the interpreter handles, plus what's com
 weight: 10
 ---
 
-The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0), and the **foundations + memory ops of the SIMD proposal** (`V128` value type plumbed end-to-end; `v128.const`; `v128.load` / `v128.store` with all twelve width-variant loads; lane-aware ops landing chunk-by-chunk through 8.E). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
+The interpreter implements the WebAssembly Core MVP plus the sign-extension proposal, the full bulk-memory proposal, non-trapping float-to-int (`trunc_sat_*`), the reference-types proposal (funcref, externref, `ref.null` / `ref.is_null` / `ref.func`, `table.get` / `table.set` / `table.size` / `table.grow` / `table.fill`, typed `select t*`), the multi-memory proposal (every memory opcode now carries a memidx; modules may declare more than one linear memory, with a parallel `HostFuncMulti` surface for host functions that need to reach beyond memidx 0), and **the full SIMD proposal** (`V128` value type plumbed end-to-end; all ~236 opcodes under the `0xFD` prefix — `v128.const`, the 14 loads + 8 stores including `load*_lane` / `store*_lane`, lane access, integer + float arithmetic, shifts, min/max, bitwise + reductions, comparisons, narrow / extend / extadd_pairwise / extmul, float ↔ int conv, demote / promote, and `i32x4.dot_i16x8_s`). That's enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end, and to host the full sysl standard-library test suite end-to-end as sysl's `wasm32-WASI` backend.
 
 ## Numeric (full MVP, all four scalar types)
 
@@ -87,9 +87,9 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 - **Untyped `select`** (`0x1B`) — operand types are inferred. Spec-restricted to numeric value types when reference types are present; a reftype operand is rejected at validation with a "use select t*" diagnostic.
 - **Typed `select t*`** (`0x1C`) — explicit operand type, encoded as `0x1C u32:count valtype[count]` with `count == 1` (multi-value `select` isn't enabled by any shipped proposal). Required for funcref / externref operands; also accepts the four numeric scalars.
 
-## SIMD (Phase 8.E, in progress)
+## SIMD (Phase 8.E — complete)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, G.1, G.2, and H are shipped.** The remainder (chunk I dot/lane mem ops) is still to come.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). The full surface — Chunks A through I — is now shipped.
 
 ### Foundations (Chunk A — done)
 
@@ -304,6 +304,26 @@ IEEE-754 NaN: every f32/f64 compare returns false when either operand is NaN, ex
 | `i32x4.trunc_sat_f64x2_s_zero` / `_u_zero` | `0xFC` / `0xFD` | 2 f64 → i32 lanes 0..1; lanes 2 + 3 zero-filled. |
 | `f64x2.convert_low_i32x4_s` / `_u` | `0xFE` / `0xFF` | Read i32 lanes 0..1 of source, widen to f64. |
 
+### Dot product + load_lane / store_lane (Chunk I — done)
+
+The last chunk in Phase 8.E. Nine ops: one pairwise multiply-add at i32 precision, and eight partial memory accesses that touch a single lane.
+
+`i32x4.dot_i16x8_s` (the only "wider lane multiply-add" op in the spec) reads two i16x8 vectors, pairs up adjacent lanes (`a[2k] * b[2k] + a[2k+1] * b[2k+1]`), and produces an i32x4. The i16 lanes are sign-extended to i32 before multiplying, so each product fits exact in i32; the pair-sum can overflow only at `-32768² + -32768² = 2³¹`, which wraps to `Int.MinValue` per the spec's two's-complement rule. No immediate past the sub-opcode.
+
+`v128.load*_lane` / `v128.store*_lane` are the only SIMD ops that carry BOTH a memarg AND a 1-byte lane immediate (after the sub-opcode: memarg LEBs, then a single byte for the lane index). Each load_lane reads N bytes from memory and places them at the named lane of the v128 operand (preserving every other lane); each store_lane writes N bytes from the named lane to memory. Operand stack: `[i32 addr, v128 src]` → `[v128]` for load, `[i32 addr, v128 src]` → `[]` for store. Lane index is validated `< 16/8/4/2` depending on access width. Out-of-bounds (`addr + offset + width > mem.size`) traps with `MemoryOutOfBounds`.
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `i32x4.dot_i16x8_s` | `0xBA` | Pairwise multiply-then-add: lane k = `a[2k]*b[2k] + a[2k+1]*b[2k+1]` with i16 sign-extension to i32. Pair-sum wraps two's-complement on overflow. |
+| `v128.load8_lane` | `0x54` | Read 1 byte at addr, write into lane (lane idx < 16). Other lanes preserved. |
+| `v128.load16_lane` | `0x55` | Read 2 LE bytes, write into i16 lane (< 8). |
+| `v128.load32_lane` | `0x56` | Read 4 LE bytes, write into i32 lane (< 4). |
+| `v128.load64_lane` | `0x57` | Read 8 LE bytes, write into i64 lane (< 2). |
+| `v128.store8_lane` | `0x58` | Write 1 byte of lane (idx < 16) to memory. |
+| `v128.store16_lane` | `0x59` | Write 2 LE bytes of lane (< 8) to memory. |
+| `v128.store32_lane` | `0x5A` | Write 4 LE bytes of lane (< 4) to memory. |
+| `v128.store64_lane` | `0x5B` | Write 8 LE bytes of lane (< 2) to memory. |
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -319,7 +339,6 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | dot product + lane mem ops (I) | in progress (8.E, chunk I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |

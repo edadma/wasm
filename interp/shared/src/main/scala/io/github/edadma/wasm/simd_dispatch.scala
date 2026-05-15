@@ -48,9 +48,13 @@ import java.lang as jl
   *     0xBC..0xBF, 0xDC..0xDF); float↔int conv with NaN/range saturation
   *     and the `_zero` half-fill suffix (8 subs 0xF8..0xFF); f32 ↔ f64
   *     demote/promote with the same half-fill semantics (subs 0x5E/0x5F).
+  *   - I: 9 special ops. `i32x4.dot_i16x8_s` (sub 0xBA), the wider-lane
+  *     pairwise multiply-add. The 8 `v128.load{8,16,32,64}_lane` /
+  *     `v128.store{8,16,32,64}_lane` ops (subs 0x54..0x5B) — partial
+  *     memory access with both a memarg and a 1-byte lane immediate.
   *
-  * Chunks remaining: I (special — dot product + load_lane / store_lane).
-  * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
+  * Phase 8.E SIMD is complete with chunk I. Unknown sub-opcodes fall
+  * through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
   self: Interpreter =>
@@ -1463,6 +1467,24 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(f64x2ConvertLowI32x4U(a))
 
+      // === Chunk I — dot product + load_lane / store_lane ====================
+
+      case 0xBA =>                                                                        // i32x4.dot_i16x8_s
+        val b = popV128()
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4DotI16x8S(a, b))
+
+      case 0x54 => loadLane(f, p1, width = 1)                                             // v128.load8_lane
+      case 0x55 => loadLane(f, p1, width = 2)                                             // v128.load16_lane
+      case 0x56 => loadLane(f, p1, width = 4)                                             // v128.load32_lane
+      case 0x57 => loadLane(f, p1, width = 8)                                             // v128.load64_lane
+
+      case 0x58 => storeLane(f, p1, width = 1)                                            // v128.store8_lane
+      case 0x59 => storeLane(f, p1, width = 2)                                            // v128.store16_lane
+      case 0x5A => storeLane(f, p1, width = 4)                                            // v128.store32_lane
+      case 0x5B => storeLane(f, p1, width = 8)                                            // v128.store64_lane
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -2204,6 +2226,64 @@ private[wasm] trait SimdDispatch:
       lane += 1
     valueStack += V128(bits)
 
+  // === Chunk I — dot product + load_lane / store_lane helpers ===============
+  //
+  // The smallest SIMD chunk. dot_i16x8_s is a pairwise multiply-then-add at
+  // the wider i32 lane (full i32 product fits exact for the multiply; the
+  // pair-sum can overflow i32 only when both products are 2^30 — that's
+  // -32768×-32768 + -32768×-32768 = 2^31, which wraps to Int.MinValue per
+  // the wasm spec's two's-complement wraparound rule).
+  //
+  // load_lane / store_lane are memory-touching ops with a (memarg, laneidx)
+  // immediate pair. width ∈ {1, 2, 4, 8}; the lane is pre-validated < 16/8/
+  // 4/2 by the validator. We can copy raw bytes between memory and the
+  // v128's lane offset (lane * width) — both sides are little-endian so the
+  // byte layouts match.
+
+  /** i32x4.dot_i16x8_s — for each i32 result lane k:
+    * `a[2k]*b[2k] + a[2k+1]*b[2k+1]` with the i16 operand lanes
+    * sign-extended to i32 before the multiply. Overflow on the pair-sum
+    * wraps (two's complement) per the spec. */
+  private def i32x4DotI16x8S(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16); var lane = 0
+    while lane < 4 do
+      val a0 = readLaneI16Signed(a, lane * 2)
+      val a1 = readLaneI16Signed(a, lane * 2 + 1)
+      val b0 = readLaneI16Signed(b, lane * 2)
+      val b1 = readLaneI16Signed(b, lane * 2 + 1)
+      writeLaneI32(r, lane, a0 * b0 + a1 * b1)
+      lane += 1
+    r
+
+  /** v128.load{8,16,32,64}_lane — read `width` bytes from memory into the
+    * v128's lane `laneIdx` (preserving the other lanes). Operand stack:
+    * `[i32 addr, v128 src]` → `[v128]`. */
+  private def loadLane(f: Frame, memArgPos: Int, width: Int): Unit =
+    val body   = f.func.body
+    val memArg = readMemArgAt(f, memArgPos)
+    val lane   = body(f.pc) & 0xff
+    f.pc += 1
+    val src  = popV128().clone
+    val addr = (popI32() & 0xffffffffL) + memArg.offset
+    val mem  = memArgMemory(memArg)
+    boundsCheck(mem, addr, width)
+    System.arraycopy(mem.data, addr.toInt, src, lane * width, width)
+    valueStack += V128(src)
+
+  /** v128.store{8,16,32,64}_lane — write `width` bytes from the v128's
+    * lane `laneIdx` to memory. Operand stack: `[i32 addr, v128 src]` →
+    * `[]`. */
+  private def storeLane(f: Frame, memArgPos: Int, width: Int): Unit =
+    val body   = f.func.body
+    val memArg = readMemArgAt(f, memArgPos)
+    val lane   = body(f.pc) & 0xff
+    f.pc += 1
+    val src  = popV128()
+    val addr = (popI32() & 0xffffffffL) + memArg.offset
+    val mem  = memArgMemory(memArg)
+    boundsCheck(mem, addr, width)
+    System.arraycopy(src, lane * width, mem.data, addr.toInt, width)
+
 
 /** Static helper called by [[Interpreter.skipImmediates]] for the `0xFD`
   * arm. Returns the byte position right after the 0xFD opcode's
@@ -2337,5 +2417,20 @@ private[wasm] object SimdDispatch:
            0xF8 | 0xF9 | 0xFA | 0xFB |                                            // trunc_sat / convert (f32x4 forms)
            0xFC | 0xFD | 0xFE | 0xFF =>                                           // trunc_sat / convert (f64x2 forms)
         Right(p1)
+
+      // Chunk I — dot product has no immediate past the sub-opcode.
+      case 0xBA =>
+        Right(p1)
+
+      // Chunk I — load_lane / store_lane carry a memarg followed by a
+      // 1-byte lane index. The lane bound (< 16/8/4/2) is checked at
+      // validation time, not here.
+      case 0x54 | 0x55 | 0x56 | 0x57 | 0x58 | 0x59 | 0x5A | 0x5B =>
+        Interpreter.readMemArg(body, p1) match
+          case Left(e) => Left(e)
+          case Right((_, pAfter)) =>
+            if pAfter + 1 > body.length then
+              Left(WasmError.InvalidModule(s"truncated lane immediate at $pc"))
+            else Right(pAfter + 1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))

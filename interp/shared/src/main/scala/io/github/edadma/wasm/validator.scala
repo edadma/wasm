@@ -1084,6 +1084,31 @@ object Validator:
                0xFC | 0xFD | 0xFE | 0xFF =>                                       // trunc_sat / convert (f64x2 forms)
             unop(ValueType.V128Type, ValueType.V128Type)
 
+          // --- Chunk I — dot product + load_lane / store_lane (9 ops) ------
+          //
+          // `i32x4.dot_i16x8_s` is just another binary `(v128, v128) → v128`
+          // — the per-lane pairwise multiply-then-add lives in stepFd.
+          //
+          // `v128.load{8,16,32,64}_lane` / `v128.store{8,16,32,64}_lane` are
+          // the only SIMD ops that carry BOTH a memarg AND a 1-byte lane
+          // immediate. Lane bound = 16 / 8 / 4 / 2 depending on access
+          // width. Operand stack for load_lane: pops v128 src (top) +
+          // i32 addr (below), pushes the modified v128. store_lane is the
+          // same pop pattern but pushes nothing.
+
+          case 0xBA =>                                                            // i32x4.dot_i16x8_s
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
+          case 0x54 => simdLoadLane("v128.load8_lane",  16)
+          case 0x55 => simdLoadLane("v128.load16_lane",  8)
+          case 0x56 => simdLoadLane("v128.load32_lane",  4)
+          case 0x57 => simdLoadLane("v128.load64_lane",  2)
+
+          case 0x58 => simdStoreLane("v128.store8_lane",  16)
+          case 0x59 => simdStoreLane("v128.store16_lane",  8)
+          case 0x5A => simdStoreLane("v128.store32_lane",  4)
+          case 0x5B => simdStoreLane("v128.store64_lane",  2)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
@@ -1155,6 +1180,27 @@ object Validator:
       popVal(scalar)
       popVal(ValueType.V128Type)
       pushVal(ValueType.V128Type)
+
+    /** Phase 8.E.I: `v128.load{8,16,32,64}_lane` carries a memarg
+      * followed by a 1-byte lane index (< max). Pops the v128 src (top),
+      * pops the i32 addr (below), pushes the modified v128. */
+    def simdLoadLane(label: String, max: Int): Unit =
+      requireMemory(label)
+      skipMemArg(label)
+      readLaneIdx(label, max)
+      popVal(ValueType.V128Type)
+      popVal(ValueType.I32Type)
+      pushVal(ValueType.V128Type)
+
+    /** Phase 8.E.I: `v128.store{8,16,32,64}_lane` carries a memarg
+      * followed by a 1-byte lane index (< max). Pops the v128 src (top),
+      * pops the i32 addr (below). No push. */
+    def simdStoreLane(label: String, max: Int): Unit =
+      requireMemory(label)
+      skipMemArg(label)
+      readLaneIdx(label, max)
+      popVal(ValueType.V128Type)
+      popVal(ValueType.I32Type)
 
     /** Resolve a [[Interpreter.BlockSig]] (arity-only) into a full
       * `FuncType` so we can pop+push the actual types. For the inline
