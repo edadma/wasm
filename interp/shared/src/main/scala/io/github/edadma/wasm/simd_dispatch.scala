@@ -36,11 +36,13 @@ import java.lang as jl
   *   - G.1: 15 bitwise + reduction ops (not/and/andnot/or/xor/bitselect
   *     — subs 0x4D..0x52; any_true 0x53; *.all_true 0x63/0x83/0xA3/0xC3;
   *     *.bitmask 0x64/0x84/0xA4/0xC4).
+  *   - G.2: 48 comparison ops (eq/ne/lt/gt/le/ge across all four int
+  *     shapes — signed + unsigned for i8x16/i16x8/i32x4, signed-only
+  *     for i64x2 — and both float shapes. Subs 0x23..0x40 (i8x16/i16x8/i32x4),
+  *     0xD6..0xDB (i64x2 signed), 0x41..0x4C (f32x4/f64x2)).
   *
-  * Chunks remaining: G.2 (the 48 comparison ops — eq/ne/lt/gt/le/ge
-  * across the four int shapes and both float shapes), H (narrow/widen +
-  * float conversions), I (special — dot product + load_lane /
-  * store_lane).
+  * Chunks remaining: H (narrow/widen + float conversions), I (special —
+  * dot product + load_lane / store_lane).
   * Unknown sub-opcodes fall through to `UnknownOpcode(0xfd)`.
   */
 private[wasm] trait SimdDispatch:
@@ -963,6 +965,269 @@ private[wasm] trait SimdDispatch:
           ln += 1
         pushI32(mask)
 
+      // === Chunk G.2 — Comparisons (48 ops) ===================================
+      //
+      // Every compare op pops two v128s, applies the per-lane predicate, and
+      // writes -1 (all bits 1) for true / 0 for false into each output lane.
+      // Validator already enforces `binop(V128, V128, V128)` for the whole
+      // group; lane width + sign-form are reified in the helper choice here.
+      //
+      // For i32x4 a single `i32x4Cmp` helper covers both forms — the `_u`
+      // sites pass `Integer.compareUnsigned(...)` predicates, mirroring how
+      // `i32x4.min_u` / `max_u` already invoke `i32x4BinOp`.
+
+      // --- i8x16 (0x23..0x2C) ------------------------------------------------
+
+      case 0x23 =>                                                                        // i8x16.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x == y))
+
+      case 0x24 =>                                                                        // i8x16.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x != y))
+
+      case 0x25 =>                                                                        // i8x16.lt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x < y))
+
+      case 0x26 =>                                                                        // i8x16.lt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpU(a, b, (x, y) => x < y))
+
+      case 0x27 =>                                                                        // i8x16.gt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x > y))
+
+      case 0x28 =>                                                                        // i8x16.gt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpU(a, b, (x, y) => x > y))
+
+      case 0x29 =>                                                                        // i8x16.le_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x <= y))
+
+      case 0x2A =>                                                                        // i8x16.le_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpU(a, b, (x, y) => x <= y))
+
+      case 0x2B =>                                                                        // i8x16.ge_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpS(a, b, (x, y) => x >= y))
+
+      case 0x2C =>                                                                        // i8x16.ge_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16CmpU(a, b, (x, y) => x >= y))
+
+      // --- i16x8 (0x2D..0x36) -----------------------------------------------
+
+      case 0x2D =>                                                                        // i16x8.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x == y))
+
+      case 0x2E =>                                                                        // i16x8.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x != y))
+
+      case 0x2F =>                                                                        // i16x8.lt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x < y))
+
+      case 0x30 =>                                                                        // i16x8.lt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpU(a, b, (x, y) => x < y))
+
+      case 0x31 =>                                                                        // i16x8.gt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x > y))
+
+      case 0x32 =>                                                                        // i16x8.gt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpU(a, b, (x, y) => x > y))
+
+      case 0x33 =>                                                                        // i16x8.le_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x <= y))
+
+      case 0x34 =>                                                                        // i16x8.le_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpU(a, b, (x, y) => x <= y))
+
+      case 0x35 =>                                                                        // i16x8.ge_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpS(a, b, (x, y) => x >= y))
+
+      case 0x36 =>                                                                        // i16x8.ge_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8CmpU(a, b, (x, y) => x >= y))
+
+      // --- i32x4 (0x37..0x40) -----------------------------------------------
+
+      case 0x37 =>                                                                        // i32x4.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x == y))
+
+      case 0x38 =>                                                                        // i32x4.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x != y))
+
+      case 0x39 =>                                                                        // i32x4.lt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x < y))
+
+      case 0x3A =>                                                                        // i32x4.lt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => jl.Integer.compareUnsigned(x, y) < 0))
+
+      case 0x3B =>                                                                        // i32x4.gt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x > y))
+
+      case 0x3C =>                                                                        // i32x4.gt_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => jl.Integer.compareUnsigned(x, y) > 0))
+
+      case 0x3D =>                                                                        // i32x4.le_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x <= y))
+
+      case 0x3E =>                                                                        // i32x4.le_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => jl.Integer.compareUnsigned(x, y) <= 0))
+
+      case 0x3F =>                                                                        // i32x4.ge_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => x >= y))
+
+      case 0x40 =>                                                                        // i32x4.ge_u
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i32x4Cmp(a, b, (x, y) => jl.Integer.compareUnsigned(x, y) >= 0))
+
+      // --- i64x2 (0xD6..0xDB) — signed-only per spec ------------------------
+
+      case 0xD6 =>                                                                        // i64x2.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x == y))
+
+      case 0xD7 =>                                                                        // i64x2.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x != y))
+
+      case 0xD8 =>                                                                        // i64x2.lt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x < y))
+
+      case 0xD9 =>                                                                        // i64x2.gt_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x > y))
+
+      case 0xDA =>                                                                        // i64x2.le_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x <= y))
+
+      case 0xDB =>                                                                        // i64x2.ge_s
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i64x2Cmp(a, b, (x, y) => x >= y))
+
+      // --- f32x4 (0x41..0x46) — IEEE: NaN-involving → false (true only ne) --
+
+      case 0x41 =>                                                                        // f32x4.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x == y))
+
+      case 0x42 =>                                                                        // f32x4.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x != y))
+
+      case 0x43 =>                                                                        // f32x4.lt
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x < y))
+
+      case 0x44 =>                                                                        // f32x4.gt
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x > y))
+
+      case 0x45 =>                                                                        // f32x4.le
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x <= y))
+
+      case 0x46 =>                                                                        // f32x4.ge
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Cmp(a, b, (x, y) => x >= y))
+
+      // --- f64x2 (0x47..0x4C) ----------------------------------------------
+
+      case 0x47 =>                                                                        // f64x2.eq
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x == y))
+
+      case 0x48 =>                                                                        // f64x2.ne
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x != y))
+
+      case 0x49 =>                                                                        // f64x2.lt
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x < y))
+
+      case 0x4A =>                                                                        // f64x2.gt
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x > y))
+
+      case 0x4B =>                                                                        // f64x2.le
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x <= y))
+
+      case 0x4C =>                                                                        // f64x2.ge
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Cmp(a, b, (x, y) => x >= y))
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -1260,6 +1525,107 @@ private[wasm] trait SimdDispatch:
       ln += 1
     r
 
+  // === Chunk G.2 — compare lane helpers ===================================
+  //
+  // Wasm SIMD compare ops produce all-1s on true / all-0s on false per lane —
+  // same width as the input shape. These helpers thread a `Boolean` lambda
+  // through the existing readers (sign-extended for `_s`, zero-extended for
+  // `_u`) and write `-1` / `0` into each output lane. For i32x4 a single
+  // helper covers both forms — the call sites pass `_<_` for signed and
+  // `Integer.compareUnsigned(_, _) < 0` for unsigned, matching how
+  // `i32x4.min_u` / `max_u` already invoke `i32x4BinOp`.
+
+  /** Sign-extending compare on each i8 lane. */
+  private def i8x16CmpS(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Boolean): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = (if op(a(i).toInt, b(i).toInt) then -1 else 0).toByte
+      i += 1
+    r
+
+  /** Zero-extending compare on each i8 lane (operands 0..255). */
+  private def i8x16CmpU(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Boolean): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 16 do
+      r(i) = (if op(a(i) & 0xff, b(i) & 0xff) then -1 else 0).toByte
+      i += 1
+    r
+
+  /** Sign-extending compare on each i16 lane. Result lane is two bytes —
+    * `-1` writes `0xFF 0xFF` (Short.MinValue's bit pattern is fine for
+    * `0`/`-1` here because we're treating the whole lane as a bitmask). */
+  private def i16x8CmpS(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val ar = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      val br = (b(ln * 2) & 0xff) | ((b(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, if op((ar << 16) >> 16, (br << 16) >> 16) then -1 else 0)
+      ln += 1
+    r
+
+  /** Zero-extending compare on each i16 lane (operands 0..65535). */
+  private def i16x8CmpU(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 8 do
+      val au = (a(ln * 2) & 0xff) | ((a(ln * 2 + 1) & 0xff) << 8)
+      val bu = (b(ln * 2) & 0xff) | ((b(ln * 2 + 1) & 0xff) << 8)
+      writeLaneI16(r, ln, if op(au, bu) then -1 else 0)
+      ln += 1
+    r
+
+  /** Compare on each i32 lane. Signed call sites pass `_<_` etc.; unsigned
+    * sites pass `Integer.compareUnsigned(_, _) < 0` etc. */
+  private def i32x4Cmp(a: Array[Byte], b: Array[Byte], op: (Int, Int) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      writeLaneI32(r, ln, if op(readLaneI32(a, ln), readLaneI32(b, ln)) then -1 else 0)
+      ln += 1
+    r
+
+  /** Compare on each i64 lane. Wasm spec only defines signed i64x2 compares
+    * (no `_u` forms) — Scala's `<` / `>` / `==` on `Long` is already signed.
+    * Scala.js emulates `Long` as a pair of `Int`s, but the comparison
+    * operators route through `java.lang.Long.compare`, which is correct
+    * across all three platforms. */
+  private def i64x2Cmp(a: Array[Byte], b: Array[Byte], op: (Long, Long) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      writeLaneI64(r, ln, if op(readLaneI64(a, ln), readLaneI64(b, ln)) then -1L else 0L)
+      ln += 1
+    r
+
+  /** Compare on each f32 lane. IEEE-754 semantics: any NaN operand makes
+    * eq/lt/gt/le/ge false and ne true. Scala's `==`/`<` on `Float` already
+    * match this on every backend. The all-1s lane (`-1` Int) is written as
+    * a raw int into the lane's 4 bytes — no `*ToRawIntBits` round-trip
+    * needed because we're producing a mask, not a float. */
+  private def f32x4Cmp(a: Array[Byte], b: Array[Byte], op: (Float, Float) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 4 do
+      val x = jl.Float.intBitsToFloat(readLaneI32(a, ln))
+      val y = jl.Float.intBitsToFloat(readLaneI32(b, ln))
+      writeLaneI32(r, ln, if op(x, y) then -1 else 0)
+      ln += 1
+    r
+
+  /** Compare on each f64 lane (same NaN semantics as f32x4Cmp). */
+  private def f64x2Cmp(a: Array[Byte], b: Array[Byte], op: (Double, Double) => Boolean): Array[Byte] =
+    val r  = new Array[Byte](16)
+    var ln = 0
+    while ln < 2 do
+      val x = jl.Double.longBitsToDouble(readLaneI64(a, ln))
+      val y = jl.Double.longBitsToDouble(readLaneI64(b, ln))
+      writeLaneI64(r, ln, if op(x, y) then -1L else 0L)
+      ln += 1
+    r
+
   /** Sign/zero-extending pair load: read 8 bytes from memory, treat them as
     * 8/width source lanes, and widen each into a `outLaneBytes`-byte
     * destination lane. `width` ∈ {1,2,4}, `outLaneBytes = width * 2`. */
@@ -1391,6 +1757,25 @@ private[wasm] object SimdDispatch:
            0x53 |                                                                 // v128.any_true
            0x63 | 0x83 | 0xA3 | 0xC3 |                                            // *.all_true
            0x64 | 0x84 | 0xA4 | 0xC4 =>                                           // *.bitmask
+        Right(p1)
+
+      // Chunk G.2 — comparisons (48 ops, all v128×v128 → v128, no
+      // immediate past the sub-opcode). Grouped by shape:
+      //   - i8x16 0x23..0x2C  (10 ops: eq/ne + lt/gt/le/ge × s/u)
+      //   - i16x8 0x2D..0x36  (same 10 ops)
+      //   - i32x4 0x37..0x40  (same 10 ops)
+      //   - i64x2 0xD6..0xDB  (6 ops: eq/ne + lt_s/gt_s/le_s/ge_s — no _u per spec)
+      //   - f32x4 0x41..0x46  (6 ops: eq/ne + lt/gt/le/ge)
+      //   - f64x2 0x47..0x4C  (same 6 ops)
+      case 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 |
+           0x29 | 0x2A | 0x2B | 0x2C |                                            // i8x16  10 cmps
+           0x2D | 0x2E | 0x2F | 0x30 | 0x31 | 0x32 |
+           0x33 | 0x34 | 0x35 | 0x36 |                                            // i16x8  10 cmps
+           0x37 | 0x38 | 0x39 | 0x3A | 0x3B | 0x3C |
+           0x3D | 0x3E | 0x3F | 0x40 |                                            // i32x4  10 cmps
+           0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDA | 0xDB |                              // i64x2   6 cmps (signed-only)
+           0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x46 |                              // f32x4   6 cmps
+           0x47 | 0x48 | 0x49 | 0x4A | 0x4B | 0x4C =>                             // f64x2   6 cmps
         Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))

@@ -1041,6 +1041,25 @@ object Validator:
                0x64 | 0x84 | 0xA4 | 0xC4 =>                                       // *.bitmask
             unop(ValueType.V128Type, ValueType.I32Type)
 
+          // --- Chunk G.2 — 48 comparison ops ------------------------------
+          //
+          // Every compare is v128×v128 → v128. Signedness, lane shape, and
+          // NaN semantics live in stepFd; the validator only enforces the
+          // operand+result shape. Three blocks of 10 (i8x16/i16x8/i32x4) +
+          // i64x2's 6 (signed-only per spec — no `_u` forms) + 6 each for
+          // f32x4 / f64x2 = 48 in total.
+
+          case 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 |
+               0x29 | 0x2A | 0x2B | 0x2C |                                        // i8x16  10 cmps
+               0x2D | 0x2E | 0x2F | 0x30 | 0x31 | 0x32 |
+               0x33 | 0x34 | 0x35 | 0x36 |                                        // i16x8  10 cmps
+               0x37 | 0x38 | 0x39 | 0x3A | 0x3B | 0x3C |
+               0x3D | 0x3E | 0x3F | 0x40 |                                        // i32x4  10 cmps
+               0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDA | 0xDB |                          // i64x2   6 cmps (signed-only)
+               0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x46 |                          // f32x4   6 cmps
+               0x47 | 0x48 | 0x49 | 0x4A | 0x4B | 0x4C =>                         // f64x2   6 cmps
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
