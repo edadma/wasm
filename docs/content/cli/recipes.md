@@ -19,27 +19,41 @@ The matching `.wat` source is at `examples/hello.wat`. After editing, regenerate
 wat2wasm examples/hello.wat -o examples/hello.wasm
 ```
 
-## Real WASI binary with a host-backed preopen
+## Freestanding C, no libc
 
-`real_rust_fileread.wasm` is a rustc-built `wasm32-wasip1` binary that calls `std::fs::read_to_string("/sandbox/hello.txt")` and prints the contents. The matching `.rs` source is committed alongside as documentation.
+`examples/c/hello.wasm` is a freestanding C program — no libc, no wasi-sdk. The source declares `fd_write` directly as a wasi import and defines `_start` as the entry point; the build is just `clang --target=wasm32 -nostdlib` plus `wasm-ld`. Useful for understanding what a wasi binary actually is once you strip the libc convenience layer off.
 
 ```bash
-mkdir -p /tmp/sandbox
-echo "Hello from the host filesystem" > /tmp/sandbox/hello.txt
-
-sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
-                wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm'
-# Hello from the host filesystem
+sbt 'cliJVM/run examples/c/hello.wasm'
+# Hello from freestanding C!
 ```
 
-The `--preopen` flag points the wasi-libc startup walk at `/tmp/sandbox` (real disk) and tells the guest the directory's visible name is `/sandbox`. From the rust binary's perspective, `/sandbox/hello.txt` resolves; absolute paths outside `/sandbox` don't.
+The matching `examples/c/hello.c` source and `Makefile` are committed alongside; see [`examples/c/README.md`](https://github.com/edadma/wasm/tree/dev/examples/c) for the build invocation.
+
+## Real WASI binary with a host-backed preopen
+
+`examples/rust/word_count.wasm` is a rustc-built `wasm32-wasip1` binary that reads `/data/input.txt` from a wasi preopen and prints `wc -lwc`-style counts:
+
+```bash
+mkdir -p ./data
+echo "The quick brown fox jumps over the lazy dog." > ./data/input.txt
+echo "Pack my box with five dozen liquor jugs."    >> ./data/input.txt
+
+sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm'
+#        2       17       86 /data/input.txt
+```
+
+The `--preopen` flag points the wasi-libc startup walk at the host's `./data` directory and tells the guest the visible name is `/data`. From the rust binary's perspective, `/data/input.txt` resolves; absolute paths outside `/data` don't.
+
+The matching `examples/rust/src/main.rs` source and `Cargo.toml` are committed; rebuild with `cargo build --release --target=wasm32-wasip1 --manifest-path=examples/rust/Cargo.toml`.
 
 ## Real WASI binary with file writes
 
-`real_rust_filewrite.wasm` writes a small file under its preopen. To run it against a real host directory, point a fresh directory at `/sandbox`:
+The test-suite fixture `real_rust_filewrite.wasm` writes a small file under its preopen — useful for confirming write capability against a host directory:
 
 ```bash
-rm -rf /tmp/wasm-write && mkdir -p /tmp/wasm-write
+rm -rf /tmp/wasm-write
+mkdir -p /tmp/wasm-write
 sbt 'cliJVM/run --preopen /tmp/wasm-write:/sandbox \
                 wasi/shared/src/test/resources/fixtures/real_rust_filewrite.wasm'
 cat /tmp/wasm-write/output.txt
