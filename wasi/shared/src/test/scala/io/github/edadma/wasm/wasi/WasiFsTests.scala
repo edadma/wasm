@@ -1278,6 +1278,285 @@ object WasiFsTests:
         case other => check(false, s"call_fd_allocate(neg len): $other")
     }
 
+    // ----- path_rename (within a single preopen) --------------------------
+
+    test("path_rename: moves a file entry; old path becomes ENOENT, new path resolves") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("old.txt" -> "hello".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Place old/new paths at distinct memory regions.
+      storePath(inst, 0, "old.txt")
+      storePath(inst, 16, "new.txt")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(3), I32(16), I32(7))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_rename: $other")
+      check(preopen.bytesOf("old.txt").isEmpty, "old.txt should be gone")
+      check(preopen.bytesOf("new.txt").exists(b => new String(b, "UTF-8") == "hello"),
+            "new.txt should hold the old bytes")
+    }
+
+    test("path_rename: ENOENT when the source path doesn't exist") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "missing")
+      storePath(inst, 16, "target")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(3), I32(16), I32(6))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    test("path_rename: EEXIST when the destination path already exists") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("a" -> "1".getBytes,
+                                                     "b" -> "2".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "a")
+      storePath(inst, 16, "b")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_rename: $other")
+      // Both originals untouched.
+      check(preopen.bytesOf("a").exists(b => new String(b, "UTF-8") == "1"), "a unchanged")
+      check(preopen.bytesOf("b").exists(b => new String(b, "UTF-8") == "2"), "b unchanged")
+    }
+
+    test("path_rename: ENOTCAPABLE on cross-preopen renames") {
+      val po1 = WasiContext.Preopen.inMemory("/s1", Map("f" -> "x".getBytes))
+      val po2 = WasiContext.Preopen.inMemory("/s2")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(po1, po2))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      // fd 3 = /s1 (source), fd 4 = /s2 (destination, different preopen).
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(4), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_rename: $other")
+      // Source untouched.
+      check(po1.bytesOf("f").exists(b => new String(b, "UTF-8") == "x"), "source untouched")
+    }
+
+    test("path_rename: EBADF when either fd isn't a preopen") {
+      val preopen = WasiContext.Preopen.inMemory("/s", Map("f" -> "x".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      inst.invoke("call_path_rename",
+                  Seq(I32(99), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"bad src fd errno=$e (want EBADF)")
+        case other => check(false, s"call_path_rename: $other")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(99), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"bad dst fd errno=$e (want EBADF)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    test("path_rename: ENOTCAPABLE on a name-only preopen") {
+      val preopen = WasiContext.Preopen.named("/etc")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "old")
+      storePath(inst, 16, "new")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(3),
+                      I32(3), I32(16), I32(3))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    // ----- path_link / path_symlink / path_readlink ------------------------
+
+    test("path_link: a hard link makes the source bytes visible under a second name") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("orig" -> "shared".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "orig")
+      storePath(inst, 16, "alias")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0),                                       // old_fd, old_flags
+                      I32(0), I32(4),                                       // old_path_ptr, old_path_len
+                      I32(3),                                               // new_fd
+                      I32(16), I32(5))) match                               // new_path_ptr, new_path_len
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_link: $other")
+      // Both paths now point to the same bytes.
+      check(preopen.bytesOf("orig").exists(b  => new String(b, "UTF-8") == "shared"), "orig retained")
+      check(preopen.bytesOf("alias").exists(b => new String(b, "UTF-8") == "shared"), "alias visible")
+    }
+
+    test("path_link: ENOENT on a missing source path") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "ghost")
+      storePath(inst, 16, "alias")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(5),
+                      I32(3), I32(16), I32(5))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: EEXIST when the destination path is taken") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("a" -> "1".getBytes, "b" -> "2".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "a")
+      storePath(inst, 16, "b")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: ENOTCAPABLE on cross-preopen hard links") {
+      val po1 = WasiContext.Preopen.inMemory("/s1", Map("f" -> "x".getBytes))
+      val po2 = WasiContext.Preopen.inMemory("/s2")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(po1, po2))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(4), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: EPERM when the source is a directory") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Create a directory at "d" through path_create_directory; then try
+      // to hardlink it.
+      storePath(inst, 0, "d")
+      runOk(inst.invoke("call_path_create_directory", Seq(I32(3), I32(0), I32(1))))
+      storePath(inst, 16, "d2")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(3), I32(16), I32(2))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EPERM, s"errno=$e (want EPERM)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_symlink: creates a symlink whose target round-trips via path_readlink") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Plant the target string at addr 0 and the new-path name at addr 16.
+      storePath(inst, 0, "../target.txt")                                   // 13 bytes
+      storePath(inst, 16, "link")                                           // 4 bytes
+      // Create the symlink.
+      inst.invoke("call_path_symlink",
+                  Seq(I32(0), I32(13),                                      // old_path_ptr, old_path_len
+                      I32(3),                                               // fd
+                      I32(16), I32(4))) match                               // new_path_ptr, new_path_len
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"symlink errno=$e (want 0)")
+        case other => check(false, s"call_path_symlink: $other")
+      // Read it back. Plant "link" again and read into a fresh buffer.
+      storePath(inst, 0, "link")
+      val bufPtr        = 64
+      val bufLen        = 64
+      val bufusedOutPtr = 32
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3),
+                      I32(0), I32(4),                                       // path_ptr, path_len
+                      I32(bufPtr), I32(bufLen),                             // buf_ptr, buf_len
+                      I32(bufusedOutPtr))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"readlink errno=$e (want 0)")
+        case other => check(false, s"call_path_readlink: $other")
+      // bufused holds the target length.
+      val used = peekI32(inst, bufusedOutPtr)
+      check(used == 13, s"bufused=$used (want 13)")
+      // The target string sits at bufPtr..bufPtr+used.
+      val got = new String(readBytes(inst, bufPtr, used), "UTF-8")
+      check(got == "../target.txt", s"readlink target='$got'")
+    }
+
+    test("path_readlink: truncates to buf_len; bufused reflects the truncated count") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "long-target-here")                                // 16 bytes
+      storePath(inst, 32, "link")
+      runOk(inst.invoke("call_path_symlink",
+                        Seq(I32(0), I32(16), I32(3), I32(32), I32(4))))
+      storePath(inst, 32, "link")
+      val bufPtr        = 128
+      val bufLen        = 5                                                 // shorter than the target
+      val bufusedOutPtr = 200
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(32), I32(4),
+                      I32(bufPtr), I32(bufLen),
+                      I32(bufusedOutPtr))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_readlink: $other")
+      val used = peekI32(inst, bufusedOutPtr)
+      check(used == 5, s"bufused=$used (want 5 — truncated)")
+      val got = new String(readBytes(inst, bufPtr, used), "UTF-8")
+      check(got == "long-", s"truncated target='$got' (want 'long-')")
+    }
+
+    test("path_readlink: EINVAL on a non-symlink path") {
+      val preopen = WasiContext.Preopen.inMemory("/s", Map("regular" -> "bytes".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "regular")
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(64), I32(64), I32(32))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"errno=$e (want EINVAL)")
+        case other => check(false, s"call_path_readlink: $other")
+    }
+
+    test("path_readlink: ENOENT on a missing path") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "ghost")
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(0), I32(5),
+                      I32(64), I32(64), I32(32))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_readlink: $other")
+    }
+
+    test("path_unlink_file: also removes a symlink (the target is left alone)") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("real" -> "untouched".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "real")
+      storePath(inst, 16, "alias")
+      // Create the symlink first.
+      runOk(inst.invoke("call_path_symlink",
+                        Seq(I32(0), I32(4), I32(3), I32(16), I32(5))))
+      // Unlink the symlink — the target should remain.
+      inst.invoke("call_path_unlink_file", Seq(I32(3), I32(16), I32(5))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"unlink errno=$e (want 0)")
+        case other => check(false, s"call_path_unlink_file: $other")
+      check(preopen.bytesOf("real").exists(b => new String(b, "UTF-8") == "untouched"),
+            "target untouched after symlink unlink")
+    }
+
     // ----- OFLAGS_EXCL in path_open (hardening pass) ----------------------
     //
     // EXCL gives userspace atomic-create semantics: `CREAT | EXCL` on an

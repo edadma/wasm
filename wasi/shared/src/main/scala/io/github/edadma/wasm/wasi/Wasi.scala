@@ -109,6 +109,10 @@ object Wasi:
     * `ENOENT`, because the distinction matters: ENOENT says "no such
     * path", ENOTCAPABLE says "you can't even ask through this preopen". */
   val ENOTCAPABLE:  Int = 76
+  /** Operation not permitted — POSIX `EPERM`. Surfaces from `path_link`
+    * when the source path is a directory (hardlinking directories is
+    * almost universally forbidden) and a few other invariants. */
+  val EPERM:        Int = 63
 
   // === WASI Preview 1 rights bits (witx-defined) ============================
   //
@@ -319,6 +323,10 @@ object Wasi:
         "fd_datasync"           -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
         "fd_advise"             -> ((_,   args) => fdAdvise(args, ctx, fdTable)),
         "fd_allocate"           -> ((_,   args) => fdAllocate(args, ctx, fdTable)),
+        "path_rename"           -> ((mem, args) => pathRename(mem, args, ctx)),
+        "path_link"             -> ((mem, args) => pathLink(mem, args, ctx)),
+        "path_symlink"          -> ((mem, args) => pathSymlink(mem, args, ctx)),
+        "path_readlink"         -> ((mem, args) => pathReadlink(mem, args, ctx)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -1142,6 +1150,173 @@ object Wasi:
           case Left(errno) => Seq(I32(errno))
       case _ => Seq(I32(EINVAL))
 
+  // === path_rename ==========================================================
+
+  /** `path_rename(fd: i32, old_path_ptr: i32, old_path_len: i32,
+    *               new_fd: i32, new_path_ptr: i32, new_path_len: i32) -> errno`
+    *
+    * Move the entry at `old_path` (resolved against the preopen at
+    * `fd`) to `new_path` (resolved against the preopen at `new_fd`).
+    *
+    * Cross-preopen renames return `ENOTCAPABLE` — moving a file from
+    * one mount to another would have to be copy + delete, and the
+    * shim doesn't try to mask that non-atomicity behind a `rename`-
+    * shaped syscall. Same-preopen renames go through the new
+    * [[WasiContext.Preopen.renamePath]] trait method.
+    *
+    * `ENOENT` if `oldPath` doesn't exist; `EEXIST` if `newPath`
+    * already does (POSIX `rename` allows overwriting a regular file
+    * at the destination, but that's a future refinement — for now
+    * we surface the existence as a clear failure). */
+  private def pathRename(memory: Memory, args: Seq[Value],
+                         ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(oldPathPtr), I32(oldPathLen),
+               I32(newFd), I32(newPathPtr), I32(newPathLen)) =>
+        val oldIdx = fd - 3
+        val newIdx = newFd - 3
+        if oldIdx < 0 || oldIdx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        if newIdx < 0 || newIdx >= ctx.preopens.length then
+          return Seq(I32(EBADF))
+        if oldIdx != newIdx then
+          return Seq(I32(ENOTCAPABLE))
+        val data    = memory.data
+        val dataLen = data.length
+        if oldPathPtr < 0 || oldPathLen < 0 ||
+           oldPathPtr.toLong + oldPathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        if newPathPtr < 0 || newPathLen < 0 ||
+           newPathPtr.toLong + newPathLen.toLong > dataLen then
+          return Seq(I32(EFAULT))
+        val oldBytes = new Array[Byte](oldPathLen)
+        System.arraycopy(data, oldPathPtr, oldBytes, 0, oldPathLen)
+        val newBytes = new Array[Byte](newPathLen)
+        System.arraycopy(data, newPathPtr, newBytes, 0, newPathLen)
+        val oldPath = new String(oldBytes, "UTF-8")
+        val newPath = new String(newBytes, "UTF-8")
+        ctx.preopens(oldIdx).renamePath(oldPath, newPath) match
+          case Right(_)    => Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  // === path_link / path_symlink / path_readlink =============================
+
+  /** `path_link(old_fd: i32, old_flags: i32, old_path_ptr: i32,
+    *             old_path_len: i32, new_fd: i32, new_path_ptr: i32,
+    *             new_path_len: i32) -> errno`
+    *
+    * Hard link: `new_path` becomes a second name for the entry at
+    * `old_path`. Both names refer to the same underlying bytes; writes
+    * through either are visible to both, and unlinking one leaves the
+    * other working.
+    *
+    * Cross-preopen hardlinks return `ENOTCAPABLE` (the trait surface
+    * is per-preopen). `old_flags` is ignored — POSIX has
+    * `LOOKUPFLAGS_SYMLINK_FOLLOW` here, but since the shim doesn't
+    * follow symlinks during resolution there's nothing to gate. */
+  private def pathLink(memory: Memory, args: Seq[Value],
+                       ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(oldFd), I32(_), I32(oldPathPtr), I32(oldPathLen),
+               I32(newFd), I32(newPathPtr), I32(newPathLen)) =>
+        val oldIdx = oldFd - 3
+        val newIdx = newFd - 3
+        if oldIdx < 0 || oldIdx >= ctx.preopens.length then return Seq(I32(EBADF))
+        if newIdx < 0 || newIdx >= ctx.preopens.length then return Seq(I32(EBADF))
+        if oldIdx != newIdx then return Seq(I32(ENOTCAPABLE))
+        val data    = memory.data
+        val dataLen = data.length
+        if oldPathPtr < 0 || oldPathLen < 0 ||
+           oldPathPtr.toLong + oldPathLen.toLong > dataLen then return Seq(I32(EFAULT))
+        if newPathPtr < 0 || newPathLen < 0 ||
+           newPathPtr.toLong + newPathLen.toLong > dataLen then return Seq(I32(EFAULT))
+        val oldBytes = new Array[Byte](oldPathLen)
+        System.arraycopy(data, oldPathPtr, oldBytes, 0, oldPathLen)
+        val newBytes = new Array[Byte](newPathLen)
+        System.arraycopy(data, newPathPtr, newBytes, 0, newPathLen)
+        ctx.preopens(oldIdx).linkPath(new String(oldBytes, "UTF-8"),
+                                      new String(newBytes, "UTF-8")) match
+          case Right(_)    => Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  /** `path_symlink(old_path_ptr: i32, old_path_len: i32, fd: i32,
+    *                new_path_ptr: i32, new_path_len: i32) -> errno`
+    *
+    * Create a symbolic link at `new_path` (resolved against the
+    * preopen at `fd`). The link's stored target is the literal bytes
+    * of `old_path` — it's an opaque string at this layer, and the
+    * shim doesn't try to resolve it.
+    *
+    * Note the irregular arg order: the source string comes FIRST,
+    * then the destination fd, then the destination path. This
+    * matches the wasi-preview1 witx exactly and is the convention
+    * wasi-libc emits. */
+  private def pathSymlink(memory: Memory, args: Seq[Value],
+                          ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(oldPathPtr), I32(oldPathLen),
+               I32(fd),
+               I32(newPathPtr), I32(newPathLen)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then return Seq(I32(EBADF))
+        val data    = memory.data
+        val dataLen = data.length
+        if oldPathPtr < 0 || oldPathLen < 0 ||
+           oldPathPtr.toLong + oldPathLen.toLong > dataLen then return Seq(I32(EFAULT))
+        if newPathPtr < 0 || newPathLen < 0 ||
+           newPathPtr.toLong + newPathLen.toLong > dataLen then return Seq(I32(EFAULT))
+        val oldBytes = new Array[Byte](oldPathLen)
+        System.arraycopy(data, oldPathPtr, oldBytes, 0, oldPathLen)
+        val newBytes = new Array[Byte](newPathLen)
+        System.arraycopy(data, newPathPtr, newBytes, 0, newPathLen)
+        ctx.preopens(idx).symlinkPath(new String(oldBytes, "UTF-8"),
+                                      new String(newBytes, "UTF-8")) match
+          case Right(_)    => Seq(I32(ESUCCESS))
+          case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  /** `path_readlink(fd: i32, path_ptr: i32, path_len: i32,
+    *                 buf_ptr: i32, buf_len: i32,
+    *                 bufused_out_ptr: i32) -> errno`
+    *
+    * Read the target of the symlink at `path` (resolved against the
+    * preopen at `fd`). The target bytes go into `buf_ptr` (truncated
+    * if longer than `buf_len`); the actual byte count is written
+    * to `bufused_out_ptr` (always min(target.length, buf_len) on
+    * success — callers compare against `buf_len` to detect truncation).
+    *
+    * EINVAL if `path` resolves to a non-symlink (POSIX `readlink`
+    * semantics); ENOENT for missing paths. */
+  private def pathReadlink(memory: Memory, args: Seq[Value],
+                           ctx: WasiContext): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(pathPtr), I32(pathLen),
+               I32(bufPtr), I32(bufLen), I32(bufusedOutPtr)) =>
+        val idx = fd - 3
+        if idx < 0 || idx >= ctx.preopens.length then return Seq(I32(EBADF))
+        val data    = memory.data
+        val dataLen = data.length
+        if pathPtr < 0 || pathLen < 0 ||
+           pathPtr.toLong + pathLen.toLong > dataLen then return Seq(I32(EFAULT))
+        if bufLen < 0 ||
+           (bufLen > 0 && (bufPtr < 0 || bufPtr.toLong + bufLen.toLong > dataLen)) then
+          return Seq(I32(EFAULT))
+        if bufusedOutPtr < 0 || bufusedOutPtr.toLong + 4L > dataLen then
+          return Seq(I32(EFAULT))
+        val pathBytes = new Array[Byte](pathLen)
+        System.arraycopy(data, pathPtr, pathBytes, 0, pathLen)
+        ctx.preopens(idx).readlinkPath(new String(pathBytes, "UTF-8")) match
+          case Left(errno)  => Seq(I32(errno))
+          case Right(target) =>
+            val targetBytes = target.getBytes("UTF-8")
+            val n = math.min(targetBytes.length, bufLen)
+            if n > 0 then System.arraycopy(targetBytes, 0, data, bufPtr, n)
+            writeI32LE(data, bufusedOutPtr, n)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
   // === path_create_directory ================================================
 
   /** `path_create_directory(fd: i32, path_ptr: i32, path_len: i32) -> errno`
@@ -1718,6 +1893,51 @@ object WasiContext:
     private[wasi] def mkdir(@unused path: String): Either[Int, Unit] =
       Left(Wasi.ENOTCAPABLE)
 
+    /** Move the entry at `oldPath` to `newPath` within this preopen.
+      * Called by `path_rename` when both source and destination fd
+      * point at the same preopen. Returns `Right(())` on success,
+      * `Left(Wasi.ENOENT)` if the source doesn't exist,
+      * `Left(Wasi.EEXIST)` if `newPath` already exists, and
+      * `Left(Wasi.ENOTCAPABLE)` for preopens with no FS capability.
+      *
+      * Open handles against the old path keep their cell reference
+      * (POSIX rename-while-open semantics). Cross-preopen renames
+      * aren't supported at the trait level — the syscall layer
+      * refuses them with ENOTCAPABLE before reaching this method. */
+    private[wasi] def renamePath(@unused oldPath: String,
+                                 @unused newPath: String): Either[Int, Unit] =
+      Left(Wasi.ENOTCAPABLE)
+
+    /** Create a hard link from `oldPath` to `newPath`. Both paths refer
+      * to the SAME underlying entry — writes through either reflect at
+      * both, and unlinking one leaves the other working. Called by
+      * `path_link`. Returns `Right(())` on success, `Left(ENOENT)` if
+      * `oldPath` doesn't exist, `Left(EEXIST)` if `newPath` is already
+      * taken, `Left(EPERM)` if `oldPath` is a directory (POSIX disallows
+      * hardlinking directories), and `Left(ENOTCAPABLE)` for preopens
+      * with no FS capability. */
+    private[wasi] def linkPath(@unused oldPath: String,
+                               @unused newPath: String): Either[Int, Unit] =
+      Left(Wasi.ENOTCAPABLE)
+
+    /** Create a symbolic link at `newPath` whose stored target is
+      * `oldPath`. The target is an opaque string here — the shim does
+      * not follow symlinks during path resolution today. Called by
+      * `path_symlink`. Returns `Right(())` on success, `Left(EEXIST)`
+      * if `newPath` already exists, `Left(ENOTCAPABLE)` for preopens
+      * with no FS capability. */
+    private[wasi] def symlinkPath(@unused oldPath: String,
+                                  @unused newPath: String): Either[Int, Unit] =
+      Left(Wasi.ENOTCAPABLE)
+
+    /** Read the target of the symlink at `path`. Returns `Right(target)`
+      * if `path` is a symlink, `Left(EINVAL)` if it's a regular file or
+      * directory (POSIX `readlink` on non-symlinks), `Left(ENOENT)` if
+      * `path` doesn't exist, and `Left(ENOTCAPABLE)` for preopens with
+      * no FS capability. Called by `path_readlink`. */
+    private[wasi] def readlinkPath(@unused path: String): Either[Int, String] =
+      Left(Wasi.ENOTCAPABLE)
+
     /** Enumerate directory entries for `fd_readdir`. Each tuple is
       * `(name, filetype byte, inode)`. Default impl returns empty
       * (name-only preopens advertise no contents). The InMemory impl
@@ -1862,7 +2082,7 @@ object WasiContext:
         * handles close, matching POSIX "unlink while open" semantics. */
       override private[wasi] def unlinkPath(path: String): Either[Int, Unit] =
         cells.get(path) match
-          case Some(FileEntry(_)) =>
+          case Some(FileEntry(_)) | Some(SymlinkEntry(_)) =>
             val _ = cells.remove(path)
             Right(())
           case Some(DirEntry) => Left(Wasi.EISDIR)
@@ -1870,8 +2090,9 @@ object WasiContext:
 
       override def statPath(path: String): Either[Int, Long] =
         cells.get(path) match
-          case Some(FileEntry(cell)) => Right(cell.bytes.length.toLong)
-          case Some(DirEntry)        => Right(0L)
+          case Some(FileEntry(cell))     => Right(cell.bytes.length.toLong)
+          case Some(DirEntry)            => Right(0L)
+          case Some(SymlinkEntry(target)) => Right(target.getBytes("UTF-8").length.toLong)
           case None                  => Left(Wasi.ENOENT)
 
       /** Filetype of `path`. Used by `path_filestat_get` (which needs
@@ -1880,8 +2101,9 @@ object WasiContext:
         * 4=REGULAR_FILE; `None` for a missing path. */
       override private[wasi] def filetypeOf(path: String): Option[Byte] =
         cells.get(path).map {
-          case FileEntry(_) => 4: Byte
-          case DirEntry     => 3: Byte
+          case FileEntry(_)    => 4: Byte                                   // REGULAR_FILE
+          case DirEntry        => 3: Byte                                   // DIRECTORY
+          case SymlinkEntry(_) => 7: Byte                                   // SYMBOLIC_LINK
         }
 
       override private[wasi] def mkdir(path: String): Either[Int, Unit] =
@@ -1890,6 +2112,59 @@ object WasiContext:
           cells(path) = DirEntry
           Right(())
 
+      /** Move `oldPath` to `newPath` within the InMemoryPreopen. The
+        * underlying `Entry` (FileEntry's FileCell or DirEntry sentinel)
+        * is moved — `FileCell` is shared with any open handles, so
+        * already-opened fds keep working against the new path
+        * transparently (POSIX rename-while-open semantics). */
+      override private[wasi] def renamePath(oldPath: String,
+                                            newPath: String): Either[Int, Unit] =
+        cells.get(oldPath) match
+          case None         => Left(Wasi.ENOENT)
+          case Some(entry)  =>
+            if oldPath == newPath then Right(())            // POSIX no-op
+            else if cells.contains(newPath) then Left(Wasi.EEXIST)
+            else
+              val _ = cells.remove(oldPath)
+              cells(newPath) = entry
+              Right(())
+
+      /** Hard link: both paths share the same `Entry`. For `FileEntry`
+        * that means the same `FileCell`, so writes through either path
+        * land in the same bytes. For `SymlinkEntry` it's the same
+        * symlink target string. Directories are refused with EPERM
+        * (POSIX disallows hardlinking dirs to keep the FS acyclic). */
+      override private[wasi] def linkPath(oldPath: String,
+                                          newPath: String): Either[Int, Unit] =
+        cells.get(oldPath) match
+          case None              => Left(Wasi.ENOENT)
+          case Some(DirEntry)    => Left(Wasi.EPERM)
+          case Some(entry)       =>
+            if cells.contains(newPath) then Left(Wasi.EEXIST)
+            else
+              cells(newPath) = entry
+              Right(())
+
+      /** Symlink: a fresh `SymlinkEntry` at `newPath` whose target is
+        * the literal `oldPath` string. The shim doesn't follow symlinks
+        * during path resolution today, so the target can be any string
+        * (validation that it resolves is deferred to whoever attempts to
+        * traverse it). */
+      override private[wasi] def symlinkPath(oldPath: String,
+                                             newPath: String): Either[Int, Unit] =
+        if cells.contains(newPath) then Left(Wasi.EEXIST)
+        else
+          cells(newPath) = SymlinkEntry(oldPath)
+          Right(())
+
+      /** Read the target of a symlink. `EINVAL` if the path resolves to
+        * a non-symlink, `ENOENT` if it doesn't resolve. */
+      override private[wasi] def readlinkPath(path: String): Either[Int, String] =
+        cells.get(path) match
+          case None                       => Left(Wasi.ENOENT)
+          case Some(SymlinkEntry(target)) => Right(target)
+          case Some(_)                    => Left(Wasi.EINVAL)
+
       /** Snapshot the directory entries for `fd_readdir`. Each tuple is
         * `(name, filetype byte, inode)`; the inode is just an index here
         * (0..N-1) since the InMemoryFs has no real inode-allocation
@@ -1897,8 +2172,9 @@ object WasiContext:
       override private[wasi] def readdir: Seq[(String, Byte, Long)] =
         cells.toSeq.zipWithIndex.map { case ((name, entry), idx) =>
           val ft: Byte = entry match
-            case FileEntry(_) => 4: Byte
-            case DirEntry     => 3: Byte
+            case FileEntry(_)    => 4: Byte
+            case DirEntry        => 3: Byte
+            case SymlinkEntry(_) => 7: Byte
           (name, ft, idx.toLong)
         }
 
@@ -1924,6 +2200,11 @@ object WasiContext:
     private[wasi] sealed trait Entry
     private[wasi] final case class FileEntry(cell: FileCell) extends Entry
     private[wasi] case object DirEntry extends Entry
+    /** Symlink entry — the `target` is a path string. The shim never
+      * follows symlinks today (path_open treats them as opaque); they're
+      * visible through `path_readlink` and surface as filetype 7
+      * (SYMBOLIC_LINK) in `path_filestat_get` and `fd_readdir`. */
+    private[wasi] final case class SymlinkEntry(target: String) extends Entry
 
     /** Mutable byte-array cell. Open handles share the cell so a
       * cursor-advancing write on one handle is observable through the

@@ -46,6 +46,14 @@
     (func $fd_advise (param i32 i64 i64 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_allocate"
     (func $fd_allocate (param i32 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "path_rename"
+    (func $path_rename (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_link"
+    (func $path_link (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_symlink"
+    (func $path_symlink (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_readlink"
+    (func $path_readlink (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_unlink_file"
     (func $path_unlink_file (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_create_directory"
@@ -156,6 +164,61 @@
     local.get $offset
     local.get $len
     call $fd_allocate)
+
+  (func (export "call_path_rename")
+        (param $fd i32)
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $new_fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $fd
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $new_fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_rename)
+
+  (func (export "call_path_link")
+        (param $old_fd i32) (param $old_flags i32)
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $new_fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $old_fd
+    local.get $old_flags
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $new_fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_link)
+
+  (func (export "call_path_symlink")
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_symlink)
+
+  (func (export "call_path_readlink")
+        (param $fd i32)
+        (param $path_ptr i32) (param $path_len i32)
+        (param $buf_ptr i32) (param $buf_len i32)
+        (param $bufused_out i32)
+        (result i32)
+    local.get $fd
+    local.get $path_ptr
+    local.get $path_len
+    local.get $buf_ptr
+    local.get $buf_len
+    local.get $bufused_out
+    call $path_readlink)
 
   (func (export "call_path_unlink_file")
         (param $fd i32) (param $path_ptr i32) (param $path_len i32)

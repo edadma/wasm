@@ -54,8 +54,12 @@ Twenty-four host functions are exposed under the module name `wasi_snapshot_prev
 | Syscall | Behaviour |
 |---|---|
 | `path_filestat_get(dirfd, …, path_ptr, path_len, *stat)` | Stats `path` relative to the preopen at `dirfd` without opening it. |
-| `path_unlink_file(dirfd, path_ptr, path_len)`            | Removes a path. Already-open handles keep their cell reference (POSIX unlink-while-open). |
+| `path_unlink_file(dirfd, path_ptr, path_len)`            | Removes a file or symlink. Already-open handles keep their cell reference (POSIX unlink-while-open). `EISDIR` for directories — use `path_remove_directory` for those (not implemented). |
 | `path_create_directory(dirfd, path_ptr, path_len)`       | Creates a directory entry. Returns `EEXIST` if anything is there already. |
+| `path_rename(fd, old_path, new_fd, new_path)`            | Moves an entry within a preopen. Cross-preopen renames return `ENOTCAPABLE`. `ENOENT` if source is missing, `EEXIST` if destination is taken. |
+| `path_link(old_fd, …, old_path, new_fd, new_path)`       | Hard link. Both paths refer to the same entry; writes through either are visible to both. Cross-preopen returns `ENOTCAPABLE`; hardlinking directories returns `EPERM`. |
+| `path_symlink(old_path, fd, new_path)`                   | Creates a symlink at `new_path` whose stored target is the opaque string `old_path`. The shim does not follow symlinks during path resolution; they're visible via `path_readlink` and surface as filetype `SYMBOLIC_LINK` (7). |
+| `path_readlink(fd, path, buf, buf_len, *bufused)`        | Reads a symlink's target into `buf`, truncating to `buf_len` bytes. `bufused` reports the actual byte count. `EINVAL` on non-symlinks. |
 | `fd_readdir(fd, buf, buf_len, cookie, *bytes_written)`   | Enumerates directory entries. Resumable via the `cookie` for buffers smaller than the listing. |
 
 ## What isn't here yet
@@ -64,7 +68,5 @@ Twenty-four host functions are exposed under the module name `wasi_snapshot_prev
 |---|---|---|
 | `poll_oneoff`                    | not implemented | No subscription handling yet — anything that polls falls back to ENOTSUP. |
 | `sock_*`                         | not implemented | wasi-preview1 sockets are a thin shim; the project is library-scoped, not server-scoped. |
-| `path_link` / `path_symlink` / `path_readlink` | not implemented | Adds complexity without unblocking the rustc smoke tests. |
-| `path_rename`                    | not implemented | Same. |
 
 Programs that issue an unimplemented syscall get back `Wasi.ENOTSUP` (52), which is the spec-conformant "host doesn't support this".
