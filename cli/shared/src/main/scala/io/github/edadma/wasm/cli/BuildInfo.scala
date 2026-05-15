@@ -8,4 +8,4 @@ package io.github.edadma.wasm.cli
   * (commit hash, build time, etc.).
   */
 object BuildInfo:
-  val version: String = "0.0.1"
+  val version: String = "0.1.1"
