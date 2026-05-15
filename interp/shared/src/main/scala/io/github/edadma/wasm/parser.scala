@@ -97,6 +97,7 @@ object Parser:
     // `memory.init` / `data.drop`. We capture it on parse; the validator
     // gates those ops on its presence + agreement with `data.length`.
     var dataCount = Option.empty[Int]
+    var funcNames = Map.empty[Int, String]
 
     while c.hasMore do
       val id      = c.readByte()
@@ -105,6 +106,7 @@ object Parser:
       if secEnd > c.bytes.length then fail(WasmError.InvalidModule(s"section $id overflows file"))
 
       id match
+        case 0  => funcNames = parseCustomSection(c, secEnd, funcNames)       // section 0 is "custom" — `name` is one of these
         case 1  => types     = parseTypeSection(c)
         case 2  => imports   = parseImportSection(c)
         case 3  => functions = parseFunctionSection(c)
@@ -117,7 +119,7 @@ object Parser:
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
         case 12 => dataCount = Some(c.readU32())                              // Section 12 (Data Count)
-        case _  => () // ignore Custom (0) and any future / unknown id
+        case _  => () // ignore any future / unknown id
       c.pos = secEnd
 
     if codes.size != functions.size then
@@ -133,7 +135,7 @@ object Parser:
           s"DataCount section value $n disagrees with data section size ${data.size}"))
     }
 
-    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start, dataCount)
+    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start, dataCount, funcNames)
 
   // === Type section ===
 
@@ -291,6 +293,52 @@ object Parser:
     * — Start requires `() -> ()`) rather than here, because parsing
     * doesn't have visibility into resolved imports' types. */
   private def parseStartSection(c: Cursor): Int = c.readU32()
+
+  // === Custom sections ===
+
+  /** Parse a Section 0 custom section. The section's name comes first as a
+    * UTF-8 length-prefixed string; the rest of the bytes are the section's
+    * payload, format chosen per name.
+    *
+    * We currently recognise one name: `name`, subsection 1 (function
+    * names). The "name" custom section was originally specified for
+    * scoped debug info; subsection 1 is the only piece that helps user-
+    * facing diagnostics — function names show up in our `function <N>
+    * (foo): byte offset …` error format when present. Subsection 0
+    * (module name) and 2 (local names) and any later subsections are
+    * skipped silently. Any unknown custom-section name is also skipped.
+    *
+    * The parser is best-effort: a malformed payload doesn't trap the
+    * whole module load, it just leaves the function-name map alone. This
+    * matches wasmtime / wabt behaviour — `name` is debug info, and a
+    * busted debug section shouldn't prevent the program from running. */
+  private def parseCustomSection(c: Cursor, secEnd: Int, current: Map[Int, String]): Map[Int, String] =
+    val sectionName =
+      try c.readName()
+      catch case _: Throwable => return current
+    if sectionName != "name" then return current
+    var out = current
+    while c.pos < secEnd do
+      // Each subsection: 1-byte kind, u32 size, payload.
+      val subKind = c.readByte() & 0xff
+      val subSize = c.readU32()
+      val subEnd  = c.pos + subSize
+      if subEnd > secEnd then return out  // truncated; abandon what we have so far
+      if subKind == 1 then
+        // Function names: `vec<(funcidx, name)>`, sorted by funcidx in the
+        // wire format but we don't rely on that — just consume each pair.
+        try
+          val n = c.readU32()
+          var i = 0
+          while i < n do
+            val idx  = c.readU32()
+            val name = c.readName()
+            out = out.updated(idx, name)
+            i += 1
+        catch case _: Throwable => return out
+      // else: subsection 0 (module name), 2 (local names), 3+ (future) — skip.
+      c.pos = subEnd
+    out
 
   // === Element section ===
 

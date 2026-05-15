@@ -114,10 +114,12 @@ object Validator:
         val typeIdx = module.functions(i)
         val funcIdx = module.imports.length + i
         if typeIdx < 0 || typeIdx >= module.types.length then
+          val nameSuffix = module.funcNames.get(funcIdx).fold("")(n => s" ($n)")
           throw new ValFail(WasmError.InvalidModule(
-            s"function $funcIdx: type index $typeIdx out of range"))
+            s"function $funcIdx$nameSuffix: type index $typeIdx out of range"))
         validateFunction(
           funcIdx          = funcIdx,
+          funcName         = module.funcNames.get(funcIdx),
           sig              = module.types(typeIdx),
           declared         = module.codes(i).locals,
           body             = module.codes(i).body,
@@ -169,6 +171,7 @@ object Validator:
     * results are on the stack at exit. */
   private def validateFunction(
       funcIdx:          Int,
+      funcName:         Option[String],
       sig:              FuncType,
       declared:         Vector[ValueType],
       body:             Array[Byte],
@@ -186,6 +189,7 @@ object Validator:
   ): Unit =
     val state = new State(
       funcIdx          = funcIdx,
+      funcName         = funcName,
       funcResults      = sig.results,
       locals           = sig.params ++ declared,
       funcSigs         = funcSigs,
@@ -211,6 +215,7 @@ object Validator:
     * operand/ctrl stacks much noisier. */
   private final class State(
       val funcIdx:     Int,
+      val funcName:    Option[String],
       val funcResults: Vector[ValueType],
       val locals:      Vector[ValueType],
       val funcSigs:    Vector[FuncType],
@@ -247,8 +252,9 @@ object Validator:
     // --- diagnostics ----
 
     def fail(msg: String): Nothing =
+      val nameSuffix = funcName.fold("")(n => s" ($n)")
       throw new ValFail(WasmError.InvalidModule(
-        s"function $funcIdx: byte offset 0x${opPC.toHexString}: $msg"))
+        s"function $funcIdx$nameSuffix: byte offset 0x${opPC.toHexString}: $msg"))
 
     def typeName(t: ValueType): String = t match
       case ValueType.I32Type       => "i32"

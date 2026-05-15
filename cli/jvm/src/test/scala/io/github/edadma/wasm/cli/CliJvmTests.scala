@@ -120,6 +120,7 @@ object CliJvmTests:
   private val WasiExit42    = "wasi/shared/src/test/resources/fixtures/wasi_exit.wasm"
   private val RustFileRead  = "wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm"
   private val RustWordCount = "examples/rust/word_count.wasm"
+  private val RustEnvEcho   = "examples/rust/env_echo.wasm"
 
   // === Tests ===============================================================
 
@@ -243,6 +244,39 @@ object CliJvmTests:
       finally
         val _ = Files.deleteIfExists(tmp.toPath.resolve("a.txt"))
         val _ = Files.deleteIfExists(tmp.toPath)
+    }
+
+    // === --env flag =========================================================
+
+    test("--env KEY=VALUE entries reach a WASI program through environ_get") {
+      // env_echo prints every (k,v) pair sorted by key as "k=v\n".
+      val (code, out, err) = runCli(
+        "-e", "FOO=bar",
+        "-e", "BAZ=qux",
+        RustEnvEcho,
+      )
+      check(code == 0, s"expected exit 0, got $code  err=$err")
+      // Sorted by key: BAZ comes before FOO.
+      val expected = "BAZ=qux\nFOO=bar\n"
+      check(out == expected, s"expected stdout '$expected', got:\n$out")
+    }
+
+    test("--env value may contain `=` signs (PATH=a:b:c works)") {
+      val (code, out, err) = runCli(
+        "-e", "PATH=/usr/bin:/bin",
+        RustEnvEcho,
+      )
+      check(code == 0, s"expected exit 0, got $code  err=$err")
+      check(out.contains("PATH=/usr/bin:/bin"),
+        s"expected stdout to contain the full value with embedded colon, got:\n$out")
+    }
+
+    test("--env with an empty key fails validation before instantiation") {
+      // `=value` has no key — scopt's validate-failure path.
+      val (code, _, err) = runCli("-e", "=novalue", RustEnvEcho)
+      check(code != 0, s"expected non-zero exit for empty env key, got $code")
+      check(err.contains("env") && err.contains("key"),
+        s"expected diagnostic about the empty key, got:\n$err")
     }
 
     test("--preopen without a colon fails validation before instantiation") {

@@ -5,7 +5,11 @@ edition = "2021"
 
 [[bin]]
 name = "word_count"
-path = "src/main.rs"
+path = "src/word_count.rs"
+
+[[bin]]
+name = "env_echo"
+path = "src/env_echo.rs"
 
 [profile.release]
 opt-level = "z"     # size-optimize; the interpreter doesn't care, but smaller .wasm is friendlier to commit

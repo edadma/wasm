@@ -30,6 +30,20 @@ sbt 'cliJVM/run examples/c/hello.wasm'
 
 The matching `examples/c/hello.c` source and `Makefile` are committed alongside; see [`examples/c/README.md`](https://github.com/edadma/wasm/tree/dev/examples/c) for the build invocation.
 
+## C with wasi-libc (`<stdio.h>`, argv, exit codes)
+
+`examples/c-libc/hexdump.c` is the smallest "real C program" target: it uses `<stdio.h>` (`fopen`/`fread`/`printf`/`fprintf(stderr, ...)`), reads its path argument from `argv[1]`, and returns an exit code from `main`. The build requires [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) — the freestanding example above doesn't, but anything that touches libc does.
+
+```bash
+# Install wasi-sdk first, then:
+make -C examples/c-libc
+sbt 'cliJVM/run --preopen /sandbox:./fixtures -- \
+                examples/c-libc/hexdump.wasm /sandbox/data.bin'
+# 00000000: 48 65 6c 6c 6f 0a                              |Hello.|
+```
+
+The `.wasm` is **not** committed (wasi-sdk isn't free to install everywhere); see [`examples/c-libc/README.md`](https://github.com/edadma/wasm/tree/dev/examples/c-libc) for the build invocation.
+
 ## Real WASI binary with a host-backed preopen
 
 `examples/rust/word_count.wasm` is a rustc-built `wasm32-wasip1` binary that reads a path passed as `argv[1]` from a wasi preopen and prints `wc -lwc`-style counts:

@@ -1180,6 +1180,383 @@ object WasiFsTests:
         case other => check(false, s"call_fd_datasync(-1): $other")
     }
 
+    // ----- fd_advise (advisory; pass valid advice through) ----------------
+
+    test("fd_advise: ESUCCESS on stdio + preopen + opened file for every valid advice") {
+      val files     = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      // advice values: 0=NORMAL, 1=SEQUENTIAL, 2=RANDOM, 3=WILLNEED, 4=DONTNEED, 5=NOREUSE.
+      for fd <- Seq(0, 1, 2, 3, 4); advice <- 0 to 5 do
+        inst.invoke("call_fd_advise", Seq(I32(fd), I64(0L), I64(0L), I32(advice))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd advice=$advice errno=$e (want 0)")
+          case other => check(false, s"call_fd_advise(fd=$fd advice=$advice): $other")
+    }
+
+    test("fd_advise: EINVAL on out-of-range advice (regardless of fd)") {
+      val files     = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      for advice <- Seq(-1, 6, 99) do
+        inst.invoke("call_fd_advise", Seq(I32(4), I64(0L), I64(0L), I32(advice))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EINVAL, s"advice=$advice errno=$e (want EINVAL)")
+          case other => check(false, s"call_fd_advise(advice=$advice): $other")
+    }
+
+    test("fd_advise: EBADF for unknown fd (only after the advice range check)") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      inst.invoke("call_fd_advise", Seq(I32(99), I64(0L), I64(0L), I32(0))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"unknown fd errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_advise: $other")
+    }
+
+    // ----- fd_allocate (grow file to cover [offset, offset+len)) ----------
+
+    test("fd_allocate: extends a regular file to offset+len, zero-filling the gap") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("f" -> "abc".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Open f for write (oflags=0; no CREAT needed since f exists).
+      storePath(inst, 0, "f")
+      runOk(callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                              oflags = 0, openedFdOut = 64))
+      val fd = peekI32(inst, 64)
+      check(fd == 4, s"opened fd=$fd")
+      // Allocate offset=2 len=8 → end=10. Existing size is 3 → file grows
+      // to 10 bytes, byte 2 stays 'c', bytes 3..9 are zero-filled.
+      inst.invoke("call_fd_allocate", Seq(I32(fd), I64(2L), I64(8L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_allocate: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(bytes.length == 10,
+            s"file should be 10 bytes after allocate(2, 8), got ${bytes.length}")
+      check(bytes(0) == 'a'.toByte && bytes(1) == 'b'.toByte && bytes(2) == 'c'.toByte,
+            s"original bytes preserved: ${bytes.toSeq.map(_.toInt)}")
+      for i <- 3 until 10 do
+        check(bytes(i) == 0, s"byte $i should be zero-filled, got ${bytes(i).toInt}")
+    }
+
+    test("fd_allocate: no-op when offset+len already fits in the current size") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("f" -> "abcdefgh".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      runOk(callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                              oflags = 0, openedFdOut = 64))
+      val fd = peekI32(inst, 64)
+      // Allocate offset=2 len=4 → end=6, which is already ≤ size=8. Nothing
+      // should grow and the bytes should be untouched.
+      inst.invoke("call_fd_allocate", Seq(I32(fd), I64(2L), I64(4L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other => check(false, s"call_fd_allocate: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "abcdefgh", s"unchanged: ${new String(bytes, "UTF-8")}")
+    }
+
+    test("fd_allocate: EBADF on stdio / preopen / unknown fd") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      for fd <- Seq(0, 1, 2, 3, 99) do
+        inst.invoke("call_fd_allocate", Seq(I32(fd), I64(0L), I64(1L))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EBADF, s"fd=$fd errno=$e (want EBADF)")
+          case other => check(false, s"call_fd_allocate(fd=$fd): $other")
+    }
+
+    test("fd_allocate: EINVAL on negative offset or len") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      // fd 4 is the opened file; the EINVAL check runs before any fd check.
+      inst.invoke("call_fd_allocate", Seq(I32(4), I64(-1L), I64(8L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"neg offset errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_allocate(neg offset): $other")
+      inst.invoke("call_fd_allocate", Seq(I32(4), I64(0L), I64(-1L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"neg len errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_allocate(neg len): $other")
+    }
+
+    // ----- path_rename (within a single preopen) --------------------------
+
+    test("path_rename: moves a file entry; old path becomes ENOENT, new path resolves") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("old.txt" -> "hello".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Place old/new paths at distinct memory regions.
+      storePath(inst, 0, "old.txt")
+      storePath(inst, 16, "new.txt")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(3), I32(16), I32(7))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_rename: $other")
+      check(preopen.bytesOf("old.txt").isEmpty, "old.txt should be gone")
+      check(preopen.bytesOf("new.txt").exists(b => new String(b, "UTF-8") == "hello"),
+            "new.txt should hold the old bytes")
+    }
+
+    test("path_rename: ENOENT when the source path doesn't exist") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "missing")
+      storePath(inst, 16, "target")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(3), I32(16), I32(6))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    test("path_rename: EEXIST when the destination path already exists") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("a" -> "1".getBytes,
+                                                     "b" -> "2".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "a")
+      storePath(inst, 16, "b")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_rename: $other")
+      // Both originals untouched.
+      check(preopen.bytesOf("a").exists(b => new String(b, "UTF-8") == "1"), "a unchanged")
+      check(preopen.bytesOf("b").exists(b => new String(b, "UTF-8") == "2"), "b unchanged")
+    }
+
+    test("path_rename: ENOTCAPABLE on cross-preopen renames") {
+      val po1 = WasiContext.Preopen.inMemory("/s1", Map("f" -> "x".getBytes))
+      val po2 = WasiContext.Preopen.inMemory("/s2")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(po1, po2))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      // fd 3 = /s1 (source), fd 4 = /s2 (destination, different preopen).
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(4), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_rename: $other")
+      // Source untouched.
+      check(po1.bytesOf("f").exists(b => new String(b, "UTF-8") == "x"), "source untouched")
+    }
+
+    test("path_rename: EBADF when either fd isn't a preopen") {
+      val preopen = WasiContext.Preopen.inMemory("/s", Map("f" -> "x".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      inst.invoke("call_path_rename",
+                  Seq(I32(99), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"bad src fd errno=$e (want EBADF)")
+        case other => check(false, s"call_path_rename: $other")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(1),
+                      I32(99), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"bad dst fd errno=$e (want EBADF)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    test("path_rename: ENOTCAPABLE on a name-only preopen") {
+      val preopen = WasiContext.Preopen.named("/etc")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "old")
+      storePath(inst, 16, "new")
+      inst.invoke("call_path_rename",
+                  Seq(I32(3), I32(0), I32(3),
+                      I32(3), I32(16), I32(3))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_rename: $other")
+    }
+
+    // ----- path_link / path_symlink / path_readlink ------------------------
+
+    test("path_link: a hard link makes the source bytes visible under a second name") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("orig" -> "shared".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "orig")
+      storePath(inst, 16, "alias")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0),                                       // old_fd, old_flags
+                      I32(0), I32(4),                                       // old_path_ptr, old_path_len
+                      I32(3),                                               // new_fd
+                      I32(16), I32(5))) match                               // new_path_ptr, new_path_len
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_link: $other")
+      // Both paths now point to the same bytes.
+      check(preopen.bytesOf("orig").exists(b  => new String(b, "UTF-8") == "shared"), "orig retained")
+      check(preopen.bytesOf("alias").exists(b => new String(b, "UTF-8") == "shared"), "alias visible")
+    }
+
+    test("path_link: ENOENT on a missing source path") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "ghost")
+      storePath(inst, 16, "alias")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(5),
+                      I32(3), I32(16), I32(5))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: EEXIST when the destination path is taken") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("a" -> "1".getBytes, "b" -> "2".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "a")
+      storePath(inst, 16, "b")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(3), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EEXIST, s"errno=$e (want EEXIST)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: ENOTCAPABLE on cross-preopen hard links") {
+      val po1 = WasiContext.Preopen.inMemory("/s1", Map("f" -> "x".getBytes))
+      val po2 = WasiContext.Preopen.inMemory("/s2")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(po1, po2))
+      storePath(inst, 0, "f")
+      storePath(inst, 16, "g")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(4), I32(16), I32(1))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOTCAPABLE, s"errno=$e (want ENOTCAPABLE)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_link: EPERM when the source is a directory") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Create a directory at "d" through path_create_directory; then try
+      // to hardlink it.
+      storePath(inst, 0, "d")
+      runOk(inst.invoke("call_path_create_directory", Seq(I32(3), I32(0), I32(1))))
+      storePath(inst, 16, "d2")
+      inst.invoke("call_path_link",
+                  Seq(I32(3), I32(0), I32(0), I32(1),
+                      I32(3), I32(16), I32(2))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EPERM, s"errno=$e (want EPERM)")
+        case other => check(false, s"call_path_link: $other")
+    }
+
+    test("path_symlink: creates a symlink whose target round-trips via path_readlink") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Plant the target string at addr 0 and the new-path name at addr 16.
+      storePath(inst, 0, "../target.txt")                                   // 13 bytes
+      storePath(inst, 16, "link")                                           // 4 bytes
+      // Create the symlink.
+      inst.invoke("call_path_symlink",
+                  Seq(I32(0), I32(13),                                      // old_path_ptr, old_path_len
+                      I32(3),                                               // fd
+                      I32(16), I32(4))) match                               // new_path_ptr, new_path_len
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"symlink errno=$e (want 0)")
+        case other => check(false, s"call_path_symlink: $other")
+      // Read it back. Plant "link" again and read into a fresh buffer.
+      storePath(inst, 0, "link")
+      val bufPtr        = 64
+      val bufLen        = 64
+      val bufusedOutPtr = 32
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3),
+                      I32(0), I32(4),                                       // path_ptr, path_len
+                      I32(bufPtr), I32(bufLen),                             // buf_ptr, buf_len
+                      I32(bufusedOutPtr))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"readlink errno=$e (want 0)")
+        case other => check(false, s"call_path_readlink: $other")
+      // bufused holds the target length.
+      val used = peekI32(inst, bufusedOutPtr)
+      check(used == 13, s"bufused=$used (want 13)")
+      // The target string sits at bufPtr..bufPtr+used.
+      val got = new String(readBytes(inst, bufPtr, used), "UTF-8")
+      check(got == "../target.txt", s"readlink target='$got'")
+    }
+
+    test("path_readlink: truncates to buf_len; bufused reflects the truncated count") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "long-target-here")                                // 16 bytes
+      storePath(inst, 32, "link")
+      runOk(inst.invoke("call_path_symlink",
+                        Seq(I32(0), I32(16), I32(3), I32(32), I32(4))))
+      storePath(inst, 32, "link")
+      val bufPtr        = 128
+      val bufLen        = 5                                                 // shorter than the target
+      val bufusedOutPtr = 200
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(32), I32(4),
+                      I32(bufPtr), I32(bufLen),
+                      I32(bufusedOutPtr))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_path_readlink: $other")
+      val used = peekI32(inst, bufusedOutPtr)
+      check(used == 5, s"bufused=$used (want 5 — truncated)")
+      val got = new String(readBytes(inst, bufPtr, used), "UTF-8")
+      check(got == "long-", s"truncated target='$got' (want 'long-')")
+    }
+
+    test("path_readlink: EINVAL on a non-symlink path") {
+      val preopen = WasiContext.Preopen.inMemory("/s", Map("regular" -> "bytes".getBytes))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "regular")
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(0), I32(7),
+                      I32(64), I32(64), I32(32))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"errno=$e (want EINVAL)")
+        case other => check(false, s"call_path_readlink: $other")
+    }
+
+    test("path_readlink: ENOENT on a missing path") {
+      val preopen = WasiContext.Preopen.inMemory("/s")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "ghost")
+      inst.invoke("call_path_readlink",
+                  Seq(I32(3), I32(0), I32(5),
+                      I32(64), I32(64), I32(32))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ENOENT, s"errno=$e (want ENOENT)")
+        case other => check(false, s"call_path_readlink: $other")
+    }
+
+    test("path_unlink_file: also removes a symlink (the target is left alone)") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("real" -> "untouched".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "real")
+      storePath(inst, 16, "alias")
+      // Create the symlink first.
+      runOk(inst.invoke("call_path_symlink",
+                        Seq(I32(0), I32(4), I32(3), I32(16), I32(5))))
+      // Unlink the symlink — the target should remain.
+      inst.invoke("call_path_unlink_file", Seq(I32(3), I32(16), I32(5))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"unlink errno=$e (want 0)")
+        case other => check(false, s"call_path_unlink_file: $other")
+      check(preopen.bytesOf("real").exists(b => new String(b, "UTF-8") == "untouched"),
+            "target untouched after symlink unlink")
+    }
+
     // ----- OFLAGS_EXCL in path_open (hardening pass) ----------------------
     //
     // EXCL gives userspace atomic-create semantics: `CREAT | EXCL` on an
@@ -1694,6 +2071,191 @@ object WasiFsTests:
         case other => check(false, s"readdir: $other")
     }
 
+    // ----- poll_oneoff (subscriptions + sleep) ----------------------------
+
+    test("poll_oneoff: nsubs=0 returns ESUCCESS with zero events") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // poison the count slot — must be overwritten with 0.
+      storeI32(inst, 16, 0xdeadbeef)
+      callPollOneoff(inst, in = 0, out = 256, nsubs = 0,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 0, s"nevents=${peekI32(inst, 16)} (want 0)")
+    }
+
+    test("poll_oneoff: EINVAL on negative nsubs") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      callPollOneoff(inst, in = 0, out = 256, nsubs = -1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EINVAL, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+    }
+
+    test("poll_oneoff: EFAULT when in/out array overruns linear memory") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      val nearEnd = 65536 - 16   // one subscription is 48 bytes; this overruns
+      callPollOneoff(inst, in = nearEnd, out = 256, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EFAULT, s"errno=$e (in overrun)")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      callPollOneoff(inst, in = 0, out = 65536 - 16, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EFAULT, s"errno=$e (out overrun)")
+        case other              => check(false, s"call_poll_oneoff: $other")
+    }
+
+    test("poll_oneoff: CLOCK monotonic with timeout=0 (relative) fires immediately") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // Subscription at addr 1024; event output at addr 2048; nevents at 16.
+      // userdata=0x1122334455667788, eventtype=0 (CLOCK), clockid=1 (monotonic),
+      // timeout=0, precision=0, flags=0 (relative).
+      buildClockSub(inst, base = 1024, userdata = 0x1122334455667788L,
+                    clockId = 1, timeout = 0L, absTime = false)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)} (want 1)")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 0x1122334455667788L,
+            s"userdata=0x${ev.userdata.toHexString} (want round-trip)")
+      check(ev.error == Wasi.ESUCCESS, s"error=${ev.error}")
+      check(ev.eventtype == 0,        s"eventtype=${ev.eventtype}")
+      check(ev.nbytes == 0L,          s"nbytes=${ev.nbytes}")
+    }
+
+    test("poll_oneoff: CLOCK with invalid clockid emits one EINVAL event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildClockSub(inst, base = 1024, userdata = 7L,
+                    clockId = 9 /* bogus */, timeout = 0L, absTime = false)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 7L,        s"userdata=${ev.userdata}")
+      check(ev.error == Wasi.EINVAL,  s"error=${ev.error}")
+    }
+
+    test("poll_oneoff: FD_READ on an opened file reports remaining bytes ready") {
+      val files = Map("readme" -> "hello!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "readme")
+      buildFdSub(inst, base = 1024, userdata = 0xAAL,
+                 eventtype = 1, fd = 4)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata  == 0xAAL,         s"userdata=${ev.userdata}")
+      check(ev.error     == Wasi.ESUCCESS, s"error=${ev.error}")
+      check(ev.eventtype == 1,             s"eventtype=${ev.eventtype}")
+      check(ev.nbytes    == 6L,            s"nbytes=${ev.nbytes} (want 6 = 'hello!')")
+    }
+
+    test("poll_oneoff: FD_WRITE on stdout reports a generous buffer") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildFdSub(inst, base = 1024, userdata = 1L,
+                 eventtype = 2, fd = 1)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.error == Wasi.ESUCCESS,       s"error=${ev.error}")
+      check(ev.eventtype == 2,               s"eventtype=${ev.eventtype}")
+      check(ev.nbytes > 0L,                  s"nbytes=${ev.nbytes} (want > 0)")
+    }
+
+    test("poll_oneoff: FD_READ on unknown fd emits one EBADF event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildFdSub(inst, base = 1024, userdata = 99L,
+                 eventtype = 1, fd = 77)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 99L,        s"userdata=${ev.userdata}")
+      check(ev.error    == Wasi.EBADF, s"error=${ev.error}")
+    }
+
+    test("poll_oneoff: unknown eventtype emits one EINVAL event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // userdata at +0, eventtype byte at +8 (we use 99 = bogus).
+      // Need to clear the whole 48-byte block first to avoid prior poison.
+      var i = 0
+      while i < 48 do
+        runOk(inst.invoke("store_byte", Seq(I32(1024 + i), I32(0))))
+        i += 1
+      runOk(inst.invoke("store_i64", Seq(I32(1024), I64(123L))))
+      runOk(inst.invoke("store_byte", Seq(I32(1024 + 8), I32(99))))
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 123L,       s"userdata=${ev.userdata}")
+      check(ev.error    == Wasi.EINVAL, s"error=${ev.error}")
+      check(ev.eventtype == 99,         s"eventtype=${ev.eventtype}")
+    }
+
+    test("poll_oneoff: multiple subs — both immediate-ready FD events fire") {
+      val files = Map("a" -> "AB".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "a")
+      buildFdSub(inst, base = 1024,         userdata = 1L, eventtype = 1, fd = 4)
+      buildFdSub(inst, base = 1024 + 48,    userdata = 2L, eventtype = 2, fd = 1)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 2,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 2, s"nevents=${peekI32(inst, 16)}")
+      val ev1 = readEvent(inst, 2048)
+      val ev2 = readEvent(inst, 2048 + 32)
+      check(ev1.userdata == 1L && ev1.eventtype == 1 && ev1.nbytes == 2L,
+            s"ev1=(ud=${ev1.userdata}, type=${ev1.eventtype}, nbytes=${ev1.nbytes})")
+      check(ev2.userdata == 2L && ev2.eventtype == 2 && ev2.nbytes > 0L,
+            s"ev2=(ud=${ev2.userdata}, type=${ev2.eventtype}, nbytes=${ev2.nbytes})")
+    }
+
+    test("poll_oneoff: short relative-clock timeout actually waits before firing") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      val timeoutNs = 30_000_000L   // 30ms
+      buildClockSub(inst, base = 1024, userdata = 0L,
+                    clockId = 1, timeout = timeoutNs, absTime = false)
+      val before = System.nanoTime()
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val elapsed = System.nanoTime() - before
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      // We slept at least most of the requested interval — guard against
+      // clock-skew flakes by checking >= 80% of the target.
+      check(elapsed >= (timeoutNs * 8) / 10,
+            s"elapsed=${elapsed}ns (want >= ${(timeoutNs * 8) / 10}ns)")
+    }
+
+    test("poll_oneoff: ABSTIME with target in the past fires immediately") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // ABSTIME flag (bit 0 of subclockflags). Absolute target = 0 (epoch
+      // start) is always in the past for monotonic.
+      buildClockSub(inst, base = 1024, userdata = 0L,
+                    clockId = 1, timeout = 0L, absTime = true)
+      val before = System.nanoTime()
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val elapsed = System.nanoTime() - before
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      check(elapsed < 10_000_000L,
+            s"elapsed=${elapsed}ns — past ABSTIME shouldn't sleep")
+    }
+
     test("path_unlink_file: open handle survives unlink (POSIX inode semantics)") {
       // Open a file, unlink it, then read from the still-open handle.
       // The handle keeps its own FileCell reference, so the bytes are
@@ -1862,6 +2424,81 @@ object WasiFsTests:
     inst.invoke("store_i32", Seq(I32(addr), I32(v))) match
       case Right(_) => ()
       case other    => throw new AssertionError(s"store_i32($addr, $v): $other")
+
+  /** Plant a little-endian i64 at `addr`. poll_oneoff tests use this to
+    * stamp `userdata` (u64) and clock-subscription `timeout`/`precision`
+    * fields directly into linear memory. */
+  private def storeI64(inst: ModuleInstance, addr: Int, v: Long): Unit =
+    inst.invoke("store_i64", Seq(I32(addr), I64(v))) match
+      case Right(_) => ()
+      case other    => throw new AssertionError(s"store_i64($addr, $v): $other")
+
+  /** Build one wasi-preview1 CLOCK subscription record (48 bytes) into
+    * linear memory at `base`. Zero-fills the whole window first so prior
+    * test scratch can't leak into unused union slots. */
+  private def buildClockSub(inst:     ModuleInstance,
+                            base:     Int,
+                            userdata: Long,
+                            clockId:  Int,
+                            timeout:  Long,
+                            absTime:  Boolean): Unit =
+    var i = 0
+    while i < 48 do
+      runOk(inst.invoke("store_byte", Seq(I32(base + i), I32(0))))
+      i += 1
+    storeI64(inst, base,          userdata)
+    runOk(inst.invoke("store_byte", Seq(I32(base + 8), I32(0))))  // eventtype = CLOCK
+    storeI32(inst, base + 16,     clockId)
+    storeI64(inst, base + 24,     timeout)
+    storeI64(inst, base + 32,     0L)                              // precision (ignored)
+    runOk(inst.invoke("store_byte",
+                      Seq(I32(base + 40), I32(if absTime then 1 else 0))))
+    runOk(inst.invoke("store_byte", Seq(I32(base + 41), I32(0))))
+
+  /** Build one wasi-preview1 FD_READ / FD_WRITE subscription record
+    * (48 bytes) into linear memory at `base`. `eventtype` is 1 for
+    * FD_READ, 2 for FD_WRITE — caller's choice. */
+  private def buildFdSub(inst:      ModuleInstance,
+                         base:      Int,
+                         userdata:  Long,
+                         eventtype: Int,
+                         fd:        Int): Unit =
+    var i = 0
+    while i < 48 do
+      runOk(inst.invoke("store_byte", Seq(I32(base + i), I32(0))))
+      i += 1
+    storeI64(inst, base,          userdata)
+    runOk(inst.invoke("store_byte", Seq(I32(base + 8), I32(eventtype))))
+    storeI32(inst, base + 16,     fd)
+
+  /** Snapshot of a 32-byte wasi event for assertion convenience. Mirrors
+    * `Wasi.writeEvent`'s field layout: u64 userdata, u16 error, u8 type,
+    * u64 nbytes. We skip the trailing eventrwflags (always 0 in the
+    * shim). */
+  private final case class Event(userdata: Long, error: Int,
+                                 eventtype: Int, nbytes: Long)
+
+  /** Decode one 32-byte event record from linear memory at `base` into
+    * an [[Event]]. */
+  private def readEvent(inst: ModuleInstance, base: Int): Event =
+    val userdata  = peekI64(inst, base)
+    val errLo     = loadByte(inst, base + 8)
+    val errHi     = loadByte(inst, base + 9)
+    val error     = errLo | (errHi << 8)
+    val eventtype = loadByte(inst, base + 10)
+    val nbytes    = peekI64(inst, base + 16)
+    Event(userdata, error, eventtype, nbytes)
+
+  /** 4-arg `poll_oneoff` wrapper. `in`/`out` are linear-memory addresses
+    * of the subscription/event arrays; `nsubs` is the array length;
+    * `neventsOut` is where the host writes the actual event count. */
+  private def callPollOneoff(inst:       ModuleInstance,
+                             in:         Int,
+                             out:        Int,
+                             nsubs:      Int,
+                             neventsOut: Int) =
+    inst.invoke("call_poll_oneoff",
+                Seq(I32(in), I32(out), I32(nsubs), I32(neventsOut)))
 
   /** Read back a single unsigned byte. Returns Int because the fixture's
     * `load_byte` is `i32.load8_u` (already zero-extended). */

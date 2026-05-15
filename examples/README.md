@@ -6,6 +6,7 @@ End-to-end programs that exercise the wasm interpreter from real-world toolchain
 |---|---|---:|---|
 | [`hello.wat`](./hello.wat) | hand-written WAT | 90 | The minimal non-WASI module: imports `env.putchar`, calls it 14 times, exports `main`. |
 | [`c/`](./c/) | Homebrew LLVM (`clang` + `wasm-ld`) | 500 | Freestanding wasi C — no libc, no wasi-sdk; declares `fd_write` directly as an import. |
+| [`c-libc/`](./c-libc/) | [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) | (build it) | Real libc-using C — `<stdio.h>`, argv, exit codes; a small `xxd`-style hex dumper. |
 | [`rust/`](./rust/) | `rustc --target=wasm32-wasip1` | 62 KB | Real rustc-built wasi binary: `std::fs::read_to_string` + `println!` against a `--preopen` host directory. |
 
 ## Running
@@ -40,11 +41,11 @@ sbt 'cliJVM/run --preopen ./data:/data examples/rust/word_count.wasm /data/input
 Each subdirectory has a README with build instructions:
 
 - [`c/README.md`](./c/README.md) — Homebrew LLVM clang + `make`.
+- [`c-libc/README.md`](./c-libc/README.md) — wasi-sdk clang + `make`. Output `.wasm` is **not** committed (the toolchain isn't free; build it yourself).
 - [`rust/README.md`](./rust/README.md) — `cargo build --release --target=wasm32-wasip1`.
 
-The pre-built `.wasm` files are committed so the examples are runnable on a fresh checkout. Re-run the build command after editing source.
+The pre-built `.wasm` files for `hello.wat`, `c/`, and `rust/` are committed so those examples are runnable on a fresh checkout. `c-libc/` you build yourself once wasi-sdk is installed.
 
 ## What's NOT here (and why)
 
-- **A wasi-sdk C example.** The freestanding C example shows the ABI without depending on any sysroot; a wasi-sdk example would add a fairly heavy toolchain dependency for marginal pedagogical value. See [https://github.com/WebAssembly/wasi-sdk] if you want to try one.
 - **A zig example.** Zig's `wasm32-wasi` target works on this interpreter (similar to rustc's), but the build adds another toolchain. Easy to add — just hasn't been a request.

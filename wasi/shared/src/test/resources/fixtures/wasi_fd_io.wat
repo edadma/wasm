@@ -42,12 +42,26 @@
     (func $fd_sync (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_datasync"
     (func $fd_datasync (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_advise"
+    (func $fd_advise (param i32 i64 i64 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_allocate"
+    (func $fd_allocate (param i32 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "path_rename"
+    (func $path_rename (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_link"
+    (func $path_link (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_symlink"
+    (func $path_symlink (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_readlink"
+    (func $path_readlink (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_unlink_file"
     (func $path_unlink_file (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_create_directory"
     (func $path_create_directory (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_readdir"
     (func $fd_readdir (param i32 i32 i32 i64 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "poll_oneoff"
+    (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -137,6 +151,77 @@
     local.get $fd
     call $fd_datasync)
 
+  (func (export "call_fd_advise")
+        (param $fd i32) (param $offset i64) (param $len i64) (param $advice i32)
+        (result i32)
+    local.get $fd
+    local.get $offset
+    local.get $len
+    local.get $advice
+    call $fd_advise)
+
+  (func (export "call_fd_allocate")
+        (param $fd i32) (param $offset i64) (param $len i64) (result i32)
+    local.get $fd
+    local.get $offset
+    local.get $len
+    call $fd_allocate)
+
+  (func (export "call_path_rename")
+        (param $fd i32)
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $new_fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $fd
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $new_fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_rename)
+
+  (func (export "call_path_link")
+        (param $old_fd i32) (param $old_flags i32)
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $new_fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $old_fd
+    local.get $old_flags
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $new_fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_link)
+
+  (func (export "call_path_symlink")
+        (param $old_path_ptr i32) (param $old_path_len i32)
+        (param $fd i32)
+        (param $new_path_ptr i32) (param $new_path_len i32)
+        (result i32)
+    local.get $old_path_ptr
+    local.get $old_path_len
+    local.get $fd
+    local.get $new_path_ptr
+    local.get $new_path_len
+    call $path_symlink)
+
+  (func (export "call_path_readlink")
+        (param $fd i32)
+        (param $path_ptr i32) (param $path_len i32)
+        (param $buf_ptr i32) (param $buf_len i32)
+        (param $bufused_out i32)
+        (result i32)
+    local.get $fd
+    local.get $path_ptr
+    local.get $path_len
+    local.get $buf_ptr
+    local.get $buf_len
+    local.get $bufused_out
+    call $path_readlink)
+
   (func (export "call_path_unlink_file")
         (param $fd i32) (param $path_ptr i32) (param $path_len i32)
         (result i32)
@@ -163,6 +248,15 @@
     local.get $bufused_out
     call $fd_readdir)
 
+  (func (export "call_poll_oneoff")
+        (param $in i32) (param $out i32) (param $nsubs i32)
+        (param $nevents_out i32) (result i32)
+    local.get $in
+    local.get $out
+    local.get $nsubs
+    local.get $nevents_out
+    call $poll_oneoff)
+
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)
     local.get $addr
@@ -174,6 +268,12 @@
     local.get $addr
     local.get $v
     i32.store)
+
+  ;; store_i64 plants u64 fields (userdata, timeout, precision) for poll subs.
+  (func (export "store_i64") (param $addr i32) (param $v i64)
+    local.get $addr
+    local.get $v
+    i64.store)
 
   (func (export "load_byte") (param $addr i32) (result i32)
     local.get $addr
