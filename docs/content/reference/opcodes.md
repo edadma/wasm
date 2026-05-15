@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, G.1, and G.2 are shipped.** The remainder (chunk H narrow/widen + conversions, I dot/lane mem ops) is still to come.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, G.1, G.2, and H are shipped.** The remainder (chunk I dot/lane mem ops) is still to come.
 
 ### Foundations (Chunk A — done)
 
@@ -281,6 +281,29 @@ IEEE-754 NaN: every f32/f64 compare returns false when either operand is NaN, ex
 | `f64x2.lt` / `gt` | `0x49` / `0x4A` | |
 | `f64x2.le` / `ge` | `0x4B` / `0x4C` | |
 
+### Narrow / extend / extadd_pairwise / extmul + float-int conv + demote / promote (Chunk H — done)
+
+42 ops covering everything that changes lane width or moves between integer and float lanes. Mechanically: narrow takes two source v128s and packs them into one with saturating clamps; extend (the spec's name for "widen") pulls half the source lanes and sign- or zero-extends each into the wider lane width; extadd_pairwise pairs adjacent narrower lanes and sums each pair (with extension) into one wider lane; extmul fuses extend + multiply at the wider lane width so the product fits exactly. The 8 float↔int conversions follow the scalar `trunc_sat_*` / `convert_*` rules per lane (NaN → 0, ±overflow saturates). The `_zero` suffix on the f64x2 / i32x4 form means "result has 4 lanes but only the first 2 carry data, the rest are 0"; `_low` on the inverse direction means "read only lanes 0..1 of the source".
+
+| Opcode | Sub | What it does |
+|---|---|---|
+| `i8x16.narrow_i16x8_s` / `_u` | `0x65` / `0x66` | Pack 16 Short lanes into 16 saturated Byte lanes (signed `[-128,127]` / unsigned `[0,255]`). |
+| `i16x8.narrow_i32x4_s` / `_u` | `0x85` / `0x86` | Pack 8 Int lanes into 8 saturated Short lanes. |
+| `i16x8.extend_low/high_i8x16_s` / `_u` | `0x87`–`0x8A` | Read 8 bytes (low or high half), sign- or zero-extend each to i16. |
+| `i32x4.extend_low/high_i16x8_s` / `_u` | `0xA7`–`0xAA` | Read 4 i16 lanes (half), extend to i32. |
+| `i64x2.extend_low/high_i32x4_s` / `_u` | `0xC7`–`0xCA` | Read 2 i32 lanes (half), extend to i64. |
+| `i16x8.extadd_pairwise_i8x16_s` / `_u` | `0x7C` / `0x7D` | Pair adjacent bytes, sum with extension into 8 i16 lanes. |
+| `i32x4.extadd_pairwise_i16x8_s` / `_u` | `0x7E` / `0x7F` | Pair adjacent i16 lanes, sum with extension into 4 i32 lanes. |
+| `i16x8.extmul_low/high_i8x16_s` / `_u` | `0x9C`–`0x9F` | Multiply extended low/high bytes at i16 precision (full product). |
+| `i32x4.extmul_low/high_i16x8_s` / `_u` | `0xBC`–`0xBF` | Multiply extended i16 lanes at i32 precision. |
+| `i64x2.extmul_low/high_i32x4_s` / `_u` | `0xDC`–`0xDF` | Multiply extended i32 lanes at i64 precision. |
+| `f32x4.demote_f64x2_zero` | `0x5E` | Round 2 f64 lanes to f32 lanes 0..1; lanes 2 + 3 zero-filled. |
+| `f64x2.promote_low_f32x4` | `0x5F` | Widen f32 lanes 0..1 to f64. |
+| `i32x4.trunc_sat_f32x4_s` / `_u` | `0xF8` / `0xF9` | Per-lane scalar `trunc_sat`: NaN → 0, ±overflow → INT_MIN/MAX (`_s`) or 0/0xFFFFFFFF (`_u`). |
+| `f32x4.convert_i32x4_s` / `_u` | `0xFA` / `0xFB` | Per-lane int → f32; `_u` treats the signed lane as UInt32 first. |
+| `i32x4.trunc_sat_f64x2_s_zero` / `_u_zero` | `0xFC` / `0xFD` | 2 f64 → i32 lanes 0..1; lanes 2 + 3 zero-filled. |
+| `f64x2.convert_low_i32x4_s` / `_u` | `0xFE` / `0xFF` | Read i32 lanes 0..1 of source, widen to f64. |
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -296,7 +319,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | narrow/widen + conversions (H), dot product + lane mem ops (I) | in progress (8.E, chunks H..I) |
+| SIMD remainder | dot product + lane mem ops (I) | in progress (8.E, chunk I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
