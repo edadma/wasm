@@ -1,20 +1,21 @@
 ---
 title: WasiContext
-summary: The configuration passed to `Wasi.preview1` — args, envs, stdio sinks, clock, random source, preopens.
+summary: The configuration passed to `Wasi.preview1` — args, envs, stdio sinks, clock, random source, preopens, sockets.
 weight: 10
 ---
 
-`WasiContext` is the configuration record `Wasi.preview1(ctx)` accepts. It's a plain case class with seven fields, all of which have sensible defaults:
+`WasiContext` is the configuration record `Wasi.preview1(ctx)` accepts. It's a plain case class with eight fields, all of which have sensible defaults:
 
 ```scala
 final case class WasiContext(
-    args:     Seq[String]                  = Seq.empty,                   // argv
-    envs:     Seq[(String, String)]        = Seq.empty,                   // KEY=VALUE pairs
-    stdout:   Int => Unit                  = WasiContext.defaultStdout,   // per-byte sink for fd 1
-    stderr:   Int => Unit                  = WasiContext.defaultStderr,   // per-byte sink for fd 2
-    clock:    WasiContext.Clock            = WasiContext.systemClock,     // realtime + monotonic
-    random:   Int => Array[Byte]           = WasiContext.defaultRandom,   // random_get source
-    preopens: Seq[WasiContext.Preopen]     = Seq.empty,                   // fd 3, 4, … flavours
+    args:     Seq[String]                       = Seq.empty,                   // argv
+    envs:     Seq[(String, String)]             = Seq.empty,                   // KEY=VALUE pairs
+    stdout:   Int => Unit                       = WasiContext.defaultStdout,   // per-byte sink for fd 1
+    stderr:   Int => Unit                       = WasiContext.defaultStderr,   // per-byte sink for fd 2
+    clock:    WasiContext.Clock                 = WasiContext.systemClock,     // realtime + monotonic
+    random:   Int => Array[Byte]                = WasiContext.defaultRandom,   // random_get source
+    preopens: Seq[WasiContext.Preopen]          = Seq.empty,                   // fd 3 .. 3+P-1
+    sockets:  Seq[WasiContext.ServerSocket]     = Seq.empty,                   // fd 3+P .. 3+P+S-1
 )
 ```
 
@@ -142,6 +143,34 @@ val stdout: Int => Unit = b =>
 
 val ctx = WasiContext.default.copy(stdout = stdout)
 ```
+
+## The `sockets` field
+
+`sockets: Seq[WasiContext.ServerSocket]` — host-provided listening sockets, exposed to the guest one fd at a time starting at `3 + preopens.length`. There is no `sock_open` / `sock_bind` / `sock_listen` in Preview 1; the host pre-binds and the guest can only `sock_accept` against the inherited fds.
+
+JVM and Scala Native get a factory:
+
+```scala
+val (listener, port) = HostServerSocket.bind(0)   // 0 → OS-chosen ephemeral
+val ctx = WasiContext.default.copy(sockets = Seq(listener))
+```
+
+Scala.js doesn't link `java.net.ServerSocket`; a Node-backed program that needs sockets must supply its own `WasiContext.ServerSocket` implementation (typically wrapping Node's `net` module).
+
+The trait surface is intentionally tiny:
+
+```scala
+trait ServerSocket:
+  def accept(): Either[Int, ClientSocket]
+  def address: String        // "host:port" for debug logs
+
+trait ClientSocket extends Wasi.FsFile:
+  def shutdown(how: Int): Either[Int, Unit]
+  // close/read/write inherited from FsFile — fd_read/fd_write
+  // route to them through the standard FdTable lookup.
+```
+
+`accept` blocks until a client connects; the returned `ClientSocket` is installed in the per-instance fd table by `sock_accept` and is observable through both `fd_read` / `fd_write` (the generic byte-stream surface) and the dedicated `sock_recv` / `sock_send` (the iovec-shape recv/send surface with recvflags/sendflags).
 
 ## Where to go next
 

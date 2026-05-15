@@ -1,10 +1,10 @@
 ---
 title: Syscalls
-summary: The 25 wasi_snapshot_preview1 host functions implemented, grouped by purpose.
+summary: The 29 wasi_snapshot_preview1 host functions implemented, grouped by purpose.
 weight: 10
 ---
 
-Twenty-five host functions are exposed under the module name `wasi_snapshot_preview1`. That's enough to run rustc-built `wasm32-wasip1` binaries that exercise stdin/stdout, command-line args, environment variables, the clock, randomness, the filesystem (read, write, create, unlink, stat, readdir, rename, hard- and soft-link), and poll-style readiness waits — including the `sleep` codepath in most wasi runtimes.
+Twenty-nine host functions are exposed under the module name `wasi_snapshot_preview1`. That covers everything `wasm32-wasip1` programs typically reach for: stdin/stdout, command-line args, environment variables, the clock, randomness, the filesystem (read, write, create, unlink, stat, readdir, rename, hard- and soft-link), poll-style readiness waits, and the wasi sockets surface (host-provided listening fds, accept / recv / send / shutdown).
 
 **Return shape:** every wasi-preview1 syscall returns a single `i32` errno (`0` for success; nonzero values from the wasi-preview1 errno list — `Wasi.ENOENT`, `Wasi.EBADF`, `Wasi.EFAULT`, …). Output data is delivered through pointers passed by the guest into its own linear memory; the host writes the bytes there, the guest reads them back. The "Seq(I32(errno))" shape you'd see from `inst.invoke` reflects that single-result calling convention — the data isn't *in* that Seq, it's in memory.
 
@@ -68,10 +68,17 @@ Twenty-five host functions are exposed under the module name `wasi_snapshot_prev
 |---|---|
 | `poll_oneoff(in, out, nsubs, *nevents)` | Wait for one of `nsubs` subscriptions to become ready. Subscriptions are 48-byte records (decoded fields `userdata`, `eventtype`, `clockid`/`fd`, `timeout`, `precision`, `flags`); events are 32-byte records (`userdata`, `error`, `eventtype`, `nbytes`). FD-read/FD-write subs on any valid fd report `ready` immediately (the InMemoryFs never blocks). CLOCK subs with `timeout = 0` or an ABSTIME target already in the past fire immediately; otherwise the host actually sleeps until the earliest deadline (`Thread.sleep` on JVM/Native, busy-spin fallback on Scala.js). EINVAL for invalid clock ids or unknown event types (per-event), EBADF for unknown fds (per-event); EFAULT only for bounds-violating pointer args. |
 
-## What isn't here yet
+## Sockets
 
-| Syscall | Status | Why |
-|---|---|---|
-| `sock_*`                         | not implemented | wasi-preview1 sockets are a thin shim; the project is library-scoped, not server-scoped. |
+WASI Preview 1 sockets follow the BSD-inetd model: there is no `sock_open` / `sock_bind` / `sock_listen`. The host pre-binds listening sockets and hands them to the wasi program through `WasiContext.sockets`. The i-th listening socket is exposed at fd `3 + preopens.length + i`; `sock_accept` resolves a listening fd and returns a fresh accepted-socket fd from the per-instance fd table. Accepted sockets also work through `fd_read` / `fd_write` (they implement `FsFile` under the hood).
+
+JVM / Scala Native: `HostServerSocket.bind(port)` factory wraps `java.net.ServerSocket` (`port = 0` for an OS-chosen ephemeral). Scala.js: synchronous accept can't be expressed on the event loop, so the factory throws — a Node-backed program needs to supply its own `WasiContext.ServerSocket` implementation.
+
+| Syscall | Behaviour |
+|---|---|
+| `sock_accept(fd, fdflags, *out_fd)`                                              | Block until a client connects to the listening fd; install the connection in the fd table and write its new fd to `*out_fd`. EBADF if the fd isn't a listening socket. |
+| `sock_recv(fd, ri_data, ri_data_len, ri_flags, *ro_datalen, *ro_flags)`           | Walk the iovec table reading from an accepted socket. `ri_flags` accepts `RECV_PEEK (1)` and `RECV_WAITALL (2)` (the shim ignores both today). Returns ENOTSOCK on non-socket fds, EINVAL on unknown ri_flags bits, EFAULT on bounds-violating pointers. |
+| `sock_send(fd, si_data, si_data_len, si_flags, *so_datalen)`                      | Walk the iovec table writing to an accepted socket. `si_flags` is reserved in Preview 1 — non-zero values return EINVAL. |
+| `sock_shutdown(fd, how)`                                                          | Half-close the read side (`SD_RD = 1`), write side (`SD_WR = 2`), or both (`SD_BOTH = 3`). EINVAL on any other `how` value. Idempotent: repeated shutdowns of the same side are not an error. |
 
 Programs that issue an unimplemented syscall get back `Wasi.ENOTSUP` (52), which is the spec-conformant "host doesn't support this".

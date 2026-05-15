@@ -19,7 +19,7 @@ Full reference, getting-started guide, WASI surface, CLI flags, and supported-op
 The repo splits into three sub-projects so the published libraries stay dependency-free:
 
 - **`interp/`** — the interpreter itself. **Zero external dependencies** (Scala stdlib only). Published to Maven Central as `wasm`.
-- **`wasi/`** — the WASI Preview 1 host shim (24 syscalls — fd/path/args/environ/clock/random/proc_exit). Also zero external deps; depends on `interp`. Published as `wasm-wasi`.
+- **`wasi/`** — the WASI Preview 1 host shim (29 syscalls — fd/path/args/environ/clock/random/proc_exit/poll/sockets). Also zero external deps; depends on `interp`. Published as `wasm-wasi`.
 - **`cli/`** — a command-line runner using [scopt](https://github.com/scopt/scopt). Depends on `interp` + `wasi`; not published.
 
 ## What the interpreter implements
@@ -48,7 +48,7 @@ Binary sections recognised: Type (1), Import (2), Function (3), Table (4), Memor
 
 ## WASI Preview 1
 
-The `wasi` module implements 24 `wasi_snapshot_preview1` host functions:
+The `wasi` module implements 29 `wasi_snapshot_preview1` host functions:
 
 | Group | Syscalls |
 |---|---|
@@ -56,8 +56,10 @@ The `wasi` module implements 24 `wasi_snapshot_preview1` host functions:
 | Clock + entropy | `clock_time_get` (realtime + monotonic), `random_get` |
 | Stdio | `fd_write` (routes by fd to stdout/stderr/file) |
 | Preopens | `fd_prestat_get`, `fd_prestat_dir_name` |
-| File I/O | `path_open`, `fd_read`, `fd_seek`, `fd_close`, `fd_filestat_get`, `fd_fdstat_get`, `fd_fdstat_set_flags`, `fd_sync`, `fd_datasync` |
-| Filesystem | `path_filestat_get`, `path_unlink_file`, `path_create_directory`, `fd_readdir` |
+| File I/O | `path_open`, `fd_read`, `fd_seek`, `fd_close`, `fd_filestat_get`, `fd_fdstat_get`, `fd_fdstat_set_flags`, `fd_sync`, `fd_datasync`, `fd_advise`, `fd_allocate` |
+| Filesystem | `path_filestat_get`, `path_unlink_file`, `path_create_directory`, `path_rename`, `path_link`, `path_symlink`, `path_readlink`, `fd_readdir` |
+| Polling | `poll_oneoff` |
+| Sockets | `sock_accept`, `sock_recv`, `sock_send`, `sock_shutdown` (host-provided listening fds, BSD-inetd style) |
 
 Three flavours of preopen behind the same `WasiContext.Preopen` trait:
 
@@ -226,16 +228,18 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 247 interpreter tests
+sbt 'interpJVM/Test/run'    # 527 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
-sbt 'wasiJVM/Test/run'      # 157 WASI tests (incl. host-backed preopen
-sbt 'wasiJS/Test/run'       #                   on real temp dirs)
+sbt 'wasiJVM/Test/run'      # 208 WASI tests on JVM/Native (192 on JS,
+sbt 'wasiJS/Test/run'       #                   16 socket tests skipped)
 sbt 'wasiNative/Test/run'
+
+sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **404 tests** across the project, all three backends green. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **749 tests** on JVM (527 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ## Regenerating fixtures
 

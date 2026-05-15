@@ -34,6 +34,7 @@ object WasiTest:
     WasiClockTests.run()
     WasiFsTests.run()
     WasiHostFsTests.run()
+    WasiSocketTests.run()
     WasiRealRustTests.run()
 
     println()

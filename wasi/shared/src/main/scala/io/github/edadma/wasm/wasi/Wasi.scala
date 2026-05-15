@@ -113,6 +113,20 @@ object Wasi:
     * when the source path is a directory (hardlinking directories is
     * almost universally forbidden) and a few other invariants. */
   val EPERM:        Int = 63
+  /** Not a socket — `sock_recv` / `sock_send` / `sock_shutdown` were
+    * called against a fd that resolves to something other than a
+    * connected socket (a regular file, a preopen directory, stdio).
+    * `sock_accept` against a non-listening fd surfaces this too. */
+  val ENOTSOCK:     Int = 57
+  /** Connection reset — the peer dropped the connection while the
+    * shim was still reading or writing. Host-side `IOException`
+    * during a `sock_recv` / `sock_send` maps here when no more
+    * specific errno applies. */
+  val ECONNRESET:   Int = 15
+  /** Socket is not connected — `sock_recv` / `sock_send` against an
+    * accepted socket that has already been fully shut down with
+    * `sock_shutdown(both)`. */
+  val ENOTCONN:     Int = 53
 
   // === WASI Preview 1 rights bits (witx-defined) ============================
   //
@@ -207,6 +221,22 @@ object Wasi:
   val RIGHTS_DIRECTORY_INHERITING: Long =
     RIGHTS_DIRECTORY_BASE | RIGHTS_REGULAR_FILE
 
+  /** Rights mask for a listening-socket fd: only `sock_accept` and
+    * `poll_fd_readwrite` (so userspace can `poll_oneoff` for an
+    * incoming connection). Inheriting mask passed down to the
+    * accepted-socket fd is [[RIGHTS_SOCKET_ACCEPTED]]. */
+  val RIGHTS_SOCKET_LISTENING: Long =
+    RIGHT_SOCK_ACCEPT | RIGHT_POLL_FD_READWRITE | RIGHT_FD_FILESTAT_GET
+
+  /** Rights mask for an accepted-socket fd: read+write through the
+    * generic `fd_read`/`fd_write` AND the dedicated `sock_recv`/
+    * `sock_send`, plus `sock_shutdown` and `poll_fd_readwrite`. No
+    * seek/tell/size — sockets are streams. */
+  val RIGHTS_SOCKET_ACCEPTED: Long =
+    RIGHT_FD_READ | RIGHT_FD_WRITE | RIGHT_FD_FDSTAT_SET_FLAGS |
+    RIGHT_FD_FILESTAT_GET | RIGHT_SOCK_SHUTDOWN |
+    RIGHT_POLL_FD_READWRITE
+
   // === File handle abstraction (Phase 7.E.2 + 7.E.3) ========================
 
   /** An opaque handle to an opened file, returned by
@@ -294,7 +324,11 @@ object Wasi:
     // points rather than mutable state). Each `Wasi.preview1(ctx)` call
     // gets its own fresh table; sharing a `WasiContext` across multiple
     // instantiations therefore gives each instance an isolated fd space.
-    val fdTable = new FdTable(ctx.preopens.length)
+    //
+    // Sockets share the fd space with preopens: listening sockets live
+    // at fd `3 + preopens.length + i` and the FdTable starts numbering
+    // accepted-file/socket fds at `3 + preopens.length + sockets.length`.
+    val fdTable = new FdTable(3 + ctx.preopens.length + ctx.sockets.length)
     new HostModule:
       val name: String = "wasi_snapshot_preview1"
       override val functions: Map[String, HostFunc] = Map(
@@ -328,6 +362,10 @@ object Wasi:
         "path_symlink"          -> ((mem, args) => pathSymlink(mem, args, ctx)),
         "path_readlink"         -> ((mem, args) => pathReadlink(mem, args, ctx)),
         "poll_oneoff"           -> ((mem, args) => pollOneoff(mem, args, ctx, fdTable)),
+        "sock_accept"           -> ((mem, args) => sockAccept(mem, args, ctx, fdTable)),
+        "sock_recv"             -> ((mem, args) => sockRecv(mem, args, ctx, fdTable)),
+        "sock_send"             -> ((mem, args) => sockSend(mem, args, ctx, fdTable)),
+        "sock_shutdown"         -> ((_,   args) => sockShutdown(args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -457,19 +495,21 @@ object Wasi:
   // is part of any reasonable wasi-libc startup.
 
   /** Resolve `fd` to an [[FsFile]] for the read/seek syscalls. Returns
-    * `None` for any fd in the stdio/preopen range (those aren't reading
-    * surfaces at this slice) or any fd not currently allocated in the
-    * fd table. `fd_filestat_get` does its own dispatch and does NOT use
-    * this helper. */
+    * `None` for any fd in the stdio/preopen/listening-socket range
+    * (those aren't reading surfaces at this slice) or any fd not
+    * currently allocated in the fd table. `fd_filestat_get` does its
+    * own dispatch and does NOT use this helper. */
   private inline def lookupFile(fd: Int, ctx: WasiContext,
                                 fdTable: FdTable): Option[FsFile] =
-    if fd < 3 + ctx.preopens.length then None else fdTable.lookup(fd)
+    if fd < 3 + ctx.preopens.length + ctx.sockets.length then None
+    else fdTable.lookup(fd)
 
   /** Same dispatch as [[lookupFile]] but returns the full [[FdEntry]]
     * so callers can read the per-fd flags (APPEND etc.). */
   private inline def lookupFileEntry(fd: Int, ctx: WasiContext,
                                      fdTable: FdTable): Option[FdEntry] =
-    if fd < 3 + ctx.preopens.length then None else fdTable.lookupEntry(fd)
+    if fd < 3 + ctx.preopens.length + ctx.sockets.length then None
+    else fdTable.lookupEntry(fd)
 
   /** `fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> errno`
     *
@@ -599,8 +639,12 @@ object Wasi:
           filetype = 2       // CHARACTER_DEVICE — stdio
         else if fd - 3 < ctx.preopens.length then
           filetype = 3       // DIRECTORY — preopen
+        else if isListeningSocketFd(fd, ctx) then
+          filetype = 6       // SOCKET_STREAM — listening socket
         else
           fdTable.lookup(fd) match
+            case Some(_: WasiContext.ClientSocket) =>
+              filetype = 6   // SOCKET_STREAM — accepted socket
             case Some(file) =>
               filetype = 4   // REGULAR_FILE — opened file
               fileSize = file.size
@@ -674,12 +718,22 @@ object Wasi:
           filetype   = 3                          // DIRECTORY — preopen
           rights     = RIGHTS_DIRECTORY_BASE
           inheriting = RIGHTS_DIRECTORY_INHERITING
+        else if isListeningSocketFd(fd, ctx) then
+          filetype   = 6                          // SOCKET_STREAM — listening
+          rights     = RIGHTS_SOCKET_LISTENING
+          inheriting = RIGHTS_SOCKET_ACCEPTED
         else
           fdTable.lookupEntry(fd) match
             case Some(entry) =>
-              filetype   = 4                      // REGULAR_FILE — opened file
-              rights     = RIGHTS_REGULAR_FILE
-              inheriting = 0L                     // files don't open children
+              entry.file match
+                case _: WasiContext.ClientSocket =>
+                  filetype   = 6                  // SOCKET_STREAM — accepted
+                  rights     = RIGHTS_SOCKET_ACCEPTED
+                  inheriting = 0L
+                case _ =>
+                  filetype   = 4                  // REGULAR_FILE — opened file
+                  rights     = RIGHTS_REGULAR_FILE
+                  inheriting = 0L                 // files don't open children
               fsFlags    = entry.fdflags
             case None => return Seq(I32(EBADF))
 
@@ -724,6 +778,11 @@ object Wasi:
         if fd < 0 then Seq(I32(EBADF))
         else if fd <= 2 then Seq(I32(ESUCCESS))
         else if fd - 3 < ctx.preopens.length then Seq(I32(EBADF))
+        else if isListeningSocketFd(fd, ctx) then
+          // Listening sockets don't carry per-fd state in this shim,
+          // but wasi-libc may flip NONBLOCK before `sock_accept`.
+          // Accept silently — the call is informational.
+          Seq(I32(ESUCCESS))
         else
           fdTable.lookupEntry(fd) match
             case Some(entry) =>
@@ -930,6 +989,7 @@ object Wasi:
         if fd < 0 then Seq(I32(EBADF))
         else if fd <= 2 then Seq(I32(ESUCCESS))
         else if fd - 3 < ctx.preopens.length then Seq(I32(ESUCCESS))
+        else if isListeningSocketFd(fd, ctx) then Seq(I32(ESUCCESS))
         else
           fdTable.lookup(fd) match
             case Some(file) =>
@@ -1023,16 +1083,34 @@ object Wasi:
             Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
-  /** Is `fd` claimed by either stdio, a preopen, or the FdTable? Used
-    * by `fd_sync` / `fd_datasync` to partition EBADF from ESUCCESS
-    * without caring which class the fd falls into. Mirrors the dispatch
-    * tree in `fd_close`. */
+  /** Is `fd` claimed by either stdio, a preopen, a listening socket, or
+    * the FdTable? Used by `fd_sync` / `fd_datasync` to partition EBADF
+    * from ESUCCESS without caring which class the fd falls into.
+    * Mirrors the dispatch tree in `fd_close`. */
   private inline def isValidFd(fd: Int, ctx: WasiContext,
                                fdTable: FdTable): Boolean =
     if fd < 0 then false
     else if fd <= 2 then true
     else if fd - 3 < ctx.preopens.length then true
+    else if isListeningSocketFd(fd, ctx) then true
     else fdTable.lookup(fd).isDefined
+
+  /** Is `fd` one of the host-provided listening-socket fds? They live
+    * in the contiguous range `3 + preopens.length .. 3 + preopens.length
+    * + sockets.length - 1`. Independent of the `FdTable` because
+    * listening sockets are static for the lifetime of the
+    * `WasiContext` (just like preopens). */
+  private inline def isListeningSocketFd(fd: Int, ctx: WasiContext): Boolean =
+    val base = 3 + ctx.preopens.length
+    fd >= base && fd < base + ctx.sockets.length
+
+  /** Resolve `fd` to the [[WasiContext.ServerSocket]] that backs it,
+    * or `None` if `fd` is not a listening-socket fd. */
+  private inline def listeningSocketAt(fd: Int, ctx: WasiContext):
+      Option[WasiContext.ServerSocket] =
+    val idx = fd - 3 - ctx.preopens.length
+    if idx >= 0 && idx < ctx.sockets.length then Some(ctx.sockets(idx))
+    else None
 
   /** `poll_oneoff(in: i32, out: i32, nsubs: i32, nevents_out: i32) -> errno`
     *
@@ -1250,8 +1328,210 @@ object Wasi:
       else
         val remainingMs = remaining / 1_000_000L
         if remainingMs >= 2L then
-          try Thread.sleep(math.min(remainingMs - 1L, 100L))
-          catch case _: Throwable => ()
+          // Per-platform shim: JVM/Native call `Thread.sleep`; Scala.js
+          // returns immediately and the outer loop busy-checks the clock.
+          // Synchronous sleep is unrepresentable on the Scala.js event loop
+          // — and `java.lang.Thread.sleep` isn't even linked there — so
+          // poll_oneoff on JS degrades to a tight wait for short timeouts.
+          PlatformSleep.sleepMillis(math.min(remainingMs - 1L, 100L))
+
+  // === sock_accept / sock_recv / sock_send / sock_shutdown ==================
+  //
+  // WASI Preview 1 sockets — the four host functions that wasi-libc
+  // routes its socket calls through. The shim adopts the BSD-inetd
+  // model: the host pre-binds listening sockets and hands them to the
+  // wasi program as fixed-fd inheritance. There is intentionally no
+  // `sock_open` in Preview 1; userspace cannot bind, only accept.
+  //
+  // fd layout (recap):
+  //   - `3 .. 3 + P − 1`           preopen directories
+  //   - `3 + P .. 3 + P + S − 1`   listening sockets ([[WasiContext.sockets]])
+  //   - `3 + P + S ..`             FdTable (opened files + accepted sockets)
+  //
+  // `sock_accept` resolves the listening-socket fd in the static range,
+  // calls `accept()` on the host-side [[WasiContext.ServerSocket]], and
+  // installs the resulting [[WasiContext.ClientSocket]] in the FdTable.
+  // Because `ClientSocket extends FsFile`, `fd_read` / `fd_write` route
+  // to it via [[lookupFile]] without sock-specific dispatch — wasi-libc
+  // wraps `read(socket_fd, ...)` onto `fd_read(socket_fd, ...)` and the
+  // socket is observable through both surfaces.
+
+  /** `sock_accept(fd: i32, fdflags: i32, retfd_out: i32) -> errno`
+    *
+    * Accept a single connection from `fd` (a listening socket). Stores
+    * the new fd at `retfd_out` on success. Blocks until a client
+    * connects — the host-side [[WasiContext.ServerSocket.accept]] is
+    * blocking. `fdflags` are forwarded to the new fd's `FdEntry` for
+    * round-trip through `fd_fdstat_get`; the shim has no genuine
+    * NONBLOCK / SYNC behaviour for socket fds.
+    *
+    * Errno discipline:
+    *   - `EBADF`     if `fd` isn't in the listening-socket range.
+    *   - `EFAULT`    if `retfd_out + 4` falls outside live memory.
+    *   - propagates whatever errno the host adapter reports for an
+    *     accept failure (`EIO`, `ECONNRESET`, …). */
+  private def sockAccept(memory: Memory, args: Seq[Value],
+                         ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(fdflags), I32(retfdOut)) =>
+        listeningSocketAt(fd, ctx) match
+          case None        => Seq(I32(EBADF))
+          case Some(srv)   =>
+            val data    = memory.data
+            val dataLen = data.length
+            if retfdOut < 0 || retfdOut.toLong + 4L > dataLen then
+              return Seq(I32(EFAULT))
+            srv.accept() match
+              case Right(client) =>
+                val newFd = fdTable.alloc(client, fdflags)
+                writeI32LE(data, retfdOut, newFd)
+                Seq(I32(ESUCCESS))
+              case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  /** `sock_recv(fd: i32, ri_data: i32, ri_data_len: i32, ri_flags: i32,
+    *           ro_datalen_out: i32, ro_flags_out: i32) -> errno`
+    *
+    * Read from an accepted socket into the iovec table at `ri_data`.
+    * Mirrors `fd_read`'s iovec walk but returns two outputs: the total
+    * byte count at `ro_datalen_out` and a `ro_flags` word at
+    * `ro_flags_out` (always 0 in this shim — no MSG_TRUNC tracking).
+    *
+    * `ri_flags` carries `RECV_PEEK (1)` and `RECV_WAITALL (2)`. The
+    * shim ignores both for now (`PEEK` would need a host-side buffer
+    * the trait doesn't expose; `WAITALL` is implicit because
+    * [[ClientSocket.read]] returns short reads only at EOF). Returns
+    * `EINVAL` for any other bits to keep userspace honest.
+    *
+    * Errno discipline:
+    *   - `EBADF`    if `fd` is not in the FdTable.
+    *   - `ENOTSOCK` if `fd` resolves to a regular file (not a socket).
+    *   - `EFAULT`   for any out-of-bounds iovec / output pointer.
+    *   - `EINVAL`   for unknown `ri_flags` bits. */
+  private def sockRecv(memory: Memory, args: Seq[Value],
+                       ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(iovsPtr), I32(iovsLen), I32(riFlags),
+               I32(roDatalenOut), I32(roFlagsOut)) =>
+        if (riFlags & ~0x3) != 0 then return Seq(I32(EINVAL))
+        socketForOp(fd, ctx, fdTable) match
+          case Left(errno)  => Seq(I32(errno))
+          case Right(sock)  =>
+            val data    = memory.data
+            val dataLen = data.length
+            val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
+            if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
+              return Seq(I32(EFAULT))
+            if roDatalenOut < 0 || roDatalenOut.toLong + 4L > dataLen then
+              return Seq(I32(EFAULT))
+            if roFlagsOut < 0 || roFlagsOut.toLong + 4L > dataLen then
+              return Seq(I32(EFAULT))
+
+            var total = 0
+            var i     = 0
+            var done  = false
+            while i < iovsLen && !done do
+              val iovec = iovsPtr + i * 8
+              val buf   = readI32LE(data, iovec)
+              val len   = readI32LE(data, iovec + 4)
+              val end   = buf.toLong + len.toLong
+              if buf < 0 || len < 0 || end > dataLen then
+                return Seq(I32(EFAULT))
+              val n = sock.read(data, buf, len)
+              total += n
+              if n < len then done = true
+              i += 1
+            writeI32LE(data, roDatalenOut, total)
+            writeI32LE(data, roFlagsOut,   0)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `sock_send(fd: i32, si_data: i32, si_data_len: i32, si_flags: i32,
+    *           so_datalen_out: i32) -> errno`
+    *
+    * Write the iovec table at `si_data` to an accepted socket. Mirrors
+    * `fd_write`'s walk; writes the total byte count to `so_datalen_out`.
+    *
+    * `si_flags` is reserved in Preview 1 — non-zero values return
+    * `EINVAL`. (POSIX `send`'s `MSG_*` bits exist in newer wasi drafts
+    * but not in `wasi_snapshot_preview1`.)
+    *
+    * Errno discipline matches [[sockRecv]]: `EBADF` / `ENOTSOCK` /
+    * `EFAULT` / `EINVAL`. */
+  private def sockSend(memory: Memory, args: Seq[Value],
+                       ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(iovsPtr), I32(iovsLen), I32(siFlags),
+               I32(soDatalenOut)) =>
+        if siFlags != 0 then return Seq(I32(EINVAL))
+        socketForOp(fd, ctx, fdTable) match
+          case Left(errno) => Seq(I32(errno))
+          case Right(sock) =>
+            val data    = memory.data
+            val dataLen = data.length
+            val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
+            if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
+              return Seq(I32(EFAULT))
+            if soDatalenOut < 0 || soDatalenOut.toLong + 4L > dataLen then
+              return Seq(I32(EFAULT))
+
+            var total = 0
+            var i     = 0
+            while i < iovsLen do
+              val iovec = iovsPtr + i * 8
+              val buf   = readI32LE(data, iovec)
+              val len   = readI32LE(data, iovec + 4)
+              val end   = buf.toLong + len.toLong
+              if buf < 0 || len < 0 || end > dataLen then
+                return Seq(I32(EFAULT))
+              val _ = sock.write(data, buf, len)
+              total += len
+              i     += 1
+            writeI32LE(data, soDatalenOut, total)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** `sock_shutdown(fd: i32, how: i32) -> errno`
+    *
+    * Shut down the read side (`SD_RD = 1`), write side (`SD_WR = 2`),
+    * or both (`SD_BOTH = SD_RD | SD_WR = 3`) of an accepted socket.
+    * Any other `how` value is `EINVAL`.
+    *
+    * After `SD_BOTH`, further reads / writes through the socket fd
+    * surface as ESUCCESS-with-zero-bytes (read EOF) / ESUCCESS (write
+    * silently dropped) at the host layer. A subsequent `fd_close` is
+    * still required to release the FdTable slot — `sock_shutdown`
+    * doesn't free the fd. */
+  private def sockShutdown(args: Seq[Value], ctx: WasiContext,
+                           fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I32(how)) =>
+        if how < 1 || how > 3 then return Seq(I32(EINVAL))
+        socketForOp(fd, ctx, fdTable) match
+          case Left(errno) => Seq(I32(errno))
+          case Right(sock) =>
+            sock.shutdown(how) match
+              case Right(_)    => Seq(I32(ESUCCESS))
+              case Left(errno) => Seq(I32(errno))
+      case _ => Seq(I32(EINVAL))
+
+  /** Resolve `fd` to a [[WasiContext.ClientSocket]] for the recv/send/
+    * shutdown trio. EBADF if the fd doesn't resolve, ENOTSOCK if it
+    * does but to a regular file. The listening-socket fd range is
+    * also rejected with ENOTSOCK — `sock_recv` / `sock_send` against
+    * a server socket are nonsensical in BSD too (you would `accept`
+    * first). */
+  private inline def socketForOp(fd: Int, ctx: WasiContext,
+                                 fdTable: FdTable):
+      Either[Int, WasiContext.ClientSocket] =
+    if fd < 0 then Left(EBADF)
+    else if fd <= 2 then Left(ENOTSOCK)
+    else if fd - 3 < ctx.preopens.length then Left(ENOTSOCK)
+    else if isListeningSocketFd(fd, ctx) then Left(ENOTSOCK)
+    else fdTable.lookup(fd) match
+      case Some(c: WasiContext.ClientSocket) => Right(c)
+      case Some(_)                           => Left(ENOTSOCK)
+      case None                              => Left(EBADF)
 
   // === path_filestat_get ====================================================
 
@@ -1904,18 +2184,18 @@ object Wasi:
   private[wasi] val FDFLAGS_SYNC:     Int = 1 << 4
 
   /** Per-instantiation table of opened-file fds. Allocates monotonically
-    * from `3 + preopens.length` and reuses the smallest free slot after
-    * a `release`. Not thread-safe — the interpreter is single-threaded,
-    * and host calls run synchronously on the same thread, so a mutable
-    * `ArrayBuffer[Option[FdEntry]]` is the right shape.
+    * from `baseFd` (`3 + preopens.length + sockets.length`) and reuses
+    * the smallest free slot after a `release`. Not thread-safe — the
+    * interpreter is single-threaded, and host calls run synchronously
+    * on the same thread, so a mutable `ArrayBuffer[Option[FdEntry]]`
+    * is the right shape.
     *
     * Slot semantics: `None` = free, `Some(entry)` = owned. We don't
     * track a separate "high-water mark" because growing the buffer is
     * O(1) amortised and the array stays small in practice (a typical
     * wasi program holds a handful of fds, not thousands). */
-  private final class FdTable(preopenCount: Int):
+  private final class FdTable(baseFd: Int):
     import scala.collection.mutable.ArrayBuffer
-    private val baseFd: Int                       = 3 + preopenCount
     private val slots:  ArrayBuffer[Option[FdEntry]] = ArrayBuffer.empty
 
     /** Allocate a new fd backed by `file` with initial `fdflags`.
@@ -2040,15 +2320,24 @@ end Wasi
   *                 The i-th preopen is exposed at fd `3 + i`. Default
   *                 is empty — userspace then sees just stdin/stdout/
   *                 stderr and any `path_open` of a relative path fails.
+  * @param sockets  Host-provided listening sockets, inetd-style. The
+  *                 i-th socket is exposed at fd
+  *                 `3 + preopens.length + i`. The wasi program calls
+  *                 `sock_accept` against the listening fd; the
+  *                 returned client fd lives in the per-instance fd
+  *                 table. Default is empty — userspace then has no
+  *                 socket capability and `sock_accept` on any fd
+  *                 returns EBADF.
   */
 final case class WasiContext(
-    args:     Seq[String]                  = Seq.empty,
-    envs:     Seq[(String, String)]        = Seq.empty,
-    stdout:   Int => Unit                  = WasiContext.defaultStdout,
-    stderr:   Int => Unit                  = WasiContext.defaultStderr,
-    clock:    WasiContext.Clock            = WasiContext.systemClock,
-    random:   Int => Array[Byte]           = WasiContext.defaultRandom,
-    preopens: Seq[WasiContext.Preopen]     = Seq.empty,
+    args:     Seq[String]                       = Seq.empty,
+    envs:     Seq[(String, String)]             = Seq.empty,
+    stdout:   Int => Unit                       = WasiContext.defaultStdout,
+    stderr:   Int => Unit                       = WasiContext.defaultStderr,
+    clock:    WasiContext.Clock                 = WasiContext.systemClock,
+    random:   Int => Array[Byte]                = WasiContext.defaultRandom,
+    preopens: Seq[WasiContext.Preopen]          = Seq.empty,
+    sockets:  Seq[WasiContext.ServerSocket]     = Seq.empty,
 )
 
 object WasiContext:
@@ -2493,6 +2782,62 @@ object WasiContext:
         cursor = end
         length
 
+  /** A listening server socket the host pre-bound and handed to the
+    * wasi program through [[WasiContext.sockets]]. wasi-libc has no
+    * `sock_bind`/`sock_listen` in Preview 1, so this is the only way
+    * a wasi process can serve connections.
+    *
+    * The trait is intentionally tiny: `accept` blocks until a client
+    * arrives, returns a [[ClientSocket]] (or a wasi errno on host
+    * failure). Platforms wire it to their native networking API —
+    * `java.nio.channels.ServerSocketChannel` on JVM, javalib's
+    * `java.net.ServerSocket` on Scala Native, Node `net.createServer`
+    * on Scala.js (or stubbed to `Left(Wasi.ENOSYS)` when sockets
+    * aren't available).
+    *
+    * `address` is for tooling/introspection only (a `"host:port"`
+    * string for debug logs) and is never read by the syscall layer.
+    *
+    * The default impl returns `Left(Wasi.ENOTCAPABLE)`, so a value
+    * constructed via `new ServerSocket {}` advertises a socket fd
+    * but refuses every `sock_accept` against it. */
+  trait ServerSocket:
+    /** Block until a client connects. Returns a `ClientSocket` wrapping
+      * the accepted connection on success, or a wasi errno on host
+      * failure (EIO / ECONNRESET / EINTR / …). */
+    def accept(): Either[Int, ClientSocket] = Left(Wasi.ENOTCAPABLE)
+
+    /** A short string identifying where the socket is listening; used
+      * only for diagnostic output. Default is `"<server-socket>"`. */
+    def address: String = "<server-socket>"
+
+  /** An accepted client socket — looks like an [[Wasi.FsFile]] so that
+    * `fd_read` / `fd_write` route to it through the standard FdTable
+    * lookup. `size` / `tell` / `seek` are stub implementations
+    * (sockets are streams; userspace that tries to `lseek` a socket
+    * fd gets nonsensical-but-safe behaviour at the syscall layer —
+    * a future hardening pass could surface `ESPIPE`).
+    *
+    * `shutdown(how)` implements `sock_shutdown`. `close()` releases
+    * the host-side connection — called from `fd_close` when the
+    * program disposes of the fd. */
+  trait ClientSocket extends Wasi.FsFile:
+    /** Shut down the read side (`SD_RD = 1`), write side (`SD_WR = 2`),
+      * or both (`SD_BOTH = 3`) of this connection. */
+    def shutdown(@unused how: Int): Either[Int, Unit] = Left(Wasi.ENOTCAPABLE)
+
+    /** Sockets have no addressable size — return 0. */
+    def size: Long = 0L
+
+    /** Sockets have no cursor — `tell` is always 0. */
+    def tell: Long = 0L
+
+    /** No-op. wasi-libc never calls `lseek` on a socket fd (rights
+      * mask `RIGHTS_SOCKET_ACCEPTED` doesn't carry `FD_SEEK`), but
+      * the trait inherits the method from [[Wasi.FsFile]] and a
+      * misbehaving program might. Silent no-op is the safest fallback. */
+    def seek(pos: Long): Unit = ()
+
   /** A pair of clocks — wall clock and a non-decreasing monotonic source.
     * Both surfaced as nanoseconds because that's the wasi-preview1 ABI
     * shape. Tests inject a deterministic impl; the default uses
@@ -2551,8 +2896,9 @@ object WasiContext:
                  envs:     Seq[(String, String)]    = Seq.empty,
                  clock:    Clock                    = systemClock,
                  random:   Int => Array[Byte]       = defaultRandom,
-                 preopens: Seq[Preopen]             = Seq.empty): Collecting =
-    new Collecting(args, envs, clock, random, preopens)
+                 preopens: Seq[Preopen]             = Seq.empty,
+                 sockets:  Seq[ServerSocket]        = Seq.empty): Collecting =
+    new Collecting(args, envs, clock, random, preopens, sockets)
 
   /** Captures stdout/stderr bytes from a wasi program. Threading-wise
     * this is single-threaded — the interpreter is single-threaded, so
@@ -2561,7 +2907,8 @@ object WasiContext:
                                         envs:     Seq[(String, String)],
                                         clock:    Clock,
                                         random:   Int => Array[Byte],
-                                        preopens: Seq[Preopen]):
+                                        preopens: Seq[Preopen],
+                                        sockets:  Seq[ServerSocket]):
     private val stdoutBuf = ArrayBuffer.empty[Byte]
     private val stderrBuf = ArrayBuffer.empty[Byte]
     val context: WasiContext = WasiContext(
@@ -2572,6 +2919,7 @@ object WasiContext:
       clock    = clock,
       random   = random,
       preopens = preopens,
+      sockets  = sockets,
     )
     def stdoutBytes:  Array[Byte] = stdoutBuf.toArray
     def stderrBytes:  Array[Byte] = stderrBuf.toArray
