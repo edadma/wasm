@@ -6,7 +6,7 @@ weight: 10
 
 ## Status
 
-The `interp` and `wasi` libraries are designed to publish to Maven Central as `io.github.edadma:wasm` and `io.github.edadma:wasm-wasi`, but no release has been cut yet — the project is still in pre-release while SIMD (Phase 8.E) is on the menu. Bulk-memory remainder, non-trapping float-to-int, reference types (including typed `select t*`), multi-memory (with the `HostFuncMulti` surface for hosts that need memidx > 0), and SIMD foundations + loads/stores + lane access + integer arithmetic + shifts + min/max + float arithmetic (`V128` value type, `v128.const`, `v128.load{,8x8_s,8x8_u,16x4_s,16x4_u,32x2_s,32x2_u,8_splat,16_splat,32_splat,64_splat,32_zero,64_zero}`, `v128.store`, `*.splat` / `*.extract_lane` / `*.replace_lane` for every lane shape, `i8x16.shuffle`, `i8x16.swizzle`, per-shape `add` / `sub` / `neg` / `abs` / `mul` and saturating `add_sat_s,u` / `sub_sat_s,u` / `avgr_u` for i8x16 and i16x8, integer `shl` / `shr_s` / `shr_u` on all four shapes, integer `min_s,u` / `max_s,u` on i8x16/i16x8/i32x4, and the full `f32x4` / `f64x2` arithmetic suite — `ceil` / `floor` / `trunc` / `nearest` / `abs` / `neg` / `sqrt` / `add` / `sub` / `mul` / `div` / `min` / `max` / `pmin` / `pmax`) are all shipped. The from-source path below is the supported way to use it today.
+The `interp` and `wasi` libraries are designed to publish to Maven Central as `io.github.edadma:wasm` and `io.github.edadma:wasm-wasi`, but no release has been cut yet — the project is still in pre-release while SIMD (Phase 8.E) is on the menu. Bulk-memory remainder, non-trapping float-to-int, reference types (including typed `select t*`), multi-memory (with the `HostFuncMulti` surface for hosts that need memidx > 0), and SIMD foundations + loads/stores + lane access + integer arithmetic + shifts + min/max + float arithmetic + bitwise & reductions + comparisons (`V128` value type, `v128.const`, `v128.load{,8x8_s,8x8_u,16x4_s,16x4_u,32x2_s,32x2_u,8_splat,16_splat,32_splat,64_splat,32_zero,64_zero}`, `v128.store`, `*.splat` / `*.extract_lane` / `*.replace_lane` for every lane shape, `i8x16.shuffle`, `i8x16.swizzle`, per-shape `add` / `sub` / `neg` / `abs` / `mul` and saturating `add_sat_s,u` / `sub_sat_s,u` / `avgr_u` for i8x16 and i16x8, integer `shl` / `shr_s` / `shr_u` on all four shapes, integer `min_s,u` / `max_s,u` on i8x16/i16x8/i32x4, the full `f32x4` / `f64x2` arithmetic suite — `ceil` / `floor` / `trunc` / `nearest` / `abs` / `neg` / `sqrt` / `add` / `sub` / `mul` / `div` / `min` / `max` / `pmin` / `pmax`, plus bitwise `not` / `and` / `andnot` / `or` / `xor` / `bitselect`, shape-aware reductions `any_true` / `*.all_true` / `*.bitmask`, and the full lane-wise compare set `eq` / `ne` / `lt` / `gt` / `le` / `ge` across all six lane shapes — signed + unsigned for i8x16/i16x8/i32x4, signed-only for i64x2 per spec) are all shipped. The from-source path below is the supported way to use it today.
 
 ## From source
 
@@ -14,12 +14,12 @@ The `interp` and `wasi` libraries are designed to publish to Maven Central as `i
 git clone https://github.com/edadma/wasm.git
 cd wasm
 sbt test                                              # whole tree, all backends
-sbt 'interpJVM/Test/run'                              # 467 interpreter tests, JVM
+sbt 'interpJVM/Test/run'                              # 487 interpreter tests, JVM
 sbt 'wasiJVM/Test/run'                                # 157 WASI tests, JVM
 sbt 'cliJVM/Test/run'                                 # 9 CLI tests
 ```
 
-The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **633 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
+The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **653 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
 
 ## Linking against a local checkout
 

@@ -89,7 +89,7 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 ## SIMD (Phase 8.E, in progress)
 
-The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, and G.1 are shipped.** The remainder (chunk G.2 comparison ops, H narrow/widen + conversions, I dot/lane mem ops) is still to come.
+The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). Landing the proposal is a multi-chunk project; **Chunks A, B, C, D, E, F, G.1, and G.2 are shipped.** The remainder (chunk H narrow/widen + conversions, I dot/lane mem ops) is still to come.
 
 ### Foundations (Chunk A — done)
 
@@ -248,6 +248,39 @@ Six bitwise ops that ignore lane shape (the v128 is just 16 raw bytes), plus nin
 | `i32x4.bitmask` | `0xA4` | Top bit of each i32 lane → 4-bit mask. |
 | `i64x2.bitmask` | `0xC4` | Top bit of each i64 lane → 2-bit mask. |
 
+### Comparisons (Chunk G.2 — done)
+
+Lane-wise compare ops produce a result lane that is all-1s on true (`0xFF…` — the bitmask shape `v128.bitselect` consumes natively) and all-0s on false, in the same lane width as the inputs. Every op is `v128 × v128 → v128`, no immediate past the sub-opcode. 48 ops in total — three full integer shapes (i8x16 / i16x8 / i32x4) get the full `eq, ne, lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u` set; i64x2 gets the six signed forms only (the spec defines no `_u` variants for i64); f32x4 and f64x2 each get `eq, ne, lt, gt, le, ge` (no signedness — floats are inherently signed).
+
+IEEE-754 NaN: every f32/f64 compare returns false when either operand is NaN, except `ne` which returns true. IEEE-754 signed zero: `-0.0 == +0.0` is true and `-0.0 < +0.0` is false.
+
+| Opcode | Sub | Notes |
+|---|---|---|
+| `i8x16.eq` / `ne` | `0x23` / `0x24` | Bit-pattern equality — sign-form doesn't matter. |
+| `i8x16.lt_s` / `lt_u` | `0x25` / `0x26` | `-1 < 0` is true signed, false unsigned (`0xFF > 0`). |
+| `i8x16.gt_s` / `gt_u` | `0x27` / `0x28` | |
+| `i8x16.le_s` / `le_u` | `0x29` / `0x2A` | |
+| `i8x16.ge_s` / `ge_u` | `0x2B` / `0x2C` | |
+| `i16x8.eq` / `ne` | `0x2D` / `0x2E` | |
+| `i16x8.lt_s` / `lt_u` | `0x2F` / `0x30` | Sign-form chooses between two reads of the 16-bit lane. |
+| `i16x8.gt_s` / `gt_u` | `0x31` / `0x32` | |
+| `i16x8.le_s` / `le_u` | `0x33` / `0x34` | |
+| `i16x8.ge_s` / `ge_u` | `0x35` / `0x36` | |
+| `i32x4.eq` / `ne` | `0x37` / `0x38` | |
+| `i32x4.lt_s` / `lt_u` | `0x39` / `0x3A` | `_u` uses `Integer.compareUnsigned` per lane. |
+| `i32x4.gt_s` / `gt_u` | `0x3B` / `0x3C` | |
+| `i32x4.le_s` / `le_u` | `0x3D` / `0x3E` | |
+| `i32x4.ge_s` / `ge_u` | `0x3F` / `0x40` | |
+| `i64x2.eq` / `ne` | `0xD6` / `0xD7` | |
+| `i64x2.lt_s` / `gt_s` | `0xD8` / `0xD9` | i64x2 has signed-only compares per spec. |
+| `i64x2.le_s` / `ge_s` | `0xDA` / `0xDB` | |
+| `f32x4.eq` / `ne` | `0x41` / `0x42` | NaN-involving: every op false except `ne`. |
+| `f32x4.lt` / `gt` | `0x43` / `0x44` | |
+| `f32x4.le` / `ge` | `0x45` / `0x46` | |
+| `f64x2.eq` / `ne` | `0x47` / `0x48` | |
+| `f64x2.lt` / `gt` | `0x49` / `0x4A` | |
+| `f64x2.le` / `ge` | `0x4B` / `0x4C` | |
+
 ## Multi-memory (Phase 8.D)
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -263,7 +296,7 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| SIMD remainder | comparisons (G.2), narrow/widen + conversions (H), dot product + lane mem ops (I) | in progress (8.E, chunks G.2..I) |
+| SIMD remainder | narrow/widen + conversions (H), dot product + lane mem ops (I) | in progress (8.E, chunks H..I) |
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
