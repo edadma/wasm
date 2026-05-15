@@ -16,5 +16,6 @@ The `wasi/` sub-project (`io.github.edadma.wasm.wasi`) implements `wasi_snapshot
 
 `Wasi.preview1(ctx)` returns a `HostModule` named `"wasi_snapshot_preview1"`. `Wasi.run(inst, "_start")` invokes the WASI command-mode entry point and translates `proc_exit(N)` into `Right(N)` — see [Quickstart](/getting-started/quickstart/) for the calling shape.
 
-- [Syscalls](/wasi/syscalls/) — the 24 syscalls in five groups.
+- [WasiContext](/wasi/context/) — args, envs, stdio sinks, clock, random source, preopens; `default` and `collecting` factories.
 - [Preopens](/wasi/preopens/) — `WasiContext.Preopen`, `HostPreopen.fromDir`, and the sandboxing model.
+- [Syscalls](/wasi/syscalls/) — the 24 syscalls in five groups.

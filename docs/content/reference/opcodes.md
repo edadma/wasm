@@ -91,6 +91,41 @@ Section 4 funcref + externref tables. `call_indirect` does a signature check at 
 
 The WebAssembly SIMD proposal adds ~236 opcodes under the `0xFD` prefix and a new `V128` value type (16 raw bytes, lane interpretation chosen per-opcode). The full surface — Chunks A through I — is now shipped.
 
+### The `V128` value type (host side)
+
+```scala
+final case class V128(bits: Array[Byte]) extends Value
+```
+
+A SIMD value is a raw 16-byte buffer; the lane shape (`i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2`) is *not* carried on the value — it's chosen per-opcode at use time. Same 16 bytes, six possible interpretations. The interpreter enforces `bits.length == 16` on every constructed value.
+
+Byte order is **little-endian** per the spec: lane 0 of any shape starts at byte 0, the low byte of each lane comes first, and `v128.load` reads bytes in memory order into the same positions. So to build a `V128` from four `i32` lanes:
+
+```scala
+def i32x4(a: Int, b: Int, c: Int, d: Int): V128 =
+  val buf = new Array[Byte](16)
+  val bb  = java.nio.ByteBuffer.wrap(buf).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+  bb.putInt(a).putInt(b).putInt(c).putInt(d)
+  V128(buf)
+
+inst.invoke("dot", Seq(i32x4(1, 2, 3, 4), i32x4(5, 6, 7, 8)))
+```
+
+To inspect a `V128` result from `invoke`:
+
+```scala
+inst.invoke("compute") match
+  case Right(Seq(V128(bs))) =>
+    val bb    = java.nio.ByteBuffer.wrap(bs).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    val lanes = Array(bb.getInt, bb.getInt, bb.getInt, bb.getInt)
+    println(lanes.mkString("[", ", ", "]"))
+  case _ => ???
+```
+
+The test suite's `TestSupport.simd` object has helpers (`fromI8`, `fromI16`, `fromI32`, `fromI64`, `fromF32`, `fromF64`) for each lane shape — they're test-scope but easy to copy if your host code needs the same builders.
+
+**`V128` equality:** the case class derives `equals` from `Array[Byte]` reference equality (Scala's `Array` doesn't define structural `equals`). So `V128(a) == V128(b)` is true only if `a eq b`. Compare the bytes directly if you want value equality.
+
 ### Foundations (Chunk A — done)
 
 - **`V128` value type** (wire byte `0x7B`). First-class in function params, results, locals, globals, and blocktypes. Locals zero-init to 16 zero bytes.

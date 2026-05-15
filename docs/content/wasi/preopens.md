@@ -75,3 +75,30 @@ The three backends (JVM, Native, JS) differ only in how they implement `path_ope
 - **`Preopen.named`** — when a guest probes preopens for capability discovery and you want to expose the *name* but not the contents.
 
 You can mix them freely. The order of `preopens` in `WasiContext` determines the fd ordering — preopen `[0]` is fd 3, preopen `[1]` is fd 4, and so on.
+
+## The `Preopen` trait surface
+
+If the three factories don't fit and you want to implement a custom preopen — say, an S3-backed read-only mount or an HTTP-fetching probe — you can subclass `WasiContext.Preopen` directly:
+
+```scala
+trait Preopen:
+  /** wasi-visible directory name (what userspace sees through `fd_prestat_dir_name`). */
+  def name: String
+
+  /** Open a path relative to this preopen. Called from `path_open`.
+    * Default returns Left(ENOTCAPABLE). */
+  def open(path: String, oflags: Int, fdflags: Int): Either[Int, Wasi.FsFile]
+
+  /** Stat a path WITHOUT opening it. Called from `path_filestat_get`.
+    * Right(size) for an existing regular file; Left(errno) otherwise.
+    * Default returns Left(ENOTCAPABLE). */
+  def statPath(path: String): Either[Int, Long]
+```
+
+Three things to know:
+
+- **`Wasi.FsFile` is the file-handle trait** — `read` / `write` / `seek` / `size` / `tell` / `close`. The shim never sees a Java `File` or a `Path`; it talks to your `FsFile`. The `InMemoryPreopen` and `HostBackedPreopen` impls are reference implementations you can read in the source.
+- **Several methods are `private[wasi]`** (`unlinkPath`, `mkdir`, `readdir`, `filetypeOf`). External impls inherit their `ENOTCAPABLE` / empty defaults but can't override them — write/enumerate semantics for custom preopens are intentionally limited to what the trait surface above allows. If you genuinely need to override one of those, the customization belongs upstream as a new factory rather than as a downstream subclass.
+- **`oflags` / `fdflags` are passed through verbatim.** The `OFLAGS_CREAT` (1), `OFLAGS_DIRECTORY` (2), `OFLAGS_EXCL` (4), `OFLAGS_TRUNC` (8) bits and the `FDFLAGS_*` set are documented in `wasi-preview1`. Read-only impls ignore them.
+
+For the common case — read/write semantics over an in-memory map, or sandboxed access to a real directory — reach for `Preopen.inMemory` and `HostPreopen.fromDir` instead. They cover what most callers need.
