@@ -53,12 +53,13 @@ object Cli:
     def openPreopen(hostPath: String, virtualName: String): WasiContext.Preopen
 
   final case class Config(
-      file:         String                = "",
-      invoke:       Option[String]        = None,
-      args:         Seq[Int]              = Nil,
-      wasiArgs:     Seq[String]           = Nil,
-      listExports:  Boolean               = false,
-      preopens:     Seq[(String, String)] = Nil,
+      file:         String                  = "",
+      invoke:       Option[String]          = None,
+      args:         Seq[Int]                = Nil,
+      wasiArgs:     Seq[String]             = Nil,
+      listExports:  Boolean                 = false,
+      preopens:     Seq[(String, String)]   = Nil,
+      envs:         Seq[(String, String)]   = Nil,
   )
 
   private val builder = OParser.builder[Config]
@@ -108,6 +109,24 @@ object Cli:
           c.copy(preopens = c.preopens :+ ((s.take(n), s.drop(n + 1))))
         }
         .text("mount a host directory as a wasi preopen (repeatable)"),
+      // Split on the FIRST `=` — values may themselves contain `=` signs
+      // (e.g. `PATH=/usr/bin:/bin` is fine, since the colons inside the
+      // value don't matter; `PYTHONHASHSEED=` with an empty value is also
+      // legal). Empty keys (a leading `=`) are rejected.
+      opt[String]('e', "env")
+        .valueName("<key>=<value>")
+        .unbounded()
+        .validate { s =>
+          val i = s.indexOf('=')
+          if i <= 0 then
+            failure(s"--env value must be key=value with a non-empty key, got '$s'")
+          else success
+        }
+        .action { (s, c) =>
+          val i = s.indexOf('=')
+          c.copy(envs = c.envs :+ ((s.take(i), s.drop(i + 1))))
+        }
+        .text("environment variable for the WASI program (repeatable)"),
       help("help").text("print this help message"),
       version("version").text("print version and exit"),
     )
@@ -152,6 +171,7 @@ object Cli:
     val argv0 = basenameWithoutWasmSuffix(cfg.file)
     val ctx = WasiContext.default.copy(
       args     = Seq(argv0) ++ cfg.wasiArgs,
+      envs     = cfg.envs,
       preopens = preopens,
     )
     val hostModules = Seq(EnvModule.default, Wasi.preview1(ctx))

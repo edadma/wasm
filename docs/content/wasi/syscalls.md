@@ -46,6 +46,8 @@ Twenty-four host functions are exposed under the module name `wasi_snapshot_prev
 | `fd_fdstat_set_flags(fd, fdflags)`           | Adjusts `APPEND`, `NONBLOCK`, `SYNC`, etc. on the fd. |
 | `fd_sync(fd)`                                | Flushes any buffered writes to the host filesystem (no-op for in-memory preopens). |
 | `fd_datasync(fd)`                            | Like `fd_sync` but data-only, for callers that don't care about metadata. |
+| `fd_advise(fd, offset, len, advice)`         | Advisory POSIX `posix_fadvise`. Valid advice values 0..5 (NORMAL / SEQUENTIAL / RANDOM / WILLNEED / DONTNEED / NOREUSE) — the shim honours none of them but returns ESUCCESS so callers can ship the hint without branching. EINVAL on out-of-range advice. |
+| `fd_allocate(fd, offset, len)`               | POSIX `posix_fallocate` — ensure `[offset, offset+len)` is usable for writes. If the range extends past EOF, the file is grown with zero bytes in the gap. EBADF on stdio / preopen / unknown fd; EINVAL on negative arguments or arithmetic overflow. |
 
 ## Filesystem
 
@@ -64,6 +66,5 @@ Twenty-four host functions are exposed under the module name `wasi_snapshot_prev
 | `sock_*`                         | not implemented | wasi-preview1 sockets are a thin shim; the project is library-scoped, not server-scoped. |
 | `path_link` / `path_symlink` / `path_readlink` | not implemented | Adds complexity without unblocking the rustc smoke tests. |
 | `path_rename`                    | not implemented | Same. |
-| `fd_advise` / `fd_allocate`      | not implemented | rustc binaries probe these but don't require them. |
 
 Programs that issue an unimplemented syscall get back `Wasi.ENOTSUP` (52), which is the spec-conformant "host doesn't support this".

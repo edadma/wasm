@@ -39,6 +39,7 @@ Usage: wasm [options] <file> [<wasi-args>...]
   -a, --args n1,n2,...                         comma-separated decimal i32 arguments to the export
   --list-exports                               print exported function names and exit (no invocation)
   -p, --preopen <host-path>:<virtual-name>     mount a host directory as a wasi preopen (repeatable)
+  -e, --env <key>=<value>                      environment variable for the WASI program (repeatable)
   --help                                       print this help message
   --version                                    print version and exit
 ```

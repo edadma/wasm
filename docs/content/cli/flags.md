@@ -51,6 +51,18 @@ sbt 'cliJVM/run --list-exports interp/shared/src/test/resources/fixtures/fact.wa
 # memory
 ```
 
+## `-e`, `--env <key>=<value>`
+
+Sets an environment variable for the WASI program. Repeatable; each `--env` adds one entry to `WasiContext.envs` in order. Empty keys (`=value`) are rejected; values may themselves contain `=` signs (`PATH=/usr/bin:/bin` is fine).
+
+```bash
+sbt 'cliJVM/run -e HOME=/root -e LANG=C.UTF-8 my-program.wasm'
+```
+
+From the guest's perspective, these reach userspace through `environ_sizes_get` + `environ_get`. `std::env::vars()` in Rust, `getenv` in C through wasi-libc.
+
+`--env` is for WASI programs specifically — non-WASI modules don't have an environ surface.
+
 ## `-p`, `--preopen <host-path>:<virtual-name>`
 
 Mounts a real host directory as a wasi preopen, backed by `HostPreopen.fromDir`. Repeatable; each `--preopen` adds one entry to the WASI context's preopen list in order.

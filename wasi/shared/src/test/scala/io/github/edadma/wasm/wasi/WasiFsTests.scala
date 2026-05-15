@@ -1180,6 +1180,104 @@ object WasiFsTests:
         case other => check(false, s"call_fd_datasync(-1): $other")
     }
 
+    // ----- fd_advise (advisory; pass valid advice through) ----------------
+
+    test("fd_advise: ESUCCESS on stdio + preopen + opened file for every valid advice") {
+      val files     = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      // advice values: 0=NORMAL, 1=SEQUENTIAL, 2=RANDOM, 3=WILLNEED, 4=DONTNEED, 5=NOREUSE.
+      for fd <- Seq(0, 1, 2, 3, 4); advice <- 0 to 5 do
+        inst.invoke("call_fd_advise", Seq(I32(fd), I64(0L), I64(0L), I32(advice))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.ESUCCESS, s"fd=$fd advice=$advice errno=$e (want 0)")
+          case other => check(false, s"call_fd_advise(fd=$fd advice=$advice): $other")
+    }
+
+    test("fd_advise: EINVAL on out-of-range advice (regardless of fd)") {
+      val files     = Map("f" -> "x".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "f")
+      for advice <- Seq(-1, 6, 99) do
+        inst.invoke("call_fd_advise", Seq(I32(4), I64(0L), I64(0L), I32(advice))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EINVAL, s"advice=$advice errno=$e (want EINVAL)")
+          case other => check(false, s"call_fd_advise(advice=$advice): $other")
+    }
+
+    test("fd_advise: EBADF for unknown fd (only after the advice range check)") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      inst.invoke("call_fd_advise", Seq(I32(99), I64(0L), I64(0L), I32(0))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EBADF, s"unknown fd errno=$e (want EBADF)")
+        case other => check(false, s"call_fd_advise: $other")
+    }
+
+    // ----- fd_allocate (grow file to cover [offset, offset+len)) ----------
+
+    test("fd_allocate: extends a regular file to offset+len, zero-filling the gap") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("f" -> "abc".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      // Open f for write (oflags=0; no CREAT needed since f exists).
+      storePath(inst, 0, "f")
+      runOk(callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                              oflags = 0, openedFdOut = 64))
+      val fd = peekI32(inst, 64)
+      check(fd == 4, s"opened fd=$fd")
+      // Allocate offset=2 len=8 → end=10. Existing size is 3 → file grows
+      // to 10 bytes, byte 2 stays 'c', bytes 3..9 are zero-filled.
+      inst.invoke("call_fd_allocate", Seq(I32(fd), I64(2L), I64(8L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e (want 0)")
+        case other => check(false, s"call_fd_allocate: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(bytes.length == 10,
+            s"file should be 10 bytes after allocate(2, 8), got ${bytes.length}")
+      check(bytes(0) == 'a'.toByte && bytes(1) == 'b'.toByte && bytes(2) == 'c'.toByte,
+            s"original bytes preserved: ${bytes.toSeq.map(_.toInt)}")
+      for i <- 3 until 10 do
+        check(bytes(i) == 0, s"byte $i should be zero-filled, got ${bytes(i).toInt}")
+    }
+
+    test("fd_allocate: no-op when offset+len already fits in the current size") {
+      val preopen = WasiContext.Preopen.inMemory("/s",
+                                                 Map("f" -> "abcdefgh".getBytes("UTF-8")))
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io, preopens = Seq(preopen))
+      storePath(inst, 0, "f")
+      runOk(callPathOpenFlags(inst, dirfd = 3, pathPtr = 0, pathLen = 1,
+                              oflags = 0, openedFdOut = 64))
+      val fd = peekI32(inst, 64)
+      // Allocate offset=2 len=4 → end=6, which is already ≤ size=8. Nothing
+      // should grow and the bytes should be untouched.
+      inst.invoke("call_fd_allocate", Seq(I32(fd), I64(2L), I64(4L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other => check(false, s"call_fd_allocate: $other")
+      val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
+      check(new String(bytes, "UTF-8") == "abcdefgh", s"unchanged: ${new String(bytes, "UTF-8")}")
+    }
+
+    test("fd_allocate: EBADF on stdio / preopen / unknown fd") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      for fd <- Seq(0, 1, 2, 3, 99) do
+        inst.invoke("call_fd_allocate", Seq(I32(fd), I64(0L), I64(1L))) match
+          case Right(Seq(I32(e))) =>
+            check(e == Wasi.EBADF, s"fd=$fd errno=$e (want EBADF)")
+          case other => check(false, s"call_fd_allocate(fd=$fd): $other")
+    }
+
+    test("fd_allocate: EINVAL on negative offset or len") {
+      val (inst, _) = openSingleFile(Map("f" -> "x".getBytes), "f")
+      // fd 4 is the opened file; the EINVAL check runs before any fd check.
+      inst.invoke("call_fd_allocate", Seq(I32(4), I64(-1L), I64(8L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"neg offset errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_allocate(neg offset): $other")
+      inst.invoke("call_fd_allocate", Seq(I32(4), I64(0L), I64(-1L))) match
+        case Right(Seq(I32(e))) =>
+          check(e == Wasi.EINVAL, s"neg len errno=$e (want EINVAL)")
+        case other => check(false, s"call_fd_allocate(neg len): $other")
+    }
+
     // ----- OFLAGS_EXCL in path_open (hardening pass) ----------------------
     //
     // EXCL gives userspace atomic-create semantics: `CREAT | EXCL` on an

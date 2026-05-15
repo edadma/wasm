@@ -42,6 +42,10 @@
     (func $fd_sync (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_datasync"
     (func $fd_datasync (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_advise"
+    (func $fd_advise (param i32 i64 i64 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_allocate"
+    (func $fd_allocate (param i32 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "path_unlink_file"
     (func $path_unlink_file (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_create_directory"
@@ -136,6 +140,22 @@
   (func (export "call_fd_datasync") (param $fd i32) (result i32)
     local.get $fd
     call $fd_datasync)
+
+  (func (export "call_fd_advise")
+        (param $fd i32) (param $offset i64) (param $len i64) (param $advice i32)
+        (result i32)
+    local.get $fd
+    local.get $offset
+    local.get $len
+    local.get $advice
+    call $fd_advise)
+
+  (func (export "call_fd_allocate")
+        (param $fd i32) (param $offset i64) (param $len i64) (result i32)
+    local.get $fd
+    local.get $offset
+    local.get $len
+    call $fd_allocate)
 
   (func (export "call_path_unlink_file")
         (param $fd i32) (param $path_ptr i32) (param $path_len i32)

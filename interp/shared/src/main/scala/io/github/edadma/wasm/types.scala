@@ -215,6 +215,11 @@ final case class WasmModule(
     // validator gates those ops on `dataCount.isDefined` matching `data.length`.
     // `None` if the section was absent.
     dataCount: Option[Int] = None,
+    // Subsection 1 of the `name` custom section (Section 0 named "name") —
+    // `funcidx → name`. Optional and best-effort: a missing or malformed
+    // `name` section is ignored and this is an empty map. Surfaces in
+    // diagnostic messages as `function <N> (myFunc): ...` when present.
+    funcNames: Map[Int, String] = Map.empty,
 )
 
 /** All failure modes surfaced by the public API.

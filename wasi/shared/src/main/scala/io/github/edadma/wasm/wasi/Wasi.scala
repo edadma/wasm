@@ -317,6 +317,8 @@ object Wasi:
         "fd_readdir"            -> ((mem, args) => fdReaddir(mem, args, ctx, fdTable)),
         "fd_sync"               -> ((_,   args) => fdSync(args, ctx, fdTable)),
         "fd_datasync"           -> ((_,   args) => fdDatasync(args, ctx, fdTable)),
+        "fd_advise"             -> ((_,   args) => fdAdvise(args, ctx, fdTable)),
+        "fd_allocate"           -> ((_,   args) => fdAllocate(args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -960,6 +962,57 @@ object Wasi:
     * same code path as `fd_sync`. */
   private def fdDatasync(args: Seq[Value], ctx: WasiContext,
                          fdTable: FdTable): Seq[Value] = fdSync(args, ctx, fdTable)
+
+  /** `fd_advise(fd: i32, offset: i64, len: i64, advice: i32) -> errno`
+    *
+    * POSIX `posix_fadvise` — hints the OS about an upcoming access
+    * pattern (NORMAL, SEQUENTIAL, RANDOM, WILLNEED, DONTNEED, NOREUSE).
+    * Advisory in every implementation; the spec lets the host ignore the
+    * advice. We accept any valid advice value (0..5) and return ESUCCESS;
+    * out-of-range advice returns EINVAL. EBADF for unknown fds; stdio /
+    * preopen / FsFile fds are all valid targets for an advisory call. */
+  private def fdAdvise(args: Seq[Value], ctx: WasiContext,
+                       fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I64(_), I64(_), I32(advice)) =>
+        if advice < 0 || advice > 5 then Seq(I32(EINVAL))
+        else if isValidFd(fd, ctx, fdTable) then Seq(I32(ESUCCESS))
+        else Seq(I32(EBADF))
+      case _ => Seq(I32(EINVAL))
+
+  /** `fd_allocate(fd: i32, offset: i64, len: i64) -> errno`
+    *
+    * POSIX `posix_fallocate` — ensure that `[offset, offset + len)` is
+    * usable for writes without later running out of space. We don't have
+    * a way to reserve real disk space through the [[FsFile]] trait, so
+    * we approximate: if the requested range extends past EOF, grow the
+    * file by writing one zero byte at `offset + len - 1` (the InMemoryFs
+    * write path zero-fills any gap; the same trick works for any FsFile
+    * impl whose write past EOF extends the file).
+    *
+    * `EBADF` if `fd` doesn't name a real file (stdio / preopen / unknown);
+    * `EINVAL` for negative offset/len or for the arithmetic-overflow case;
+    * otherwise `ESUCCESS`. */
+  private def fdAllocate(args: Seq[Value], ctx: WasiContext,
+                         fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(fd), I64(offset), I64(len)) =>
+        if offset < 0 || len < 0 then return Seq(I32(EINVAL))
+        // Long-add overflow guards: end must be representable and not exceed Int.MaxValue
+        // (the in-memory write API takes Int positions). Any host-FS impl with a 64-bit
+        // file API would relax this; for now the InMemoryFs is the only writer.
+        val end = offset + len
+        if end < offset || end > Int.MaxValue.toLong then return Seq(I32(EINVAL))
+        lookupFile(fd, ctx, fdTable) match
+          case None       => Seq(I32(EBADF))
+          case Some(file) =>
+            if end > file.size && end > 0 then
+              val origTell = file.tell
+              file.seek(end - 1L)
+              val _ = file.write(Array[Byte](0), 0, 1)
+              file.seek(origTell)
+            Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
 
   /** Is `fd` claimed by either stdio, a preopen, or the FdTable? Used
     * by `fd_sync` / `fd_datasync` to partition EBADF from ESUCCESS
