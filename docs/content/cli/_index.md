@@ -31,9 +31,10 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 ```text
 $ wasm --help
 wasm 0.1.1
-Usage: wasm [options] <file>
+Usage: wasm [options] <file> [<wasi-args>...]
 
   <file>                                       path to a .wasm module
+  <wasi-args>...                               arguments passed to a WASI program's `_start` as argv[1..]; use `--` to separate from CLI flags
   -i, --invoke <export>                        name of the export to invoke (default: _start if exported, else main)
   -a, --args n1,n2,...                         comma-separated decimal i32 arguments to the export
   --list-exports                               print exported function names and exit (no invocation)

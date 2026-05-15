@@ -115,10 +115,11 @@ object CliJvmTests:
   //
   // Project-relative — sbt sets the cwd to the build root for `Test/run`.
 
-  private val HelloPutchar = "examples/hello.wasm"
-  private val HelloWasi    = "wasi/shared/src/test/resources/fixtures/hello_wasi.wasm"
-  private val WasiExit42   = "wasi/shared/src/test/resources/fixtures/wasi_exit.wasm"
-  private val RustFileRead = "wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm"
+  private val HelloPutchar  = "examples/hello.wasm"
+  private val HelloWasi     = "wasi/shared/src/test/resources/fixtures/hello_wasi.wasm"
+  private val WasiExit42    = "wasi/shared/src/test/resources/fixtures/wasi_exit.wasm"
+  private val RustFileRead  = "wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm"
+  private val RustWordCount = "examples/rust/word_count.wasm"
 
   // === Tests ===============================================================
 
@@ -192,6 +193,56 @@ object CliJvmTests:
       check(code == 1, s"expected exit 1, got $code")
       check(err.contains("--preopen") && err.contains("does not exist"),
         s"expected stderr to mention the bad preopen, was:\n$err")
+    }
+
+    // === wasi argv pass-through (positional args after the file) ============
+
+    test("trailing positional args are passed to a WASI program as argv[1..]") {
+      // examples/rust/word_count.wasm reads the path it's given as argv[1]
+      // and prints `lines words bytes path`. We seed a small file, then run
+      // word_count.wasm with that path as a trailing positional arg, and
+      // expect the count line + the path on stdout.
+      val tmp = Files.createTempDirectory("wasm-cli-argv-").toFile
+      try
+        Files.writeString(tmp.toPath.resolve("input.txt"), "one two\nthree four five\n")
+        val (code, out, err) = runCli(
+          "--preopen", s"${tmp.getAbsolutePath}:/data",
+          RustWordCount,
+          "/data/input.txt",
+        )
+        check(code == 0, s"expected exit 0, got $code  err=$err")
+        check(out.contains("/data/input.txt"),
+          s"expected stdout to contain the path the program echoed, was:\n$out")
+        // 2 lines, 5 words, 24 bytes — pin all three so a regression in
+        // argv passing surfaces unambiguously.
+        check(out.contains("2") && out.contains("5") && out.contains("24"),
+          s"expected stdout to contain the lines/words/bytes counts, was:\n$out")
+      finally
+        val _ = Files.deleteIfExists(tmp.toPath.resolve("input.txt"))
+        val _ = Files.deleteIfExists(tmp.toPath)
+    }
+
+    test("`--` ahead of positional args separates wasi argv from CLI flag parsing") {
+      // Same shape as the previous test, but with the explicit `--` token
+      // between flags and positional args. scopt honours `--` as the
+      // standard POSIX option terminator. The file basename (argv[0])
+      // and the path (argv[1]) are reachable from the rust program either
+      // way; we're just pinning that `--` doesn't break the surface.
+      val tmp = Files.createTempDirectory("wasm-cli-argv-dash-").toFile
+      try
+        Files.writeString(tmp.toPath.resolve("a.txt"), "x\ny\nz\n")
+        val (code, out, err) = runCli(
+          "--preopen", s"${tmp.getAbsolutePath}:/data",
+          RustWordCount,
+          "--",
+          "/data/a.txt",
+        )
+        check(code == 0, s"expected exit 0, got $code  err=$err")
+        check(out.contains("/data/a.txt"),
+          s"expected stdout to contain the path, was:\n$out")
+      finally
+        val _ = Files.deleteIfExists(tmp.toPath.resolve("a.txt"))
+        val _ = Files.deleteIfExists(tmp.toPath)
     }
 
     test("--preopen without a colon fails validation before instantiation") {
