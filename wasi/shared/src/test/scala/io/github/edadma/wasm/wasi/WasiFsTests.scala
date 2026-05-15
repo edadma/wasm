@@ -2071,6 +2071,191 @@ object WasiFsTests:
         case other => check(false, s"readdir: $other")
     }
 
+    // ----- poll_oneoff (subscriptions + sleep) ----------------------------
+
+    test("poll_oneoff: nsubs=0 returns ESUCCESS with zero events") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // poison the count slot — must be overwritten with 0.
+      storeI32(inst, 16, 0xdeadbeef)
+      callPollOneoff(inst, in = 0, out = 256, nsubs = 0,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 0, s"nevents=${peekI32(inst, 16)} (want 0)")
+    }
+
+    test("poll_oneoff: EINVAL on negative nsubs") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      callPollOneoff(inst, in = 0, out = 256, nsubs = -1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EINVAL, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+    }
+
+    test("poll_oneoff: EFAULT when in/out array overruns linear memory") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      val nearEnd = 65536 - 16   // one subscription is 48 bytes; this overruns
+      callPollOneoff(inst, in = nearEnd, out = 256, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EFAULT, s"errno=$e (in overrun)")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      callPollOneoff(inst, in = 0, out = 65536 - 16, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.EFAULT, s"errno=$e (out overrun)")
+        case other              => check(false, s"call_poll_oneoff: $other")
+    }
+
+    test("poll_oneoff: CLOCK monotonic with timeout=0 (relative) fires immediately") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // Subscription at addr 1024; event output at addr 2048; nevents at 16.
+      // userdata=0x1122334455667788, eventtype=0 (CLOCK), clockid=1 (monotonic),
+      // timeout=0, precision=0, flags=0 (relative).
+      buildClockSub(inst, base = 1024, userdata = 0x1122334455667788L,
+                    clockId = 1, timeout = 0L, absTime = false)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)} (want 1)")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 0x1122334455667788L,
+            s"userdata=0x${ev.userdata.toHexString} (want round-trip)")
+      check(ev.error == Wasi.ESUCCESS, s"error=${ev.error}")
+      check(ev.eventtype == 0,        s"eventtype=${ev.eventtype}")
+      check(ev.nbytes == 0L,          s"nbytes=${ev.nbytes}")
+    }
+
+    test("poll_oneoff: CLOCK with invalid clockid emits one EINVAL event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildClockSub(inst, base = 1024, userdata = 7L,
+                    clockId = 9 /* bogus */, timeout = 0L, absTime = false)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 7L,        s"userdata=${ev.userdata}")
+      check(ev.error == Wasi.EINVAL,  s"error=${ev.error}")
+    }
+
+    test("poll_oneoff: FD_READ on an opened file reports remaining bytes ready") {
+      val files = Map("readme" -> "hello!".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "readme")
+      buildFdSub(inst, base = 1024, userdata = 0xAAL,
+                 eventtype = 1, fd = 4)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata  == 0xAAL,         s"userdata=${ev.userdata}")
+      check(ev.error     == Wasi.ESUCCESS, s"error=${ev.error}")
+      check(ev.eventtype == 1,             s"eventtype=${ev.eventtype}")
+      check(ev.nbytes    == 6L,            s"nbytes=${ev.nbytes} (want 6 = 'hello!')")
+    }
+
+    test("poll_oneoff: FD_WRITE on stdout reports a generous buffer") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildFdSub(inst, base = 1024, userdata = 1L,
+                 eventtype = 2, fd = 1)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.error == Wasi.ESUCCESS,       s"error=${ev.error}")
+      check(ev.eventtype == 2,               s"eventtype=${ev.eventtype}")
+      check(ev.nbytes > 0L,                  s"nbytes=${ev.nbytes} (want > 0)")
+    }
+
+    test("poll_oneoff: FD_READ on unknown fd emits one EBADF event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      buildFdSub(inst, base = 1024, userdata = 99L,
+                 eventtype = 1, fd = 77)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 99L,        s"userdata=${ev.userdata}")
+      check(ev.error    == Wasi.EBADF, s"error=${ev.error}")
+    }
+
+    test("poll_oneoff: unknown eventtype emits one EINVAL event") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // userdata at +0, eventtype byte at +8 (we use 99 = bogus).
+      // Need to clear the whole 48-byte block first to avoid prior poison.
+      var i = 0
+      while i < 48 do
+        runOk(inst.invoke("store_byte", Seq(I32(1024 + i), I32(0))))
+        i += 1
+      runOk(inst.invoke("store_i64", Seq(I32(1024), I64(123L))))
+      runOk(inst.invoke("store_byte", Seq(I32(1024 + 8), I32(99))))
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val ev = readEvent(inst, 2048)
+      check(ev.userdata == 123L,       s"userdata=${ev.userdata}")
+      check(ev.error    == Wasi.EINVAL, s"error=${ev.error}")
+      check(ev.eventtype == 99,         s"eventtype=${ev.eventtype}")
+    }
+
+    test("poll_oneoff: multiple subs — both immediate-ready FD events fire") {
+      val files = Map("a" -> "AB".getBytes("UTF-8"))
+      val (inst, _) = openSingleFile(files, "a")
+      buildFdSub(inst, base = 1024,         userdata = 1L, eventtype = 1, fd = 4)
+      buildFdSub(inst, base = 1024 + 48,    userdata = 2L, eventtype = 2, fd = 1)
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 2,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      check(peekI32(inst, 16) == 2, s"nevents=${peekI32(inst, 16)}")
+      val ev1 = readEvent(inst, 2048)
+      val ev2 = readEvent(inst, 2048 + 32)
+      check(ev1.userdata == 1L && ev1.eventtype == 1 && ev1.nbytes == 2L,
+            s"ev1=(ud=${ev1.userdata}, type=${ev1.eventtype}, nbytes=${ev1.nbytes})")
+      check(ev2.userdata == 2L && ev2.eventtype == 2 && ev2.nbytes > 0L,
+            s"ev2=(ud=${ev2.userdata}, type=${ev2.eventtype}, nbytes=${ev2.nbytes})")
+    }
+
+    test("poll_oneoff: short relative-clock timeout actually waits before firing") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      val timeoutNs = 30_000_000L   // 30ms
+      buildClockSub(inst, base = 1024, userdata = 0L,
+                    clockId = 1, timeout = timeoutNs, absTime = false)
+      val before = System.nanoTime()
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val elapsed = System.nanoTime() - before
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      // We slept at least most of the requested interval — guard against
+      // clock-skew flakes by checking >= 80% of the target.
+      check(elapsed >= (timeoutNs * 8) / 10,
+            s"elapsed=${elapsed}ns (want >= ${(timeoutNs * 8) / 10}ns)")
+    }
+
+    test("poll_oneoff: ABSTIME with target in the past fires immediately") {
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io)
+      // ABSTIME flag (bit 0 of subclockflags). Absolute target = 0 (epoch
+      // start) is always in the past for monotonic.
+      buildClockSub(inst, base = 1024, userdata = 0L,
+                    clockId = 1, timeout = 0L, absTime = true)
+      val before = System.nanoTime()
+      callPollOneoff(inst, in = 1024, out = 2048, nsubs = 1,
+                     neventsOut = 16) match
+        case Right(Seq(I32(e))) => check(e == Wasi.ESUCCESS, s"errno=$e")
+        case other              => check(false, s"call_poll_oneoff: $other")
+      val elapsed = System.nanoTime() - before
+      check(peekI32(inst, 16) == 1, s"nevents=${peekI32(inst, 16)}")
+      check(elapsed < 10_000_000L,
+            s"elapsed=${elapsed}ns — past ABSTIME shouldn't sleep")
+    }
+
     test("path_unlink_file: open handle survives unlink (POSIX inode semantics)") {
       // Open a file, unlink it, then read from the still-open handle.
       // The handle keeps its own FileCell reference, so the bytes are
@@ -2239,6 +2424,81 @@ object WasiFsTests:
     inst.invoke("store_i32", Seq(I32(addr), I32(v))) match
       case Right(_) => ()
       case other    => throw new AssertionError(s"store_i32($addr, $v): $other")
+
+  /** Plant a little-endian i64 at `addr`. poll_oneoff tests use this to
+    * stamp `userdata` (u64) and clock-subscription `timeout`/`precision`
+    * fields directly into linear memory. */
+  private def storeI64(inst: ModuleInstance, addr: Int, v: Long): Unit =
+    inst.invoke("store_i64", Seq(I32(addr), I64(v))) match
+      case Right(_) => ()
+      case other    => throw new AssertionError(s"store_i64($addr, $v): $other")
+
+  /** Build one wasi-preview1 CLOCK subscription record (48 bytes) into
+    * linear memory at `base`. Zero-fills the whole window first so prior
+    * test scratch can't leak into unused union slots. */
+  private def buildClockSub(inst:     ModuleInstance,
+                            base:     Int,
+                            userdata: Long,
+                            clockId:  Int,
+                            timeout:  Long,
+                            absTime:  Boolean): Unit =
+    var i = 0
+    while i < 48 do
+      runOk(inst.invoke("store_byte", Seq(I32(base + i), I32(0))))
+      i += 1
+    storeI64(inst, base,          userdata)
+    runOk(inst.invoke("store_byte", Seq(I32(base + 8), I32(0))))  // eventtype = CLOCK
+    storeI32(inst, base + 16,     clockId)
+    storeI64(inst, base + 24,     timeout)
+    storeI64(inst, base + 32,     0L)                              // precision (ignored)
+    runOk(inst.invoke("store_byte",
+                      Seq(I32(base + 40), I32(if absTime then 1 else 0))))
+    runOk(inst.invoke("store_byte", Seq(I32(base + 41), I32(0))))
+
+  /** Build one wasi-preview1 FD_READ / FD_WRITE subscription record
+    * (48 bytes) into linear memory at `base`. `eventtype` is 1 for
+    * FD_READ, 2 for FD_WRITE — caller's choice. */
+  private def buildFdSub(inst:      ModuleInstance,
+                         base:      Int,
+                         userdata:  Long,
+                         eventtype: Int,
+                         fd:        Int): Unit =
+    var i = 0
+    while i < 48 do
+      runOk(inst.invoke("store_byte", Seq(I32(base + i), I32(0))))
+      i += 1
+    storeI64(inst, base,          userdata)
+    runOk(inst.invoke("store_byte", Seq(I32(base + 8), I32(eventtype))))
+    storeI32(inst, base + 16,     fd)
+
+  /** Snapshot of a 32-byte wasi event for assertion convenience. Mirrors
+    * `Wasi.writeEvent`'s field layout: u64 userdata, u16 error, u8 type,
+    * u64 nbytes. We skip the trailing eventrwflags (always 0 in the
+    * shim). */
+  private final case class Event(userdata: Long, error: Int,
+                                 eventtype: Int, nbytes: Long)
+
+  /** Decode one 32-byte event record from linear memory at `base` into
+    * an [[Event]]. */
+  private def readEvent(inst: ModuleInstance, base: Int): Event =
+    val userdata  = peekI64(inst, base)
+    val errLo     = loadByte(inst, base + 8)
+    val errHi     = loadByte(inst, base + 9)
+    val error     = errLo | (errHi << 8)
+    val eventtype = loadByte(inst, base + 10)
+    val nbytes    = peekI64(inst, base + 16)
+    Event(userdata, error, eventtype, nbytes)
+
+  /** 4-arg `poll_oneoff` wrapper. `in`/`out` are linear-memory addresses
+    * of the subscription/event arrays; `nsubs` is the array length;
+    * `neventsOut` is where the host writes the actual event count. */
+  private def callPollOneoff(inst:       ModuleInstance,
+                             in:         Int,
+                             out:        Int,
+                             nsubs:      Int,
+                             neventsOut: Int) =
+    inst.invoke("call_poll_oneoff",
+                Seq(I32(in), I32(out), I32(nsubs), I32(neventsOut)))
 
   /** Read back a single unsigned byte. Returns Int because the fixture's
     * `load_byte` is `i32.load8_u` (already zero-extended). */

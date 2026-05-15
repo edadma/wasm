@@ -60,6 +60,8 @@
     (func $path_create_directory (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_readdir"
     (func $fd_readdir (param i32 i32 i32 i64 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "poll_oneoff"
+    (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
 
   (memory 1)
   (export "memory" (memory 0))
@@ -246,6 +248,15 @@
     local.get $bufused_out
     call $fd_readdir)
 
+  (func (export "call_poll_oneoff")
+        (param $in i32) (param $out i32) (param $nsubs i32)
+        (param $nevents_out i32) (result i32)
+    local.get $in
+    local.get $out
+    local.get $nsubs
+    local.get $nevents_out
+    call $poll_oneoff)
+
   ;; store_byte lets tests poke path bytes / filler into memory.
   (func (export "store_byte") (param $addr i32) (param $b i32)
     local.get $addr
@@ -257,6 +268,12 @@
     local.get $addr
     local.get $v
     i32.store)
+
+  ;; store_i64 plants u64 fields (userdata, timeout, precision) for poll subs.
+  (func (export "store_i64") (param $addr i32) (param $v i64)
+    local.get $addr
+    local.get $v
+    i64.store)
 
   (func (export "load_byte") (param $addr i32) (result i32)
     local.get $addr

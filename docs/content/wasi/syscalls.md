@@ -1,10 +1,10 @@
 ---
 title: Syscalls
-summary: The 24 wasi_snapshot_preview1 host functions implemented, grouped by purpose.
+summary: The 25 wasi_snapshot_preview1 host functions implemented, grouped by purpose.
 weight: 10
 ---
 
-Twenty-four host functions are exposed under the module name `wasi_snapshot_preview1`. That's enough to run rustc-built `wasm32-wasip1` binaries that exercise stdin/stdout, command-line args, environment variables, the clock, randomness, and the filesystem (read, write, create, unlink, stat, readdir).
+Twenty-five host functions are exposed under the module name `wasi_snapshot_preview1`. That's enough to run rustc-built `wasm32-wasip1` binaries that exercise stdin/stdout, command-line args, environment variables, the clock, randomness, the filesystem (read, write, create, unlink, stat, readdir, rename, hard- and soft-link), and poll-style readiness waits — including the `sleep` codepath in most wasi runtimes.
 
 **Return shape:** every wasi-preview1 syscall returns a single `i32` errno (`0` for success; nonzero values from the wasi-preview1 errno list — `Wasi.ENOENT`, `Wasi.EBADF`, `Wasi.EFAULT`, …). Output data is delivered through pointers passed by the guest into its own linear memory; the host writes the bytes there, the guest reads them back. The "Seq(I32(errno))" shape you'd see from `inst.invoke` reflects that single-result calling convention — the data isn't *in* that Seq, it's in memory.
 
@@ -62,11 +62,16 @@ Twenty-four host functions are exposed under the module name `wasi_snapshot_prev
 | `path_readlink(fd, path, buf, buf_len, *bufused)`        | Reads a symlink's target into `buf`, truncating to `buf_len` bytes. `bufused` reports the actual byte count. `EINVAL` on non-symlinks. |
 | `fd_readdir(fd, buf, buf_len, cookie, *bytes_written)`   | Enumerates directory entries. Resumable via the `cookie` for buffers smaller than the listing. |
 
+## Polling
+
+| Syscall | Behaviour |
+|---|---|
+| `poll_oneoff(in, out, nsubs, *nevents)` | Wait for one of `nsubs` subscriptions to become ready. Subscriptions are 48-byte records (decoded fields `userdata`, `eventtype`, `clockid`/`fd`, `timeout`, `precision`, `flags`); events are 32-byte records (`userdata`, `error`, `eventtype`, `nbytes`). FD-read/FD-write subs on any valid fd report `ready` immediately (the InMemoryFs never blocks). CLOCK subs with `timeout = 0` or an ABSTIME target already in the past fire immediately; otherwise the host actually sleeps until the earliest deadline (`Thread.sleep` on JVM/Native, busy-spin fallback on Scala.js). EINVAL for invalid clock ids or unknown event types (per-event), EBADF for unknown fds (per-event); EFAULT only for bounds-violating pointer args. |
+
 ## What isn't here yet
 
 | Syscall | Status | Why |
 |---|---|---|
-| `poll_oneoff`                    | not implemented | No subscription handling yet — anything that polls falls back to ENOTSUP. |
 | `sock_*`                         | not implemented | wasi-preview1 sockets are a thin shim; the project is library-scoped, not server-scoped. |
 
 Programs that issue an unimplemented syscall get back `Wasi.ENOTSUP` (52), which is the spec-conformant "host doesn't support this".

@@ -327,6 +327,7 @@ object Wasi:
         "path_link"             -> ((mem, args) => pathLink(mem, args, ctx)),
         "path_symlink"          -> ((mem, args) => pathSymlink(mem, args, ctx)),
         "path_readlink"         -> ((mem, args) => pathReadlink(mem, args, ctx)),
+        "poll_oneoff"           -> ((mem, args) => pollOneoff(mem, args, ctx, fdTable)),
       )
 
   /** Invoke `entry` on a wasi-imports module and translate a
@@ -1032,6 +1033,225 @@ object Wasi:
     else if fd <= 2 then true
     else if fd - 3 < ctx.preopens.length then true
     else fdTable.lookup(fd).isDefined
+
+  /** `poll_oneoff(in: i32, out: i32, nsubs: i32, nevents_out: i32) -> errno`
+    *
+    * Wait until at least one of `nsubs` subscriptions is ready, then write
+    * the ready events into `out` and store the count at `nevents_out`. The
+    * subscription record is 48 bytes wide; the event record is 32 bytes. The
+    * layout matches wasi-preview1 witx (see header comments in `pollOneoff`'s
+    * decode/emit helpers for field offsets).
+    *
+    * Readiness model in this shim:
+    *
+    *   - **fd-read / fd-write** on a valid fd is *always* ready. The
+    *     InMemoryFs never blocks, and stdio in the host is synchronous.
+    *     Tests that need to assert "the program would have blocked here"
+    *     use a clock subscription instead.
+    *   - **fd-read / fd-write** on an unknown fd emits one event with
+    *     `error = EBADF` — wasi-libc programs hand that back as a
+    *     `select`/`poll` failure for that descriptor.
+    *   - **clock** subscriptions with a target time already in the past
+    *     (including `timeout = 0` in non-ABSTIME mode) fire immediately.
+    *     Otherwise the shim sleeps until the earliest pending target
+    *     and emits one event per CLOCK subscription whose target has
+    *     now arrived (which, given we slept to the earliest, is at
+    *     least one).
+    *
+    * The sleep uses `Thread.sleep` for the bulk wait and a tight loop on
+    * `clock.monotonicNanos()` for the final sub-millisecond. On Scala.js
+    * `Thread.sleep` throws — the try/catch falls through to a pure
+    * busy-spin, which is acceptable for the short timeouts test code
+    * uses. Programs that need precise multi-second timeouts on JS would
+    * plug a different `WasiContext.Clock` in and not rely on busy-spin.
+    *
+    * Errno discipline at the top level: ESUCCESS on every path that
+    * produced any event (even ones tagged with per-event errors).
+    * EFAULT only for bounds-violating pointer args; EINVAL only for
+    * a negative `nsubs`. */
+  private def pollOneoff(memory: Memory, args: Seq[Value],
+                         ctx: WasiContext, fdTable: FdTable): Seq[Value] =
+    args match
+      case Seq(I32(inPtr), I32(outPtr), I32(nsubs), I32(neventsOutPtr)) =>
+        val data    = memory.data
+        val dataLen = data.length
+
+        if nsubs < 0 then return Seq(I32(EINVAL))
+        val inEnd  = inPtr.toLong  + nsubs.toLong * 48L
+        val outEnd = outPtr.toLong + nsubs.toLong * 32L
+        if inPtr < 0 || outPtr < 0 || neventsOutPtr < 0 ||
+           inEnd > dataLen || outEnd > dataLen ||
+           neventsOutPtr.toLong + 4L > dataLen
+        then return Seq(I32(EFAULT))
+
+        if nsubs == 0 then
+          writeI32LE(data, neventsOutPtr, 0)
+          return Seq(I32(ESUCCESS))
+
+        // Pass 1: emit immediately-ready events (all valid FD subs +
+        // CLOCK subs whose target is already in the past). For CLOCK
+        // subs that need to wait, cache the monotonic deadline in a
+        // parallel array indexed by subIdx; Pass 2 sleeps to the
+        // earliest and emits events for every entry whose deadline has
+        // now arrived. Long.MinValue marks "no pending CLOCK" so we
+        // can distinguish from a real deadline of 0.
+        var nFired              = 0
+        var earliestSleepTarget = Long.MaxValue   // monotonic-ns absolute
+        val pendingClockDeadline = new Array[Long](nsubs)
+        val pendingClockUserdata = new Array[Long](nsubs)
+        var pp = 0
+        while pp < nsubs do
+          pendingClockDeadline(pp) = Long.MinValue
+          pp += 1
+        var subIdx              = 0
+        while subIdx < nsubs do
+          val subBase   = inPtr + subIdx * 48
+          val userdata  = readI64LE(data, subBase)
+          val eventtype = data(subBase + 8) & 0xff
+          eventtype match
+            case 0 =>
+              // CLOCK: clockid u32 @+16, timeout u64 @+24, precision u64
+              // @+32, flags u16 @+40. Flag bit 0 = ABSTIME (timeout is
+              // an absolute timestamp in the chosen clock's epoch).
+              val clockId = readI32LE(data, subBase + 16)
+              val timeout = readI64LE(data, subBase + 24)
+              val flags   = (data(subBase + 40) & 0xff) |
+                            ((data(subBase + 41) & 0xff) << 8)
+              val absTime = (flags & 0x1) != 0
+
+              val nowNanos = clockId match
+                case 0         => ctx.clock.realtimeNanos()
+                case 1 | 2 | 3 => ctx.clock.monotonicNanos()
+                case _         => Long.MinValue   // sentinel for EINVAL
+
+              if nowNanos == Long.MinValue then
+                writeEvent(data, outPtr + nFired * 32, userdata,
+                           EINVAL, 0, 0L)
+                nFired += 1
+              else
+                val target =
+                  if absTime then timeout
+                  else nowNanos + timeout
+                if target <= nowNanos then
+                  writeEvent(data, outPtr + nFired * 32, userdata,
+                             ESUCCESS, 0, 0L)
+                  nFired += 1
+                else
+                  // Translate target into a monotonic deadline so all
+                  // subscriptions race against the same timebase.
+                  val monoNow      = ctx.clock.monotonicNanos()
+                  val monoDeadline = monoNow + (target - nowNanos)
+                  pendingClockDeadline(subIdx) = monoDeadline
+                  pendingClockUserdata(subIdx) = userdata
+                  if monoDeadline < earliestSleepTarget then
+                    earliestSleepTarget = monoDeadline
+
+            case 1 | 2 =>
+              // FD_READ / FD_WRITE: fd u32 @+16.
+              val fd = readI32LE(data, subBase + 16)
+              if isValidFd(fd, ctx, fdTable) then
+                val nbytes: Long = eventtype match
+                  case 1 =>   // FD_READ — bytes available
+                    lookupFileEntry(fd, ctx, fdTable) match
+                      case Some(e) =>
+                        val rem = e.file.size - e.file.tell
+                        if rem < 0 then 0L else rem
+                      case None =>
+                        if fd == 0 then 1L else 0L
+                  case _ =>   // FD_WRITE — buffer space available
+                    1024L * 1024L
+                writeEvent(data, outPtr + nFired * 32, userdata,
+                           ESUCCESS, eventtype, nbytes)
+                nFired += 1
+              else
+                writeEvent(data, outPtr + nFired * 32, userdata,
+                           EBADF, eventtype, 0L)
+                nFired += 1
+
+            case _ =>
+              writeEvent(data, outPtr + nFired * 32, userdata,
+                         EINVAL, eventtype, 0L)
+              nFired += 1
+          subIdx += 1
+
+        // Pass 2: if nothing fired and there's at least one pending
+        // CLOCK, sleep to the earliest cached deadline and emit one
+        // event per CLOCK whose deadline has now passed. Sleeping to
+        // `earliestSleepTarget` guarantees at least one will fire;
+        // others fire too if they share or under-price that deadline.
+        if nFired == 0 && earliestSleepTarget != Long.MaxValue then
+          sleepUntilMonotonic(earliestSleepTarget, ctx.clock)
+          val monoAfter = ctx.clock.monotonicNanos()
+          subIdx = 0
+          while subIdx < nsubs do
+            val deadline = pendingClockDeadline(subIdx)
+            if deadline != Long.MinValue && deadline <= monoAfter then
+              writeEvent(data, outPtr + nFired * 32,
+                         pendingClockUserdata(subIdx),
+                         ESUCCESS, 0, 0L)
+              nFired += 1
+            subIdx += 1
+
+        writeI32LE(data, neventsOutPtr, nFired)
+        Seq(I32(ESUCCESS))
+      case _ => Seq(I32(EINVAL))
+
+  /** Write one 32-byte wasi event record at `base`. Layout:
+    *
+    *   - 0..7  : u64 userdata (echoed back from the subscription)
+    *   - 8..9  : u16 error    (per-event errno, 0 = ready)
+    *   - 10    : u8  type     (EVENTTYPE_CLOCK/FD_READ/FD_WRITE)
+    *   - 11..15: padding
+    *   - 16..23: u64 nbytes   (FD_READ: bytes available; FD_WRITE: buffer
+    *                           space; CLOCK: 0)
+    *   - 24..25: u16 flags    (eventrwflags — zero in this shim; we don't
+    *                           track RDHUP / HANGUP)
+    *   - 26..31: padding
+    *
+    * Callers should already have bounds-checked `base..base+32` against
+    * memory length. */
+  private inline def writeEvent(data: Array[Byte], base: Int,
+                                userdata: Long, error: Int,
+                                eventtype: Int, nbytes: Long): Unit =
+    writeI64LE(data, base,      userdata)
+    writeI16LE(data, base + 8,  error)
+    data(base + 10) = eventtype.toByte
+    data(base + 11) = 0
+    data(base + 12) = 0
+    data(base + 13) = 0
+    data(base + 14) = 0
+    data(base + 15) = 0
+    writeI64LE(data, base + 16, nbytes)
+    writeI16LE(data, base + 24, 0)
+    data(base + 26) = 0
+    data(base + 27) = 0
+    data(base + 28) = 0
+    data(base + 29) = 0
+    data(base + 30) = 0
+    data(base + 31) = 0
+
+  /** Block the host thread until `clock.monotonicNanos()` reaches
+    * `target`. Uses `Thread.sleep` for the bulk wait and busy-spins the
+    * final fragment, so sub-millisecond targets stay reasonably tight.
+    *
+    * `Thread.sleep` throws on Scala.js (synchronous sleep isn't possible
+    * there); the try/catch swallows that and falls through to a pure
+    * busy-spin. That's fine for short timeouts and acceptable for tests;
+    * production JS code that needs long timeouts plugs a different
+    * `WasiContext.Clock` in and arranges its own scheduling. */
+  private def sleepUntilMonotonic(target: Long,
+                                  clock: WasiContext.Clock): Unit =
+    var keepGoing = true
+    while keepGoing do
+      val now       = clock.monotonicNanos()
+      val remaining = target - now
+      if remaining <= 0L then
+        keepGoing = false
+      else
+        val remainingMs = remaining / 1_000_000L
+        if remainingMs >= 2L then
+          try Thread.sleep(math.min(remainingMs - 1L, 100L))
+          catch case _: Throwable => ()
 
   // === path_filestat_get ====================================================
 
@@ -1762,11 +1982,25 @@ object Wasi:
     ((data(offset + 2) & 0xff) << 16) |
     ((data(offset + 3) & 0xff) << 24)
 
+  private inline def readI64LE(data: Array[Byte], offset: Int): Long =
+    (data(offset    ) & 0xffL)        |
+    ((data(offset + 1) & 0xffL) <<  8) |
+    ((data(offset + 2) & 0xffL) << 16) |
+    ((data(offset + 3) & 0xffL) << 24) |
+    ((data(offset + 4) & 0xffL) << 32) |
+    ((data(offset + 5) & 0xffL) << 40) |
+    ((data(offset + 6) & 0xffL) << 48) |
+    ((data(offset + 7) & 0xffL) << 56)
+
   private inline def writeI32LE(data: Array[Byte], offset: Int, v: Int): Unit =
     data(offset    ) =  (v         & 0xff).toByte
     data(offset + 1) = ((v >>>  8) & 0xff).toByte
     data(offset + 2) = ((v >>> 16) & 0xff).toByte
     data(offset + 3) = ((v >>> 24) & 0xff).toByte
+
+  private inline def writeI16LE(data: Array[Byte], offset: Int, v: Int): Unit =
+    data(offset    ) =  (v         & 0xff).toByte
+    data(offset + 1) = ((v >>>  8) & 0xff).toByte
 
   private inline def writeI64LE(data: Array[Byte], offset: Int, v: Long): Unit =
     data(offset    ) =  (v         & 0xffL).toByte
@@ -2060,6 +2294,12 @@ object WasiContext:
             // preopens carry the "directory fd" role today, and
             // fd_readdir runs against those. Userspace gets EISDIR.
             Left(Wasi.EISDIR)
+          case Some(SymlinkEntry(_)) =>
+            // Path resolves to a symlink. The shim doesn't follow
+            // symlinks during path resolution (path_readlink is the
+            // only way to inspect them), so opening one through
+            // path_open is treated as "the target doesn't exist".
+            Left(Wasi.ENOENT)
           case None =>
             // Missing — CREAT-or-fail. If CREAT+DIRECTORY both set,
             // userspace is asking to create a directory through
