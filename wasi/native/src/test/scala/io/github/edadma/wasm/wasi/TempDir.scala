@@ -1,6 +1,6 @@
 package io.github.edadma.wasm.wasi
 
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.nio.file.{Files, Paths, StandardOpenOption}
 import java.util.Comparator
 
 /** Per-platform temp-dir helper used by [[WasiHostFsTests]] to spin up
@@ -38,7 +38,7 @@ object TempDir:
     * separators (`/` works on Unix and most Java NIO paths). */
   def writeFile(dir: String, rel: String, bytes: Array[Byte]): Unit =
     val p = Paths.get(dir).resolve(rel)
-    Files.write(p, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+    val _ = Files.write(p, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
 
   /** Read `dir/rel` as bytes. Throws if the file doesn't exist. */
   def readFile(dir: String, rel: String): Array[Byte] =
@@ -59,4 +59,4 @@ object TempDir:
   /** Create a sub-directory under `dir/rel`. Parents must already exist
     * (this helper is for explicit per-test seeding, not nested mkdir). */
   def mkdir(dir: String, rel: String): Unit =
-    Files.createDirectory(Paths.get(dir).resolve(rel))
+    val _ = Files.createDirectory(Paths.get(dir).resolve(rel))

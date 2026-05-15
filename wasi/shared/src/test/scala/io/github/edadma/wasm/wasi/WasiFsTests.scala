@@ -2,7 +2,7 @@ package io.github.edadma.wasm.wasi
 
 import io.github.edadma.wasm.{I32, I64, ModuleInstance}
 
-import WasiTestSupport.{check, instantiate, test}
+import WasiTestSupport.{check, instantiate, runOk, test}
 
 /** Filesystem-syscall tests — covers Phases 7.E.1 + 7.E.2 + 7.E.3 +
   * 7.E.4 + 7.F:
@@ -328,12 +328,12 @@ object WasiFsTests:
                                   preopens = Seq(Preopen.inMemory("/s", files)))
       val out = 64
       storePath(inst, 0, "a")
-      callPathOpen(inst, 3, 0, 1, out)
+      runOk(callPathOpen(inst, 3, 0, 1, out))
       val fdA = peekI32(inst, out)
       check(fdA == 4, s"first open fd=$fdA (want 4)")
 
       storePath(inst, 0, "b")
-      callPathOpen(inst, 3, 0, 1, out)
+      runOk(callPathOpen(inst, 3, 0, 1, out))
       val fdB = peekI32(inst, out)
       check(fdB == 5, s"second open fd=$fdB (want 5)")
 
@@ -342,7 +342,7 @@ object WasiFsTests:
         case other              => check(false, s"call_fd_close: $other")
 
       storePath(inst, 0, "a")
-      callPathOpen(inst, 3, 0, 1, out)
+      runOk(callPathOpen(inst, 3, 0, 1, out))
       val fdAagain = peekI32(inst, out)
       check(fdAagain == 4,
             s"reopen fd=$fdAagain (want 4 — smallest free, not 6)")
@@ -353,7 +353,7 @@ object WasiFsTests:
       val (inst, _) = instantiate(WasiFixtures.wasi_path_open,
                                   preopens = Seq(Preopen.inMemory("/s", files)))
       storePath(inst, 0, "a")
-      callPathOpen(inst, 3, 0, 1, 64)
+      runOk(callPathOpen(inst, 3, 0, 1, 64))
       val fd = peekI32(inst, 64)
       check(fd == 4, s"opened fd=$fd")
       inst.invoke("call_fd_close", Seq(I32(fd))) match
@@ -469,7 +469,7 @@ object WasiFsTests:
 
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 16)
-      callFdRead(inst, 4, 256, 1, 320)
+      runOk(callFdRead(inst, 4, 256, 1, 320))
       check(peekI32(inst, 320) == 2, "first read drains 2 bytes")
 
       // Re-issue. nread must be 0; the dst buffer's first byte must
@@ -548,10 +548,10 @@ object WasiFsTests:
       val files = Map("h" -> "0123456789".getBytes("UTF-8"))
       val (inst, _) = openSingleFile(files, "h")
 
-      callFdSeek(inst, 4, 4L, 0, 320)
+      runOk(callFdSeek(inst, 4, 4L, 0, 320))
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 3)
-      callFdRead(inst, 4, 256, 1, 320)
+      runOk(callFdRead(inst, 4, 256, 1, 320))
       check(peekI32(inst, 320) == 3, "read 3 bytes from offset 4")
       val got = new String(readBytes(inst, 768, 3), "UTF-8")
       check(got == "456", s"bytes='$got' (want '456')")
@@ -569,7 +569,7 @@ object WasiFsTests:
 
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 4)
-      callFdRead(inst, 4, 256, 1, 320)
+      runOk(callFdRead(inst, 4, 256, 1, 320))
       check(peekI32(inst, 320) == 0, "read past EOF returns 0")
     }
 
@@ -882,7 +882,7 @@ object WasiFsTests:
       val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
                                   preopens = Seq(preopen))
       val fd = openWithFlags(inst, "f", oflags = 0)
-      callFdSeek(inst, fd, 8L, 0, 320)
+      runOk(callFdSeek(inst, fd, 8L, 0, 320))
       storeBytes(inst, 768, Array[Byte]('X', 'Y'))
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 2)
@@ -903,11 +903,11 @@ object WasiFsTests:
       val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
                                   preopens = Seq(preopen))
       val fd = openWithFlags(inst, "f", oflags = 0)
-      callFdSeek(inst, fd, 2L, 0, 320)
+      runOk(callFdSeek(inst, fd, 2L, 0, 320))
       storeBytes(inst, 768, "XY".getBytes("UTF-8"))
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 2)
-      callFdWrite(inst, fd, 256, 1, 320)
+      runOk(callFdWrite(inst, fd, 256, 1, 320))
       val bytes = preopen.bytesOf("f").getOrElse(Array.emptyByteArray)
       check(new String(bytes, "UTF-8") == "abXYef",
             s"file='${new String(bytes, "UTF-8")}' (want 'abXYef')")
@@ -922,13 +922,13 @@ object WasiFsTests:
       storeBytes(inst, 768, payload)
       storeI32(inst, 256, 768)
       storeI32(inst, 260, payload.length)
-      callFdWrite(inst, fd, 256, 1, 320)
+      runOk(callFdWrite(inst, fd, 256, 1, 320))
 
       // Seek back to start, read into a fresh region.
-      callFdSeek(inst, fd, 0L, 0, 320)
+      runOk(callFdSeek(inst, fd, 0L, 0, 320))
       storeI32(inst, 256, 832)
       storeI32(inst, 260, payload.length)
-      callFdRead(inst, fd, 256, 1, 320)
+      runOk(callFdRead(inst, fd, 256, 1, 320))
       check(peekI32(inst, 320) == payload.length,
             s"nread=${peekI32(inst, 320)}")
       val got = readBytes(inst, 832, payload.length)
@@ -1773,7 +1773,7 @@ object WasiFsTests:
                                 pathLen:     Int,
                                 oflags:      Int,
                                 fdflags:     Int = 0,
-                                openedFdOut: Int = 64) =
+                                openedFdOut: Int) =
     inst.invoke("call_path_open", Seq(
       I32(dirfd),
       I32(0),

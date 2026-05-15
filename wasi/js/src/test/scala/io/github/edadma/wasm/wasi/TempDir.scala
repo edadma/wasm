@@ -27,7 +27,7 @@ object TempDir:
 
   def remove(path: String): Unit =
     val opts = js.Dynamic.literal(recursive = true, force = true)
-    try fs.rmSync(path, opts) catch case _: Throwable => ()
+    try { val _ = fs.rmSync(path, opts) } catch case _: Throwable => ()
 
   def writeFile(dir: String, rel: String, bytes: Array[Byte]): Unit =
     val p   = path.join(dir, rel).asInstanceOf[String]
@@ -36,7 +36,7 @@ object TempDir:
     while i < bytes.length do
       arr(i) = (bytes(i) & 0xff).toShort
       i += 1
-    fs.writeFileSync(p, arr)
+    val _ = fs.writeFileSync(p, arr)
 
   def readFile(dir: String, rel: String): Array[Byte] =
     val p   = path.join(dir, rel).asInstanceOf[String]
@@ -62,4 +62,4 @@ object TempDir:
       fs.statSync(path.join(dir, rel)).isFile().asInstanceOf[Boolean]
 
   def mkdir(dir: String, rel: String): Unit =
-    fs.mkdirSync(path.join(dir, rel))
+    val _ = fs.mkdirSync(path.join(dir, rel))

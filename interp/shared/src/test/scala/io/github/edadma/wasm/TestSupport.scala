@@ -37,6 +37,14 @@ object TestSupport:
     case Right(a)  => a
     case Left(err) => throw new AssertionError(s"unexpected error: $err")
 
+  /** Same as [[runRight]] but discards the success value. Use this when
+    * a test only cares that an invocation succeeded — the Seq[Value] /
+    * Unit result would otherwise trip -Wnonunit-statement at call sites
+    * that just want the side-effect (global mutation, memory write). */
+  def runOk[A](e: Either[WasmError, A]): Unit = e match
+    case Right(_)  => ()
+    case Left(err) => throw new AssertionError(s"unexpected error: $err")
+
   // === Instantiation + invocation helpers =================================
 
   def instantiate(bytes: Array[Byte], env: HostModule = EnvModule.default): ModuleInstance =

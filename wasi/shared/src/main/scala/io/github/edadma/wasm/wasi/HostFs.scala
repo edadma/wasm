@@ -136,7 +136,7 @@ private[wasi] final class HostBackedPreopen(
     fs:       HostFs,
 ) extends WasiContext.Preopen:
 
-  import HostFs.{Stat, File => HostFile, Dir => HostDir, Handle}
+  import HostFs.{File => HostFile, Dir => HostDir}
 
   // OFLAGS bit positions per wasi-preview1. Mirrors the constants in
   // `WasiContext.Preopen` — duplicated here because those are private

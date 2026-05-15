@@ -125,7 +125,7 @@ object HostPreopen:
 
     override def truncate(rel: String): Either[Int, Unit] =
       try
-        fs.truncateSync(join(rel), 0)
+        val _ = fs.truncateSync(join(rel), 0)
         Right(())
       catch case e: js.JavaScriptException => Left(errnoOf(jsCode(e)))
 
@@ -148,13 +148,13 @@ object HostPreopen:
 
     override def mkdir(rel: String): Either[Int, Unit] =
       try
-        fs.mkdirSync(join(rel))
+        val _ = fs.mkdirSync(join(rel))
         Right(())
       catch case e: js.JavaScriptException => Left(errnoOf(jsCode(e)))
 
     override def unlinkFile(rel: String): Either[Int, Unit] =
       try
-        fs.unlinkSync(join(rel))
+        val _ = fs.unlinkSync(join(rel))
         Right(())
       catch case e: js.JavaScriptException => Left(errnoOf(jsCode(e)))
 
@@ -170,7 +170,7 @@ object HostPreopen:
     override def close(): Unit =
       if !closed then
         closed = true
-        try fs.closeSync(fd) catch case _: js.JavaScriptException => ()
+        try { val _ = fs.closeSync(fd) } catch case _: js.JavaScriptException => ()
 
     override def read(dst: Array[Byte], off: Int, len: Int, pos: Long): Int =
       // Allocate a Buffer of exactly `len`, hand to fs.readSync, then
@@ -192,7 +192,7 @@ object HostPreopen:
       val buf = g.Buffer.alloc(len).asInstanceOf[js.Dynamic]
       var i   = 0
       while i < len do
-        buf.applyDynamic("writeInt8")(src(off + i).toInt, i)
+        val _ = buf.applyDynamic("writeInt8")(src(off + i).toInt, i)
         i += 1
       fs.writeSync(fd, buf, 0, len, pos.toDouble).asInstanceOf[Int]
 

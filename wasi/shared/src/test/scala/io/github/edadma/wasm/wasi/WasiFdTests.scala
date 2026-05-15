@@ -2,7 +2,7 @@ package io.github.edadma.wasm.wasi
 
 import io.github.edadma.wasm.{I32, WasmError}
 
-import WasiTestSupport.{check, instantiate, test}
+import WasiTestSupport.{check, instantiate, runOk, test}
 
 /** fd_write, fd_close, proc_exit + the `Wasi.run` runner. Phase 7.A
   * shipped the fd_write surface (success / EBADF / EFAULT, multi-iovec,
@@ -115,8 +115,8 @@ object WasiFdTests:
     test("fd_write: EFAULT when an iovec's buffer extends past memory end") {
       val (inst, collecting) = instantiate(WasiFixtures.wasi_passthrough)
       // iovec[0] = { buf=65000, buf_len=1000 } → end is 66000 > 65536
-      inst.invoke("write_i32", Seq(I32(0), I32(65000)))
-      inst.invoke("write_i32", Seq(I32(4), I32(1000)))
+      runOk(inst.invoke("write_i32", Seq(I32(0), I32(65000))))
+      runOk(inst.invoke("write_i32", Seq(I32(4), I32(1000))))
       inst.invoke("fd_write_raw",
                   Seq(I32(1), I32(0), I32(1), I32(16))) match
         case Right(Seq(I32(errno))) =>
@@ -129,9 +129,9 @@ object WasiFdTests:
     test("fd_write: EFAULT when nwritten pointer is past memory end") {
       val (inst, collecting) = instantiate(WasiFixtures.wasi_passthrough)
       // Valid iovec { buf=8, buf_len=1 } and byte at addr 8; corrupt nwritten.
-      inst.invoke("write_byte", Seq(I32(8), I32(0x21))) // '!'
-      inst.invoke("write_i32",  Seq(I32(0), I32(8)))
-      inst.invoke("write_i32",  Seq(I32(4), I32(1)))
+      runOk(inst.invoke("write_byte", Seq(I32(8), I32(0x21)))) // '!'
+      runOk(inst.invoke("write_i32",  Seq(I32(0), I32(8))))
+      runOk(inst.invoke("write_i32",  Seq(I32(4), I32(1))))
       inst.invoke("fd_write_raw",
                   Seq(I32(1), I32(0), I32(1), I32(70000))) match
         case Right(Seq(I32(errno))) =>

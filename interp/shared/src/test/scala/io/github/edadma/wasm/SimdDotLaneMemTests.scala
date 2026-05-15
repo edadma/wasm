@@ -181,7 +181,7 @@ object SimdDotLaneMemTests:
 
       val src = b16(0xab, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
                     0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01)
-      runRight(inst.invoke("store8_lane_0", Seq(I32(601), V128(src))))
+      runOk(inst.invoke("store8_lane_0", Seq(I32(601), V128(src))))
       check(mem.data(600) == 0x77.toByte, s"byte 600 changed: ${mem.data(600)}")
       check(mem.data(601) == 0xab.toByte, s"byte 601: ${mem.data(601)} != 0xab")
       check(mem.data(602) == 0x77.toByte, s"byte 602 changed: ${mem.data(602)}")
@@ -195,7 +195,7 @@ object SimdDotLaneMemTests:
 
       val src = b16(0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
                     0x90, 0xa0, 0xb0, 0xc0, 0xef, 0xbe, 0xad, 0xde)
-      runRight(inst.invoke("store32_lane_3", Seq(I32(701), V128(src))))
+      runOk(inst.invoke("store32_lane_3", Seq(I32(701), V128(src))))
       check(mem.data(700) == 0x77.toByte, s"byte 700 changed: ${mem.data(700)}")
       check(mem.data(701) == 0xef.toByte, s"byte 701: ${mem.data(701)}")
       check(mem.data(702) == 0xbe.toByte, s"byte 702: ${mem.data(702)}")
@@ -210,7 +210,7 @@ object SimdDotLaneMemTests:
 
       val src = b16(0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
                     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
-      runRight(inst.invoke("store64_lane_1", Seq(I32(800), V128(src))))
+      runOk(inst.invoke("store64_lane_1", Seq(I32(800), V128(src))))
       val actual = mem.data.slice(800, 808)
       val expected = Array[Byte](0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
       check(bytesEq(actual, expected), s"store64_lane_1: ${actual.mkString(",")}")
@@ -229,8 +229,8 @@ object SimdDotLaneMemTests:
       val src = b16(0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
                     0xfe, 0xed, 0xfa, 0xce, 0xba, 0xad, 0xf0, 0x0d)
 
-      runRight(inst.invoke("store32_lane_0", Seq(I32(900),  V128(src))))
-      runRight(inst.invoke("store32_lane_3", Seq(I32(912),  V128(src))))
+      runOk(inst.invoke("store32_lane_0", Seq(I32(900),  V128(src))))
+      runOk(inst.invoke("store32_lane_3", Seq(I32(912),  V128(src))))
 
       val readBack = callV128(inst, "load_at", I32(900))
       // Lanes 0 (bytes 0..3) and 3 (bytes 12..15) of src made it into the

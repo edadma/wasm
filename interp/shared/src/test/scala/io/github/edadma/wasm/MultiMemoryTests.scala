@@ -111,8 +111,10 @@ object MultiMemoryTests:
     test("memory.copy within mem0 — overlapping forward") {
       val inst = instantiate(Fixtures.multi_memory)
       // Seed mem0[200..203] = 1,2,3,4.
-      inst.invoke("store8_m0", Seq(I32(200), I32(1))); inst.invoke("store8_m0", Seq(I32(201), I32(2)))
-      inst.invoke("store8_m0", Seq(I32(202), I32(3))); inst.invoke("store8_m0", Seq(I32(203), I32(4)))
+      runOk(inst.invoke("store8_m0", Seq(I32(200), I32(1))))
+      runOk(inst.invoke("store8_m0", Seq(I32(201), I32(2))))
+      runOk(inst.invoke("store8_m0", Seq(I32(202), I32(3))))
+      runOk(inst.invoke("store8_m0", Seq(I32(203), I32(4))))
       // Copy 200..203 → 202..205 (overlapping forward).
       inst.invoke("copy_within_m0", Seq(I32(202), I32(200), I32(4))) match
         case Right(Seq()) => ()
@@ -124,10 +126,10 @@ object MultiMemoryTests:
     test("memory.copy mem0 → mem1") {
       val inst = instantiate(Fixtures.multi_memory)
       // Seed mem0[50..53] = 'X','Y','Z','W'.
-      inst.invoke("store8_m0", Seq(I32(50), I32('X'.toInt)))
-      inst.invoke("store8_m0", Seq(I32(51), I32('Y'.toInt)))
-      inst.invoke("store8_m0", Seq(I32(52), I32('Z'.toInt)))
-      inst.invoke("store8_m0", Seq(I32(53), I32('W'.toInt)))
+      runOk(inst.invoke("store8_m0", Seq(I32(50), I32('X'.toInt))))
+      runOk(inst.invoke("store8_m0", Seq(I32(51), I32('Y'.toInt))))
+      runOk(inst.invoke("store8_m0", Seq(I32(52), I32('Z'.toInt))))
+      runOk(inst.invoke("store8_m0", Seq(I32(53), I32('W'.toInt))))
       // Copy 4 bytes from mem0[50..] to mem1[100..].
       inst.invoke("copy_m0_to_m1", Seq(I32(100), I32(50), I32(4))) match
         case Right(Seq()) => ()

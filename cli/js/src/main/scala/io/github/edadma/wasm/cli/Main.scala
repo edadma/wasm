@@ -26,7 +26,7 @@ object Main:
       out
 
     def exit(code: Int): Nothing =
-      g.process.exit(code)
+      val _ = g.process.exit(code)
       throw new RuntimeException("unreachable after process.exit")
 
     def openPreopen(hostPath: String, virtualName: String): WasiContext.Preopen =
