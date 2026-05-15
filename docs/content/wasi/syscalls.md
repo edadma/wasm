@@ -4,7 +4,9 @@ summary: The 24 wasi_snapshot_preview1 host functions implemented, grouped by pu
 weight: 10
 ---
 
-Twenty-four host functions are exposed under the module name `wasi_snapshot_preview1`. That's enough to run rustc-built `wasm32-wasip1` binaries that exercise stdin/stdout, command-line args, environment variables, the clock, randomness, and the filesystem (read, write, create, unlink, stat, readdir). Every syscall returns a `Seq(I32(errno))` value; nonzero errnos come from the wasi-preview1 list (`Wasi.ENOENT`, `Wasi.EBADF`, etc.).
+Twenty-four host functions are exposed under the module name `wasi_snapshot_preview1`. That's enough to run rustc-built `wasm32-wasip1` binaries that exercise stdin/stdout, command-line args, environment variables, the clock, randomness, and the filesystem (read, write, create, unlink, stat, readdir).
+
+**Return shape:** every wasi-preview1 syscall returns a single `i32` errno (`0` for success; nonzero values from the wasi-preview1 errno list — `Wasi.ENOENT`, `Wasi.EBADF`, `Wasi.EFAULT`, …). Output data is delivered through pointers passed by the guest into its own linear memory; the host writes the bytes there, the guest reads them back. The "Seq(I32(errno))" shape you'd see from `inst.invoke` reflects that single-result calling convention — the data isn't *in* that Seq, it's in memory.
 
 ## Process
 

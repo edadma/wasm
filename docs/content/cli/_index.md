@@ -6,6 +6,28 @@ weight: 40
 
 The `cli/` sub-project builds a small wrapper around the interpreter and the WASI shim. Use it when you want to run a `.wasm` module from a shell — for quick experiments, for CI smoke tests against rustc-built binaries, or as a starting point for a longer-lived launcher.
 
+## First run
+
+The committed `examples/hello.wasm` is a hand-written WAT fixture that calls `env.putchar` to print `Hello, world!`. From a checkout of this repo:
+
+```bash
+sbt 'cliJVM/run examples/hello.wasm'
+# Hello, world!
+```
+
+For a real rustc-built WASI binary, you'll need to give it a host directory to read from via `--preopen`:
+
+```bash
+mkdir -p /tmp/sandbox
+echo "Hello from the host" > /tmp/sandbox/hello.txt
+
+sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
+                wasi/shared/src/test/resources/fixtures/real_rust_fileread.wasm'
+# Hello from the host
+```
+
+## Help output
+
 ```text
 $ wasm --help
 wasm 0.1.1
