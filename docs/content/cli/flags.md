@@ -47,7 +47,7 @@ If a `--preopen`'s host path doesn't exist or isn't a directory, the CLI exits w
 
 ## `--help` / `--version`
 
-Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.0.1` and exits.
+Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.1.1` and exits.
 
 ## Dispatch rules
 

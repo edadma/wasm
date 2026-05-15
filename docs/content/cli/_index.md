@@ -8,7 +8,7 @@ The `cli/` sub-project builds a small wrapper around the interpreter and the WAS
 
 ```text
 $ wasm --help
-wasm 0.0.1
+wasm 0.1.1
 Usage: wasm [options] <file>
 
   <file>                                       path to a .wasm module

@@ -1,14 +1,32 @@
 ---
 title: Installation
-summary: Add the library as an sbt dependency once it lands on Maven Central, or build from source today.
+summary: Add `io.github.edadma:wasm:0.1.1` (and optionally `wasm-wasi`) to your sbt build, or work from a local checkout for development.
 weight: 10
 ---
 
-## Status
+## Maven Central
 
-The `interp` and `wasi` libraries are designed to publish to Maven Central as `io.github.edadma:wasm` and `io.github.edadma:wasm-wasi`, but no release has been cut yet — the project is wrapping up the pre-release phase now that Phase 8.E SIMD is complete. Bulk-memory remainder, non-trapping float-to-int, reference types (including typed `select t*`), multi-memory (with the `HostFuncMulti` surface for hosts that need memidx > 0), and the **full SIMD proposal** (`V128` value type, `v128.const`, every load/store including `load*_lane` / `store*_lane`, full lane access, integer + float arithmetic, shifts, min/max, bitwise + reductions, comparisons, narrow/extend/extadd_pairwise/extmul, float-int conversions, demote/promote, and `i32x4.dot_i16x8_s`) are all shipped. The from-source path below is the supported way to use it today; the next release after this is the cut to Maven Central.
+Released artifacts (Scala 3, cross-built on JVM / Scala.js / Scala Native):
+
+```scala
+libraryDependencies ++= Seq(
+  "io.github.edadma" %%% "wasm"      % "0.1.1",
+  "io.github.edadma" %%% "wasm-wasi" % "0.1.1",  // optional — only if you want the WASI shim
+)
+```
+
+`%%%` (triple `%`) is the [sbt-crossproject](https://github.com/portable-scala/sbt-crossproject) form that picks the right artifact for each platform — drop one `%` if you're on a non-cross build. The CLI (`wasm-cli`) is built from this repo but is not published; it's a runnable example, not a library.
+
+| Coordinate                                | What you get                                              |
+|-------------------------------------------|-----------------------------------------------------------|
+| `io.github.edadma:wasm:0.1.1`             | The interpreter — `Runtime.instantiate`, `ModuleInstance`. |
+| `io.github.edadma:wasm-wasi:0.1.1`        | The WASI Preview 1 host shim — depends on `wasm`.         |
+
+The `wasm` artifact has zero external runtime dependencies; the `wasm-wasi` artifact depends only on `wasm`.
 
 ## From source
+
+If you want to build the repo locally — to run the test suite, hack on the interpreter, or use the CLI runner — clone and run:
 
 ```bash
 git clone https://github.com/edadma/wasm.git
@@ -23,7 +41,7 @@ The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (
 
 ## Linking against a local checkout
 
-Until Maven Central is wired up, the way to depend on `wasm` from another sbt project is a local checkout plus `dependsOn` in your own `build.sbt`, e.g.:
+If you're hacking on the interpreter and want a downstream project to pick up your changes without a `publishSigned` round-trip, point the downstream sbt build at the local source tree:
 
 ```scala
 lazy val wasm = ProjectRef(file("../wasm"), "interpJVM")
