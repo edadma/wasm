@@ -114,14 +114,9 @@ private[spec] object KnownFailures:
     *                  function-references proposal — not on the
     *                  roadmap. The 162 downstream failures are all
     *                  knock-ons from module-load failing first.
-    *
-    *   - `if`       — four validator gaps around `if` blocks where the
-    *                  then- or else-branch's resulting stack height
-    *                  doesn't match the declared block result arity.
     */
   private val names: Set[String] = Set(
     "br_table",
-    "if",
   )
 
   def expected(name: String): Boolean = names.contains(name)

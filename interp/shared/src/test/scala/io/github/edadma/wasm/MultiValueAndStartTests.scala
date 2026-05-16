@@ -113,6 +113,18 @@ object MultiValueAndStartTests:
       check(callI32(inst, "log2_floor", 1024) == 10, "log2(1024) = 10")
     }
 
+    test("validator: if without else with mismatched params/results is rejected") {
+      // Regression — surfaced by the W3C spec runner against
+      // testsuite/if.wast lines 934/953/966/972. An `if` with no else
+      // clause has an implicit empty else-branch with type [t1*]→[t1*]
+      // (passes params through). When the block's params don't equal
+      // its results, this is invalid. Previously accepted silently.
+      expectInstantiateError(Fixtures.if_no_else_bad) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("if without else") && msg.contains("results")
+      }
+    }
+
   // === Section 8 (Start) ===================================================
 
   private def startSection(): Unit =

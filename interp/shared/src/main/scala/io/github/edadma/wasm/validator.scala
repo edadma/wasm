@@ -662,8 +662,16 @@ object Validator:
             fail(s"try_table catch: payload types ${payloadTypes.map(typeName).mkString("[", ",", "]")} don't match label $lbl arity ${targetTypes.map(typeName).mkString("[", ",", "]")}")
         }
       case 0x0b =>                                                              // end
-        val frame = popCtrl()
-        pushVals(frame.endTypes)
+        // Closing an If frame here means no `else` was seen. The implicit
+        // empty else-branch has type `[t1*] -> [t1*]` (passes params
+        // straight through), so it only validates iff `startTypes ==
+        // endTypes`. If they differ, the implicit empty else can't
+        // satisfy the declared block result and the if is invalid.
+        val frame = ctrlStack.last
+        if frame.kind == CtrlKind.If && frame.startTypes != frame.endTypes then
+          fail(s"if without else: block params ${frame.startTypes.map(typeName).mkString("[",",","]")} don't match results ${frame.endTypes.map(typeName).mkString("[",",","]")}")
+        val popped = popCtrl()
+        pushVals(popped.endTypes)
       case 0x0c =>                                                              // br N
         val n = readU32()
         val frame = labelFrame(n)
