@@ -108,15 +108,71 @@ private[spec] object KnownFailures:
 
   /** Manifest names (sans `.json` extension) expected to have failures.
     *
-    *   - `br_table` — the testsuite's br_table module 0 uses the typed
-    *                  function-references reftype short form
-    *                  `(ref null func)` (wire byte 0x63). That's the
-    *                  function-references proposal — not on the
-    *                  roadmap. The 162 downstream failures are all
-    *                  knock-ons from module-load failing first.
+    * Grouped by the feature gap each represents — all of these need
+    * non-trivial implementation work beyond the surgical bug-fix
+    * pattern. Pinning here keeps the sweep green while the gaps stay
+    * visible. See `docs/content/reference/spec-compliance.md` for the
+    * follow-up tracking table.
+    *
+    * --- Function-references / GC proposals (not on the roadmap) ---
+    *   - `br_table`      — module 0 uses `(ref null func)` short form (0x63)
+    *   - `table-sub`     — same reftype short form
+    *   - `local_init`    — `(ref func)` non-null short form (0x64)
+    *   - `unreached-valid` — function-references + typed reftype lookup
+    *
+    * --- Imported globals (gates 7 manifests) ---
+    * Parser doesn't yet handle the import kind 0x03 (global) form, so
+    * the globaltype bytes (valtype + mut) are misread as a new import.
+    *   - `data`, `elem`, `exports`, `global`, `imports`, `names`,
+    *     `memory_grow`, `table_copy`, `table_grow`
+    *
+    * --- Cross-module `register` (runner-side) ---
+    * The wast2json command stream includes `register` commands that bind
+    * a module instance to an external name for subsequent imports; our
+    * runner doesn't implement that dispatch yet.
+    *   - `linking`
+    *
+    * --- UTF-8 validation in import/custom-section names (~528 fails) ---
+    * The parser accepts byte sequences for module/field/section-id
+    * names without enforcing valid UTF-8. Each manifest's 176 cases
+    * exercise different invalid encodings.
+    *   - `utf8-custom-section-id`
+    *   - `utf8-import-field`
+    *   - `utf8-import-module`
+    *
+    * --- Binary-format strictness (parser-side `assert_malformed`) ---
+    * Various spec rules around LEB termination bits, section ordering,
+    * malformed type encodings that our parser is lax about.
+    *   - `binary`
+    *   - `binary-leb128`
+    *   - `custom`
     */
   private val names: Set[String] = Set(
+    // Function-references / GC proposals
     "br_table",
+    "table-sub",
+    "local_init",
+    "unreached-valid",
+    // Imported globals
+    "data",
+    "elem",
+    "exports",
+    "global",
+    "imports",
+    "names",
+    "memory_grow",
+    "table_copy",
+    "table_grow",
+    // Cross-module register
+    "linking",
+    // UTF-8 validation
+    "utf8-custom-section-id",
+    "utf8-import-field",
+    "utf8-import-module",
+    // Binary-format strictness
+    "binary",
+    "binary-leb128",
+    "custom",
   )
 
   def expected(name: String): Boolean = names.contains(name)

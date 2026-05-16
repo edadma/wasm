@@ -128,6 +128,75 @@ FILES=(
   simd_store32_lane
   simd_store64_lane
   simd_select
+  # --- bulk memory + memory + load/store + data --------------------------
+  memory
+  memory_copy
+  memory_fill
+  memory_init
+  memory_grow
+  memory_size
+  memory_trap
+  memory_redundancy
+  memory-multi
+  load
+  store
+  data
+  bulk
+  # --- tables + element segments ----------------------------------------
+  table
+  table-sub
+  table_get
+  table_set
+  table_grow
+  table_fill
+  table_init
+  table_copy
+  table_size
+  elem
+  # --- recent features: EH + tail calls + tag ---------------------------
+  tag
+  throw
+  throw_ref
+  try_table
+  return_call
+  return_call_indirect
+  # --- binary format edge cases -----------------------------------------
+  binary
+  binary-leb128
+  # --- misc plumbing ----------------------------------------------------
+  start
+  traps
+  linking
+  imports
+  exports
+  local_get
+  local_set
+  local_tee
+  local_init
+  global
+  func
+  names
+  extern
+  custom
+  token
+  left-to-right
+  skip-stack-guard-page
+  unreached-invalid
+  unreached-valid
+  obsolete-keywords
+  utf8-custom-section-id
+  utf8-import-field
+  utf8-import-module
+  utf8-invalid-encoding
+  id
+  float_exprs
+  float_memory
+  float_misc
+  f32_bitwise
+  f32_cmp
+  f64_bitwise
+  f64_cmp
+  annotations
 )
 
 for name in "${FILES[@]}"; do

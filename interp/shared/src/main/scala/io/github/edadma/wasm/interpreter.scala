@@ -909,6 +909,11 @@ final class Interpreter private[wasm] (
                 case TryTableHandler.CatchRef(_, _) | TryTableHandler.CatchAllRef(_) =>
                   valueStack += RefExn(exc)
                 case _ => ()
+              // Per the EH proposal, catch label indices are counted in
+              // the try_table's OUTER scope — pop the try_table label
+              // before branchTo so target 0 names the immediately
+              // enclosing label, not the try_table itself.
+              val _ = f.labels.remove(f.labels.size - 1)
               branchTo(matched.target)
               return true
             else

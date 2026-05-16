@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**841 tests** on the JVM (619 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **89 manifests / ~35,000 assertions** in the current slice (including the full SIMD proposal), **88 manifests fully green** and 1 pinned (the function-references proposal, not on the roadmap). See [Spec compliance](/reference/spec-compliance/) for the table.
+**842 tests** on the JVM (620 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **123 manifests fully green** and 19 pinned (function-references / imported-globals / cross-module register / UTF-8 / binary-format gaps). See [Spec compliance](/reference/spec-compliance/) for the table.
 
 ## Try it
 
