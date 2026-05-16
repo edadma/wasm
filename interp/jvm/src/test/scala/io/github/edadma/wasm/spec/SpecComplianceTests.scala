@@ -120,16 +120,18 @@ private[spec] object KnownFailures:
     *   - `local_init`    — `(ref func)` non-null short form (0x64)
     *   - `unreached-valid` — function-references + typed reftype lookup
     *
-    * --- Compact-imports proposal (gates 9 manifests) ---
-    * The wasm-3.0 testsuite ships modules using a non-standard,
-    * experimental "compact-imports" wire format that groups imports by
-    * shared module name (see github.com/WebAssembly/compact-imports).
-    * Our parser still expects the wasm-2.0 `count import*` shape and
-    * rejects the compact form with "unknown import kind 0x7f". The
-    * imported-globals + extended-const + relaxed-const-expr support
-    * landed in this drop, but these manifests' modules can't be
-    * parsed until compact-imports lands too.
-    *   - `data`, `elem`, `exports`, `global`, `imports`, `names`,
+    * --- Residual gaps after compact-imports (8 manifests) ---
+    * Compact-imports (0x7E/0x7F trigger when field_name == "") landed
+    * — `names` is now fully green. The remaining 8 manifests have
+    * other residual causes: imported memories / tables aren't
+    * surfaced in the model (kind 0x01 and 0x02 are silently skipped
+    * by the parser); certain fault-injection corners around
+    * `assert_malformed` modules behave differently from the spec; and
+    * particular bulk-op edge cases on `table_copy` / `table_grow`
+    * still differ from the reference. Each manifest has shrunk
+    * substantially since compact-imports landed; the next round of
+    * triage is per-manifest investigation.
+    *   - `data`, `elem`, `exports`, `global`, `imports`,
     *     `memory_grow`, `table_copy`, `table_grow`
     *
     * --- Cross-module `register` (runner-side) ---
@@ -145,13 +147,15 @@ private[spec] object KnownFailures:
     "table-sub",
     "local_init",
     "unreached-valid",
-    // Compact-imports proposal
+    // Remaining gaps after compact-imports landed: 9 manifests still
+    // pinned but no longer gated on compact-imports parsing — each has
+    // its own residual cause (imported memories/tables not surfaced,
+    // particular fault-injection corners, etc.).
     "data",
     "elem",
     "exports",
     "global",
     "imports",
-    "names",
     "memory_grow",
     "table_copy",
     "table_grow",

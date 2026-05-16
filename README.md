@@ -263,7 +263,7 @@ The official [WebAssembly testsuite](https://github.com/WebAssembly/testsuite) r
 sbt 'interpJVM/Test/runMain io.github.edadma.wasm.spec.SpecComplianceTests'
 ```
 
-**129 of 142 manifests fully green**; the remaining 13 are pinned in `KnownFailures` (function-references / GC reftype short forms × 4, compact-imports wire format × 9, cross-module `register` × 1). See [docs/spec-compliance](docs/content/reference/spec-compliance.md) for details.
+**129 of 142 manifests fully green**; the remaining 13 are pinned in `KnownFailures` (function-references / GC reftype short forms × 4, residual gaps after compact-imports landed × 8 — mostly imported memories / tables not yet surfaced, cross-module `register` × 1). See [docs/spec-compliance](docs/content/reference/spec-compliance.md) for details.
 
 ## Regenerating fixtures
 

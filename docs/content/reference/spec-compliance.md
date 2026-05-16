@@ -6,7 +6,7 @@ weight: 30
 
 The interpreter has an integrated runner for the official [WebAssembly testsuite](https://github.com/WebAssembly/testsuite). It consumes the `.wast` files, dispatches each `assert_return` / `assert_trap` / `assert_invalid` / `assert_malformed` command against `Runtime.instantiate` + `inst.invoke`, and tracks per-file pass / fail / skip totals.
 
-The slice that's wired in covers **142 manifests** — numerics, conversions, control flow, memory addressing, function pointers, the complete SIMD proposal, bulk memory + tables + element segments, the EH and tail-call proposals, plus binary-format and UTF-8 edge-case manifests — over **~53,000 assertions**.
+The slice that's wired in covers **142 manifests** — numerics, conversions, control flow, memory addressing, function pointers, the complete SIMD proposal, bulk memory + tables + element segments, the EH and tail-call proposals, plus binary-format and UTF-8 edge-case manifests — over **~53,000 assertions**. The parser also handles the wasm-3.0 **compact-imports** wire format (groups of imports sharing a module name, signaled by an empty field name plus kind byte `0x7E` / `0x7F`), so manifests that emit the compact form parse without special-casing.
 
 ## Running it
 
@@ -30,7 +30,7 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 51084 passed, 830 failed, 1296 skipped (of 53210) ==
+== Spec totals: 51156 passed, 758 failed, 1296 skipped (of 53210) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -70,21 +70,20 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 | `local_init`      | `(ref func)` non-null short form (`0x64`).                           |
 | `unreached-valid` | Function-references + typed reftype lookup.                          |
 
-**Compact-imports proposal** (gates 9 manifests):
+**Residual gaps after compact-imports landed** (8 manifests):
 
-The wasm-3.0 testsuite ships modules using an experimental "compact-imports" wire format ([github.com/WebAssembly/compact-imports](https://github.com/WebAssembly/compact-imports)) that groups imports under a shared module name with a 3-byte magic header. Our parser still expects the wasm-2.0 `count import*` shape and rejects the compact form with `unknown import kind 0x7f`. The supporting features (kind `0x03` global imports, host-resolved `HostGlobal`, extended-const i32/i64 add/sub/mul, relaxed const-expr `global.get` over any earlier immutable global) all landed in 0.3.0; only the wire-format extension itself remains.
+The compact-imports wire format (signaled by `field_name == ""` plus a kind byte of `0x7E` or `0x7F` — `0x7E` shares a kind across the group, `0x7F` lets sub-imports mix kinds) now parses. `names` was fully unlocked. The remaining manifests each have their own residual cause — mostly **imported memories / tables not being surfaced** (parser silently skips kind `0x01` and `0x02`; the module then can't validate `i32.load` / `call_indirect` because there's no memory or table to point at) and **cross-module register** support on the runner side.
 
-| Manifest      |
-|---------------|
-| `data`        |
-| `elem`        |
-| `exports`     |
-| `global`      |
-| `imports`     |
-| `memory_grow` |
-| `names`       |
-| `table_copy`  |
-| `table_grow`  |
+| Manifest      | Residual cause                                                                                        |
+|---------------|-------------------------------------------------------------------------------------------------------|
+| `data`        | Niche `MemoryOutOfBounds` cases on active-segment OOB and two validator gaps                          |
+| `elem`        | Imported tables not surfaced; wasm-3.0 GC reftype short form `0x40` in table sections                 |
+| `exports`     | One `ExportNotFound` corner                                                                           |
+| `global`      | One wasm-3.0 GC reftype short form in a table section                                                 |
+| `imports`     | Mix of cross-module register, imported memories, imported tables                                      |
+| `memory_grow` | Multi-memory edge case (`memidx 2 out of range`)                                                      |
+| `table_copy`  | Imports a function from a `register`-bound module — needs cross-module register                       |
+| `table_grow`  | Imported tables not surfaced                                                                          |
 
 **Cross-module `register`** (runner-side):
 
@@ -98,7 +97,7 @@ Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest 
 
 ## What the runner caught
 
-Triage across the initial run-up and five coverage-expansion passes surfaced thirteen real interpreter bugs:
+Triage across the initial run-up and six coverage-expansion passes surfaced thirteen real interpreter bugs plus one wire-format proposal that needed parser support:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
@@ -121,3 +120,5 @@ Triage across the initial run-up and five coverage-expansion passes surfaced thi
 13. **Imported globals + extended-const + relaxed const-expr** were not surfaced. The parser silently skipped import kind `0x03`, every const-expr accepted only a single literal opcode, and `global.get` in a const-expr was rejected outright. Three spec features that travel together now land as one drop: (a) `GlobalImport` joins `FuncImport` / `TagImport` in the module model, surfaces at instantiation via a new `HostGlobal` resolved against `HostModule.globals`, and occupies the leading slots of the unified globalidx space; (b) the const-expr reader is now a small stack-machine parser that flattens `iN.add` / `iN.sub` / `iN.mul` (extended-const proposal) into an expression tree the validator and runtime evaluate recursively; (c) the validator allows `global.get N` over any earlier-defined immutable global (wasm-3.0 relaxation), with forward-reference and mutability rejection. Active data / element segment offsets accept the same const-expr forms. The wasm-3.0 testsuite's "compact-imports" wire format extension is a separate proposal and remains pinned.
 
 All thirteen ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.
+
+14. **Compact-imports wire format.** The wasm-3.0 testsuite emits a compact import-section encoding where a regular-looking import with `field_name == ""` and a kind byte of `0x7E` (shared-kind) or `0x7F` (per-import-kind) signals that the just-read `mod_name` is shared across a group of sub-imports. The 0x7E form is `kind sub_count (field_name desc)*`; the 0x7F form is `sub_count (field_name kind desc)*`. The outer `count` field in the import-section header is the TOTAL number of imports across all groups, not the count of groups — so the parser advances `i` by `sub_count` per compact group. Without this, modules using the compact form failed at parse time with `unknown import kind 0x7F`. The `names` manifest was fully unlocked by this fix; eight other manifests gated on compact-imports now decode but still hit secondary residual gaps (imported memories / tables and cross-module register).
