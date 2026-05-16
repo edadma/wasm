@@ -132,14 +132,6 @@ private[spec] object KnownFailures:
     * runner doesn't implement that dispatch yet.
     *   - `linking`
     *
-    * --- UTF-8 validation in import/custom-section names (~528 fails) ---
-    * The parser accepts byte sequences for module/field/section-id
-    * names without enforcing valid UTF-8. Each manifest's 176 cases
-    * exercise different invalid encodings.
-    *   - `utf8-custom-section-id`
-    *   - `utf8-import-field`
-    *   - `utf8-import-module`
-    *
     * --- Binary-format strictness (parser-side `assert_malformed`) ---
     * Various spec rules around LEB termination bits, section ordering,
     * malformed type encodings that our parser is lax about.
@@ -165,10 +157,6 @@ private[spec] object KnownFailures:
     "table_grow",
     // Cross-module register
     "linking",
-    // UTF-8 validation
-    "utf8-custom-section-id",
-    "utf8-import-field",
-    "utf8-import-module",
     // Binary-format strictness
     "binary",
     "binary-leb128",
