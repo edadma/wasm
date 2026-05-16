@@ -910,6 +910,33 @@ hr {
   line-height: 1.5;
 }
 
+/* Splash layout — frontmatter `splash: true` (set on `_index.md` for
+   the landing page) tells `baseof.html` to render without sidebar +
+   rail. The content column then expands and the hero centers
+   itself, Starlight-style. Everything else in the splash flow
+   (cards, custom markdown body) inherits the wider gutter. */
+.juicerdocs-page-splash .juicerdocs-content {
+  max-width: 64rem;
+}
+.juicerdocs-page-splash .juicerdocs-hero {
+  text-align: center;
+  padding-top: 5rem;
+  padding-bottom: 3rem;
+}
+.juicerdocs-page-splash .juicerdocs-hero-meta {
+  justify-content: center;
+}
+.juicerdocs-page-splash .juicerdocs-hero-summary {
+  margin-left: auto;
+  margin-right: auto;
+}
+.juicerdocs-page-splash .juicerdocs-hero-actions {
+  justify-content: center;
+}
+@media (min-width: 1024px) {
+  .juicerdocs-page-splash .juicerdocs-cards { grid-template-columns: 1fr 1fr 1fr; }
+}
+
 .juicerdocs-section-heading {
   font-size: 1.25rem;
   font-weight: 600;
