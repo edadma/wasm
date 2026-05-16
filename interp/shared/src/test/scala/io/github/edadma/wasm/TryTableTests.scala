@@ -98,10 +98,13 @@ object TryTableTests:
       // Tag t = (i32) -> (). Function f = () -> i32. Layout:
       //   (block $B (result i32)
       //     (try_table (result i32)
-      //       (catch $t $B)        ;; labelidx 1 (try_table=0, $B=1)
+      //       (catch $t $B)        ;; labelidx 0 (outer scope: $B is innermost)
       //       i32.const 42
       //       throw $t
       //       i32.const 0))         ;; unreachable
+      // Per the EH proposal, catch label indices in `try_table`'s catch
+      // vector are counted in the OUTER scope — the try_table itself is
+      // NOT on the label stack from the catch clause's perspective.
       val typeS = typeSec(
         ft(Nil, Seq(BT_I32)),     // 0: () -> i32   (func + try_table + block result)
         ft(Seq(BT_I32), Nil),     // 1: (i32) -> () (tag — payload pushed on catch)
@@ -113,7 +116,7 @@ object TryTableTests:
         0x02, BT_I32,                   // block (result i32)
           0x1f, BT_I32,                 //   try_table (result i32)
             0x01,                       //     1 catch clause
-              0x00, 0x00, 0x01,         //     catch tag=0 label=1 (the outer block)
+              0x00, 0x00, 0x00,         //     catch tag=0 label=0 (outer block — outer scope only)
           0x41, 0x2a,                   //     i32.const 42  (becomes tag payload)
           0x08, 0x00,                   //     throw $t
           0x41, 0x00,                   //     i32.const 0   (unreachable)
@@ -142,7 +145,7 @@ object TryTableTests:
         0x02, BT_VOID,                  // block $B (no result)
           0x1f, BT_VOID,                //   try_table (no result)
             0x01,                       //     1 catch clause
-              0x02, 0x01,               //     catch_all label=1 ($B)
+              0x02, 0x00,               //     catch_all label=0 ($B — outer scope)
           0x08, 0x00,                   //     throw $t0
           0x0b,                         //   end try_table
         0x0b,                           // end block
@@ -186,7 +189,7 @@ object TryTableTests:
         0x02, 0x69,                     // block $B (result exnref)
           0x1f, BT_VOID,                //   try_table (no result)
             0x01,                       //     1 catch clause
-              0x03, 0x01,               //     catch_all_ref label=1 ($B)
+              0x03, 0x00,               //     catch_all_ref label=0 ($B — outer scope)
           0x08, 0x00,                   //     throw $t0   (catch fires, branches to $B with exnref)
           0x0b,                         //   end try_table  (fall-through: $B needs an exnref result on this path too — won't be taken)
           0xd0, 0x69,                   //   ref.null exn   (unreachable filler so fall-through is typed)
@@ -226,14 +229,14 @@ object TryTableTests:
       val tagS  = tagSec(1)
       val expS  = expSec(("f", 0x00, 0))
       val body2 = b(
-        0x02, BT_VOID,
-          0x1f, BT_VOID,
-            0x01,
-              0x02, 0x01,
-            0x02, 0x69,
-              0x1f, BT_VOID,
-                0x01,
-                  0x03, 0x01,
+        0x02, BT_VOID,                    // block $OUTER (no result)
+          0x1f, BT_VOID,                  //   try_table (outer): outer-catch labels see [outer_block]
+            0x01,                         //     1 catch clause
+              0x02, 0x00,                 //     catch_all label=0 ($OUTER — outer scope, no try_table)
+            0x02, 0x69,                   //     block $INNER (result exnref): now labels = [outer, inner]
+              0x1f, BT_VOID,              //       try_table (inner): inner-catch labels see [outer, inner]
+                0x01,                     //         1 catch clause
+                  0x03, 0x00,             //         catch_all_ref label=0 ($INNER — outer scope of inner try_table)
                 0x08, 0x00,
               0x0b,
               0xd0, 0x69,
@@ -275,7 +278,7 @@ object TryTableTests:
         0x02, BT_VOID,                  // block $B (no result)
           0x1f, BT_VOID,                //   try_table (no result)
             0x01,                       //     1 catch clause
-              0x02, 0x01,               //     catch_all label=1 ($B)
+              0x02, 0x00,               //     catch_all label=0 ($B — outer scope)
           // body: just fall through
           0x0b,                         //   end try_table  (normal fall-through)
         0x0b,                           // end $B
@@ -300,12 +303,12 @@ object TryTableTests:
       val expS  = expSec(("f", 0x00, 0))
       val body = b(
         0x02, BT_VOID,                  // block $OUTER (no result)
-          0x1f, BT_VOID,                //   try_table (outer)
+          0x1f, BT_VOID,                //   try_table (outer): catch labels see [$OUTER]
             0x01,
-              0x02, 0x01,               //     catch_all label=1 ($OUTER)
-            0x1f, BT_VOID,              //     try_table (inner) — catches only $t0
+              0x02, 0x00,               //     catch_all label=0 ($OUTER — outer scope)
+            0x1f, BT_VOID,              //     try_table (inner): catch labels see [$OUTER, outer-try_table]
               0x01,
-                0x00, 0x00, 0x00,       //       catch tag=0 label=0 (the inner try_table — i.e. fall through to its own end)
+                0x00, 0x00, 0x01,       //       catch tag=0 label=1 ($OUTER — dead branch; $t0 never thrown here)
               0x08, 0x01,               //     throw $t1
             0x0b,                       //     end inner try_table
           0x0b,                         //   end outer try_table
@@ -359,7 +362,7 @@ object TryTableTests:
         0x02, 0x02,                     // block $B (typeidx 2 — result (i32, exnref))
           0x1f, BT_VOID,                //   try_table (no result; catch_ref branches with carry)
             0x01,
-              0x01, 0x00, 0x01,         //     catch_ref tag=0 label=1 ($B with arity [i32, exnref])
+              0x01, 0x00, 0x00,         //     catch_ref tag=0 label=0 ($B — outer scope of inner try_table)
           0x41, 0xd5, 0x00,             //   i32.const 85 (SLEB: bit 6 set → 2 bytes)
           0x08, 0x00,                   //   throw $t0    (with i32 payload 85)
           0x0b,                         //   end try_table
@@ -436,7 +439,7 @@ object TryTableTests:
         0x02, BT_VOID,              // block (no result, no carry)
           0x1f, BT_VOID,            //   try_table
             0x01,
-              0x00, 0x00, 0x01,     //     catch tag=0 (i32 payload) label=1 (block with no carry) — mismatch
+              0x00, 0x00, 0x00,     //     catch tag=0 (i32 payload) label=0 (block with no carry) — mismatch
           0x0b,
         0x0b,
         0x0b,
@@ -461,4 +464,39 @@ object TryTableTests:
                 s"unexpected message: $msg")
         case other =>
           check(false, s"expected InvalidModule(stack underflow for throw_ref), got $other")
+    }
+
+    test("try_table validator: catch label index counts from OUTER scope, not the try_table itself") {
+      // Regression — surfaced by the W3C spec runner against throw.wast
+      // and throw_ref.wast. Per the EH proposal, catch label indices are
+      // counted in the OUTER scope: the try_table is NOT on the label
+      // stack from the catch clause's perspective.
+      //
+      // This module: block (result i32) { try_table catch tag=0 label=0 ... }
+      // Tag 0 has i32 payload. With spec-correct indexing, label 0 is the
+      // outer BLOCK (which carries [i32] — matches the payload). The
+      // OLD behaviour treated label 0 as the try_table itself (which has
+      // empty results, so the i32 payload would mismatch).
+      val typeS = typeSec(
+        ft(Nil, Seq(BT_I32)),       // 0: () -> i32 (func + outer block)
+        ft(Seq(BT_I32), Nil),       // 1: (i32) -> () (tag — i32 payload)
+      )
+      val funcS = funcSec(0)
+      val tagS  = tagSec(1)
+      val expS  = expSec(("f", 0x00, 0))
+      val body  = b(
+        0x02, BT_I32,               // block (result i32) — label 0 from catch clause's POV
+          0x1f, BT_VOID,            //   try_table (no result)
+            0x01,
+              0x00, 0x00, 0x00,     //     catch tag=0 (i32 payload) label=0 (outer block) — VALID
+          0x41, 0x01,               //     i32.const 1
+          0x08, 0x00,               //     throw tag 0 (i32 = 1)
+          0x0b,                     //   end try_table
+          0x41, 0x07,               //   i32.const 7 (fall-through filler — block needs i32)
+        0x0b,                       // end block
+        0x0b,                       // end func
+      )
+      val bytes = Header ++ typeS ++ funcS ++ tagS ++ expS ++ codeSec(body)
+      val inst  = instantiate(bytes)
+      check(callI32(inst, "f") == 1, "catch with i32 payload branching to outer-block label 0 should deliver 1")
     }

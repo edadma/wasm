@@ -635,11 +635,11 @@ object Validator:
           case Right((hs, np2)) => pc = np2; hs
           case Left(e)          => throw new ValFail(e)
         popVals(ft.params)
-        pushCtrl(CtrlKind.TryTable, ft.params, ft.results)
-        // Validate each handler clause. labelidx is counted with the
-        // TryTable frame on the ctrl stack — so labelidx 0 is the
-        // try_table itself, and a catch targeting 0 means "exit the
-        // try_table with the handler's payload on the stack".
+        // Validate each catch clause's label/payload BEFORE pushing the
+        // try_table frame: per the EH proposal, the catch label indices
+        // are counted in the OUTER scope (the context the try_table sits
+        // in), so `catch x 0` targets the immediately enclosing label,
+        // not the try_table itself.
         handlers.foreach { h =>
           val (payloadTypes, lbl) = h match
             case Interpreter.TryTableHandler.Catch(tagIdx, l) =>
@@ -661,6 +661,7 @@ object Validator:
           if targetTypes != payloadTypes then
             fail(s"try_table catch: payload types ${payloadTypes.map(typeName).mkString("[", ",", "]")} don't match label $lbl arity ${targetTypes.map(typeName).mkString("[", ",", "]")}")
         }
+        pushCtrl(CtrlKind.TryTable, ft.params, ft.results)
       case 0x0b =>                                                              // end
         // Closing an If frame here means no `else` was seen. The implicit
         // empty else-branch has type `[t1*] -> [t1*]` (passes params
