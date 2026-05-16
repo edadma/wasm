@@ -30,7 +30,7 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 
 ```text
 $ wasm --help
-wasm 0.1.1
+wasm 0.3.0
 Usage: wasm [options] <file> [<wasi-args>...]
 
   <file>                                       path to a .wasm module
