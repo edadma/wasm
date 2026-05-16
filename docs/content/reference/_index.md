@@ -8,7 +8,7 @@ The Quickstart and Concepts pages cover the model. This section is for lookups �
 
 ## At a glance
 
-**Implemented (0.1.1):**
+**Implemented:**
 
 - Every WebAssembly Core opcode (numeric, control flow, memory, tables, parametric, variables).
 - Sign-extension proposal (`i{32,64}.extend{8,16,32}_s`).
@@ -17,14 +17,17 @@ The Quickstart and Concepts pages cover the model. This section is for lookups �
 - Reference types (`funcref`, `externref`, `ref.{null,is_null,func}`, `table.{get,set,grow,size,fill}`, typed `select t*`).
 - Multi-memory (every memory opcode carries a memidx; modules may declare more than one memory).
 - Full SIMD proposal — all ~236 ops under the `0xFD` prefix (`V128` value type plumbed end-to-end).
+- Relaxed SIMD — all 20 sub-opcodes (`0x100..0x113`).
+- Exception handling — both legacy (`try` / `catch` / `throw` / `rethrow` / `delegate`) and modern (`try_table` + `throw_ref` + `exnref`).
+- Tail calls (`return_call` / `return_call_indirect`).
+- Threads / atomics — 66 atomic sub-opcodes + shared memory + `wait` / `notify` / `fence`.
 - Multi-value blocks + functions.
 - Start section.
 - Validation pass that runs before any code does.
 
 **Not implemented:**
 
-- Threads + atomics (`*.atomic.*`).
-- Exception handling (`try` / `catch` / `throw` / `rethrow`).
+- Function references proposal (typed `(ref null func)` short-form reftype with wire byte `0x63`).
 - GC proposal (`struct.*`, `array.*`, `ref.cast`).
 - Component model (out of scope — packaging proposal, not a wasm core feature).
 
@@ -32,3 +35,4 @@ See [Opcodes](/reference/opcodes/) for the by-byte detail.
 
 - [Opcodes](/reference/opcodes/) — every WebAssembly opcode group, supported or planned.
 - [Errors](/reference/errors/) — the `WasmError` ADT in one table.
+- [Spec compliance](/reference/spec-compliance/) — running the W3C testsuite against the interpreter.

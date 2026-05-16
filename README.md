@@ -241,7 +241,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 612 interpreter tests
+sbt 'interpJVM/Test/run'    # 613 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -252,7 +252,18 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **834 tests** on JVM (612 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **835 tests** on JVM (613 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+
+### W3C testsuite
+
+The official [WebAssembly testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — `~9,500 assertions` across 33 manifests covering numerics, control flow, memory addressing, and function pointers:
+
+```bash
+./scripts/build-spec-tests.sh /path/to/wasm-testsuite     # one-time, regenerates JSON fixtures
+sbt 'interpJVM/Test/runMain io.github.edadma.wasm.spec.SpecComplianceTests'
+```
+
+30 of 33 manifests are fully green; the remaining three (`align`, `br_table`, `if`) are pinned in `KnownFailures` with documented validator / proposal gaps. See [docs/spec-compliance](docs/content/reference/spec-compliance.md) for details.
 
 ## Regenerating fixtures
 

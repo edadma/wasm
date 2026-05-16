@@ -173,7 +173,12 @@ object Interpreter:
     *
     * The interpreter ignores `align` (alignment is advisory) — only
     * `memIdx` + `offset` matter at run time. */
-  final case class MemArg(memIdx: Int, align: Int, offset: Int)
+  /** A load/store immediate. `offset` is a wasm u32, but we widen it to
+    * Long here so that effective-address computations against a Long
+    * `addr` aren't sign-extended when the offset's high bit is set (which
+    * would silently turn a "trap on OOB" load into a wrap-to-low-memory
+    * load). `readMemArg` masks with `0xFFFFFFFFL` on construction. */
+  final case class MemArg(memIdx: Int, align: Int, offset: Long)
 
   /** Read a memarg starting at `pc`. Returns `(MemArg, posAfter)`. The
     * shape is identical for every load + store opcode, so threading this
@@ -191,7 +196,7 @@ object Interpreter:
           case Right((memIdx, p2)) =>
             Leb128.readU32(body, p2) match
               case Left(e)             => Left(e)
-              case Right((offset, p3)) => Right((MemArg(memIdx, align, offset), p3))
+              case Right((offset, p3)) => Right((MemArg(memIdx, align, offset.toLong & 0xffffffffL), p3))
 
   // === Pre-compute the matching-end lookup for one body ====================
 
@@ -1712,7 +1717,13 @@ final class Interpreter private[wasm] (
       case 0xaa =>                                                                          // i32.trunc_f64_s
         val v = popF64()
         if jl.Double.isNaN(v) then fail(WasmError.InvalidModule("trunc: NaN"))
-        if v < -2147483648.0 || v >= 2147483648.0 then fail(WasmError.InvalidModule("i32.trunc_f64_s: out of range"))
+        // Range check: trap iff trunc(v) is outside [INT_MIN, INT_MAX]. f64
+        // precision lets values strictly between -2^31-1 and -2^31 exist
+        // (e.g. -2147483648.9), all of which truncate to INT_MIN and are in
+        // range. The previous `v < -2^31.0` form rejected them; the correct
+        // strict cutoff is `v <= -2^31 - 1` since -2147483649.0 truncates to
+        // -2147483649, which is out of range.
+        if v >= 2147483648.0 || v <= -2147483649.0 then fail(WasmError.InvalidModule("i32.trunc_f64_s: out of range"))
         pushI32(v.toInt)
         f.pc += 1
 

@@ -1013,6 +1013,19 @@ object NumericTests:
       expectError(inst, "i32_trunc_f64_s", Seq(F64(-2147483649.0))) {
         case WasmError.InvalidModule(m) => m.contains("out of range")
       }
+      // Regression — surfaced by the W3C spec runner against
+      // testsuite/conversions.wast line 123. trunc(-2147483648.9) is
+      // -2147483648 (toward-zero), which is in i32 range; an earlier
+      // `v < -2147483648.0` check rejected anything strictly below
+      // -INT_MIN as f64. The correct strict cutoff is v <= -2^31 - 1.
+      check(
+        callI32V(inst, "i32_trunc_f64_s", F64(-2147483648.9)) == Int.MinValue,
+        "trunc(-2147483648.9) = INT_MIN (toward zero)",
+      )
+      check(
+        callI32V(inst, "i32_trunc_f64_s", F64(-2147483648.5)) == Int.MinValue,
+        "trunc(-2147483648.5) = INT_MIN (toward zero)",
+      )
     }
 
     test("conv: i32.trunc_f64_u — in-range and traps") {

@@ -144,6 +144,13 @@ lazy val interp = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       )
     }.taskValue,
   )
+  .jvmSettings(
+    // JVM-only spec compliance runner (SpecComplianceTests) lives next to
+    // InterpreterTest in the test classpath; pin the default `Test/run`
+    // entry point so it doesn't prompt the user to disambiguate. Run the
+    // spec runner explicitly via `Test/runMain`.
+    Test / mainClass := Some("io.github.edadma.wasm.InterpreterTest"),
+  )
   .jsSettings(
     scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) },
     scalaJSLinkerConfig ~= { _.withSourceMap(false) },
