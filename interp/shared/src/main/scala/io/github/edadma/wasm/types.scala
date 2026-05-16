@@ -115,9 +115,7 @@ object ValueType:
   * it at one. */
 final case class FuncType(params: Vector[ValueType], results: Vector[ValueType])
 
-/** An imported function. Table / memory imports aren't surfaced yet
-  * (Phase 5); if the module needs them it will fail at instantiation or use.
-  * Imported globals surface via [[GlobalImport]] (Phase 9). */
+/** An imported function. */
 final case class FuncImport(module: String, name: String, typeIdx: Int)
 
 /** An imported global. Surfaced via the import section (kind 0x03). The
@@ -129,6 +127,18 @@ final case class FuncImport(module: String, name: String, typeIdx: Int)
   * `globalSigs` and the runtime's `globals` array both follow this layout
   * so `global.get N` resolves consistently. */
 final case class GlobalImport(module: String, name: String, valueType: ValueType, mutable: Boolean)
+
+/** An imported linear memory (kind 0x02). The module declares the limits
+  * it expects the import to satisfy; the runtime checks the host-supplied
+  * [[Memory]] against those limits at instantiation and prepends it to
+  * the live `memories` array ahead of any module-defined memories. */
+final case class MemoryImport(module: String, name: String, limits: MemoryLimits)
+
+/** An imported table (kind 0x01). The module declares the reftype + limits
+  * it expects; the runtime checks the host-supplied [[RuntimeTable]] and
+  * prepends it to the live `tables` array ahead of any module-defined
+  * tables. */
+final case class TableImport(module: String, name: String, refType: RefType, min: Int, max: Option[Int])
 
 /** A constant initializer expression. Used wherever the spec requires a
   * "constant expression": global init values, active data-segment offsets,
@@ -186,8 +196,8 @@ final case class MemoryLimits(min: Int, max: Option[Int], shared: Boolean = fals
   * `min` is the initial slot count; any slot the element segments don't
   * cover starts as a typed null (`RefNull(refType)`).
   *
-  * Imported tables are not represented yet (Phase 5 alongside imported
-  * globals).
+  * Imported tables surface via [[TableImport]] and occupy tableidx slots
+  * ahead of these defined tables.
   */
 final case class Table(refType: RefType, min: Int, max: Option[Int])
 
@@ -280,8 +290,8 @@ final case class WasmModule(
     types: Vector[FuncType],
     imports: Vector[FuncImport],
     functions: Vector[Int],          // type indices, one per defined function (matches `codes` 1:1)
-    tables: Vector[Table],           // module-defined tables (imports not surfaced yet)
-    memories: Vector[MemoryLimits],
+    tables: Vector[Table],           // module-defined tables; imports surface via tableImports
+    memories: Vector[MemoryLimits],  // module-defined memories; imports surface via memoryImports
     globals: Vector[Global],         // module-defined globals; imports surface via globalImports
     exports: Vector[Export],
     elements: Vector[ElementSegment],// element segments — active ones populate `tables` at instantiation
@@ -307,6 +317,14 @@ final case class WasmModule(
     // module-defined globals. Resolved by `Runtime.instantiate` against the
     // supplied host modules' `globals` maps.
     globalImports: Vector[GlobalImport] = Vector.empty,
+    // Imported tables (kind 0x01). Occupy tableidx slots 0..k-1, ahead of
+    // module-defined tables. Resolved by `Runtime.instantiate` against the
+    // supplied host modules' `tables` maps.
+    tableImports:  Vector[TableImport]  = Vector.empty,
+    // Imported memories (kind 0x02). Occupy memidx slots 0..k-1, ahead of
+    // module-defined memories. Resolved by `Runtime.instantiate` against
+    // the supplied host modules' `memories` maps.
+    memoryImports: Vector[MemoryImport] = Vector.empty,
 )
 
 /** All failure modes surfaced by the public API.

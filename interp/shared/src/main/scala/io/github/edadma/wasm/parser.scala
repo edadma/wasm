@@ -166,6 +166,8 @@ object Parser:
     var tagImports    = Vector.empty[TagImport]
     var tags          = Vector.empty[Tag]
     var globalImports = Vector.empty[GlobalImport]
+    var tableImports  = Vector.empty[TableImport]
+    var memoryImports = Vector.empty[MemoryImport]
 
     // Spec: known section IDs are 0..13. Anything else is "malformed
     // section id". Non-custom sections must appear at most once and in
@@ -208,10 +210,12 @@ object Parser:
         case 0  => funcNames = parseCustomSection(c, secEnd, funcNames)       // section 0 is "custom" — `name` is one of these
         case 1  => types     = parseTypeSection(c)
         case 2  =>
-          val (funcImps, tagImps, globImps) = parseImportSection(c)
+          val (funcImps, tagImps, globImps, tblImps, memImps) = parseImportSection(c)
           imports       = funcImps
           tagImports    = tagImps
           globalImports = globImps
+          tableImports  = tblImps
+          memoryImports = memImps
         case 3  => functions = parseFunctionSection(c)
         case 4  => tables    = parseTableSection(c)
         case 5  => memories  = parseMemorySection(c)
@@ -265,6 +269,8 @@ object Parser:
       tagImports    = tagImports,
       tags          = tags,
       globalImports = globalImports,
+      tableImports  = tableImports,
+      memoryImports = memoryImports,
     )
 
   // === Type section ===
@@ -330,27 +336,29 @@ object Parser:
     * In both variants the `i` loop counter advances by the group's
     * `sub_count` so the outer `num_imports` total is the COUNT OF
     * IMPORTS (across all forms), not the count of groups. */
-  private def parseImportSection(c: Cursor): (Vector[FuncImport], Vector[TagImport], Vector[GlobalImport]) =
+  private def parseImportSection(c: Cursor): (
+      Vector[FuncImport],
+      Vector[TagImport],
+      Vector[GlobalImport],
+      Vector[TableImport],
+      Vector[MemoryImport],
+  ) =
     val n     = c.readU32()
     val out   = ArrayBuffer.empty[FuncImport]
     val tags  = ArrayBuffer.empty[TagImport]
     val globs = ArrayBuffer.empty[GlobalImport]
+    val tbls  = ArrayBuffer.empty[TableImport]
+    val mems  = ArrayBuffer.empty[MemoryImport]
 
     def readDesc(mod: String, name: String, kind: Int): Unit = kind match
       case 0x00 =>                                     // func
         out += FuncImport(mod, name, c.readU32())
-      case 0x01 =>                                     // table — silently skipped.
-        // NOTE: when imported tables are eventually surfaced (Phase 5),
-        // they will occupy table indices 0..k-1 in the wasm namespace
-        // ahead of any defined tables. Until then, a module that mixes
-        // imported and defined tables would see its `call_indirect`
-        // tableidx immediates misalign against our `tables` array. The
-        // Core spec allows at most one table per module, so single-
-        // defined-table modules remain correct.
-        val _ = c.readByte()                           // elem reftype
-        skipLimits(c)
-      case 0x02 =>                                     // memory — skip
-        skipLimits(c)
+      case 0x01 =>                                     // table
+        val rt  = readRefType(c, s"table import ${mod}.${name}")
+        val lim = readTableLimits(c)
+        tbls += TableImport(mod, name, rt, lim.min, lim.max)
+      case 0x02 =>                                     // memory
+        mems += MemoryImport(mod, name, readMemLimits(c))
       case 0x03 =>                                     // global
         val vt  = readValType(c)
         val mut = c.readByte()
@@ -396,13 +404,7 @@ object Parser:
       else
         readDesc(mod, name, kindByte)
         i += 1
-    (out.toVector, tags.toVector, globs.toVector)
-
-  private def skipLimits(c: Cursor): Unit =
-    val flag = c.readByte()
-    val _ = c.readU32() // min
-    if (flag & 0x01) != 0 then
-      val _ = c.readU32() // max
+    (out.toVector, tags.toVector, globs.toVector, tbls.toVector, mems.toVector)
 
   // === Function section ===
 

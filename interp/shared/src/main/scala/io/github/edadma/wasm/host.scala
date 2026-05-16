@@ -56,6 +56,20 @@ trait HostModule:
     * globals. */
   def globals: Map[String, HostGlobal] = Map.empty
 
+  /** Host-provided linear memories. Imported by a wasm module's import
+    * section (kind 0x02). The host supplies a live [[Memory]] instance;
+    * the runtime checks the host's `currentPages` / `maxPages` against
+    * the importing module's declared limits and uses the live instance
+    * directly so guest writes are observable to the host. Defaults to
+    * empty. */
+  def memories: Map[String, Memory] = Map.empty
+
+  /** Host-provided tables. Imported by a wasm module's import section
+    * (kind 0x01). The host supplies a live [[RuntimeTable]]; the runtime
+    * checks the table's `refType`, current `size`, and `max` against the
+    * importing module's declared shape. Defaults to empty. */
+  def tables: Map[String, RuntimeTable] = Map.empty
+
 /** The single host module the interpreter ships with.
   *
   * Exposes `env.putchar(i32) -> ()`. By default it writes the low 8 bits of

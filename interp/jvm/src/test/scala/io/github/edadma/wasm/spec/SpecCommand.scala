@@ -14,8 +14,17 @@ private[spec] sealed trait SpecCommand:
 private[spec] object SpecCommand:
 
   /** Load `filename` from the manifest's directory and install it as the
-    * "current" module for subsequent actions / asserts. */
-  final case class Module(line: Int, filename: String) extends SpecCommand
+    * "current" module for subsequent actions / asserts. If `name` is set
+    * (e.g. `"$Mf"` from a `(module $Mf ...)` text-form declaration), the
+    * module is also addressable by that name for later `Register`
+    * commands and action-targeted invokes. */
+  final case class Module(line: Int, name: Option[String], filename: String) extends SpecCommand
+
+  /** `(register "as" $name?)` — bind a previously-loaded module to the
+    * host name `asName` so subsequent module instantiations can import
+    * from it. `modName` selects which module to register; if `None`,
+    * the current module is used. */
+  final case class Register(line: Int, asName: String, modName: Option[String]) extends SpecCommand
 
   /** A top-level action whose effects are observed (typically used to
     * call into the module without checking results). */
@@ -50,8 +59,8 @@ private[spec] object SpecCommand:
 
   sealed trait ActionExpr
 
-  final case class Invoke(field: String, args: Vector[Any]) extends ActionExpr
-  final case class GetGlobal(field: String)                 extends ActionExpr
+  final case class Invoke(modName: Option[String], field: String, args: Vector[Any]) extends ActionExpr
+  final case class GetGlobal(modName: Option[String], field: String)                 extends ActionExpr
 
   // ----------------------------------------------------------------------
 
@@ -60,7 +69,18 @@ private[spec] object SpecCommand:
     val line = rec("line").asInstanceOf[Long].toInt
     rec("type") match
       case "module" =>
-        Module(line, rec("filename").asInstanceOf[String])
+        Module(
+          line,
+          rec.get("name").map(_.asInstanceOf[String]),
+          rec("filename").asInstanceOf[String],
+        )
+
+      case "register" =>
+        Register(
+          line,
+          rec("as").asInstanceOf[String],
+          rec.get("name").map(_.asInstanceOf[String]),
+        )
 
       case "action" =>
         Action(line, parseAction(rec("action").asInstanceOf[Map[String, Any]]))
@@ -102,13 +122,14 @@ private[spec] object SpecCommand:
         Skip(line, s"unsupported command type '$other'")
 
   private def parseAction(rec: Map[String, Any]): ActionExpr =
+    val modName = rec.get("module").map(_.asInstanceOf[String])
     rec("type") match
       case "invoke" =>
         val field = rec("field").asInstanceOf[String]
         val args  = rec.getOrElse("args", Vector.empty[Any]).asInstanceOf[Vector[Any]]
           .map(_.asInstanceOf[Map[String, Any]])
           .map(SpecValue.decodeArg)
-        Invoke(field, args)
+        Invoke(modName, field, args)
       case "get" =>
-        GetGlobal(rec("field").asInstanceOf[String])
+        GetGlobal(modName, rec("field").asInstanceOf[String])
       case other => sys.error(s"unsupported action type '$other'")

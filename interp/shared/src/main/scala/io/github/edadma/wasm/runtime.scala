@@ -35,6 +35,7 @@ final class ModuleInstance private[wasm] (
     private val exportFuncs: Map[String, Int],
     private val exportGlobals: Map[String, Int],
     private val exportMemories: Map[String, Int],
+    private val exportTables: Map[String, Int],
     // Phase 8.B: bulk-memory state. Both `dataBytes`/`dataDropped` and
     // `elemRefs`/`elemDropped` persist across `invoke` calls — `data.drop`
     // / `elem.drop` flips bits that subsequent `memory.init` / `table.init`
@@ -103,6 +104,41 @@ final class ModuleInstance private[wasm] (
     exportMemories.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(memories(idx))
+
+  /** Look up an exported table by name. Used by hosts that want to forward
+    * one module's exported table as another module's table import — the
+    * canonical example is the W3C spec testsuite's `register` + cross-
+    * module-import flow. */
+  def exportedTable(name: String): Either[WasmError, RuntimeTable] =
+    exportTables.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(tables(idx))
+
+  /** Declared signature of an exported function. Needed when re-exporting
+    * one module's function as another module's host import — the importer
+    * needs to type-check the call site against the callee's actual
+    * signature. */
+  def exportedFunctionType(name: String): Either[WasmError, FuncType] =
+    exportFuncs.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(funcs(idx).signature)
+
+  /** Names of all exported memories / tables / globals, in declaration
+    * order. Sibling to [[exportedFunctionNames]] — used by hosts that
+    * want to enumerate everything an instance exposes (e.g. the spec
+    * runner's cross-module register wrapper). */
+  def exportedMemoryNames: Seq[String] = exportMemories.keys.toSeq.sorted
+  def exportedTableNames:  Seq[String] = exportTables.keys.toSeq.sorted
+  def exportedGlobalNames: Seq[String] = exportGlobals.keys.toSeq.sorted
+
+  /** Mutability of an exported global — needed by hosts re-exporting one
+    * module's globals as another module's imports, since wasm's
+    * mutability-matching rule fails the import if the host advertises
+    * the wrong flavour. */
+  def exportedGlobalMutability(name: String): Either[WasmError, Boolean] =
+    exportGlobals.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(globalMutable(idx))
 
 /** A runtime-side table. Slots are typed [[Value]]s — `RefNull` for empty
   * slots, `RefFunc` / `RefExtern` for populated ones — and the table
@@ -238,21 +274,54 @@ object Runtime:
     }
 
     // === memories ===========================================================
-    // Phase 8.D: surface multiple memories per module. Zero-memory modules
-    // still get an implicit zero-page placeholder so `i32.load` / `i32.store`
-    // validation doesn't crash; otherwise allocate one `Memory` per binary
-    // entry.
+    // Unified memidx space: imports first (live `Memory` instances supplied
+    // by host modules), then module-defined memories. Zero-memory modules
+    // still get an implicit zero-page placeholder so the validator's
+    // memarg checks have something to point at.
+    val hostsMemories: Map[String, Map[String, Memory]] =
+      hostModules.iterator.map(m => m.name -> m.memories).toMap
+    val hostsTables:   Map[String, Map[String, RuntimeTable]] =
+      hostModules.iterator.map(m => m.name -> m.tables).toMap
+
+    val nMemoryImports = module.memoryImports.length
+    val nMemoryDefs    = module.memories.length
+    val totalMemories  = nMemoryImports + nMemoryDefs
     val memories =
-      if module.memories.isEmpty then Array(new Memory(0))
+      if totalMemories == 0 then Array(new Memory(0))
       else
-        val arr = new Array[Memory](module.memories.size)
-        var mi = 0
-        while mi < module.memories.size do
-          val ml = module.memories(mi)
+        val arr = new Array[Memory](totalMemories)
+        var mim = 0
+        while mim < nMemoryImports do
+          val mi = module.memoryImports(mim)
+          val hm = hostsMemories.get(mi.module).flatMap(_.get(mi.name)).getOrElse {
+            fail(WasmError.UnknownImport(mi.module, mi.name))
+          }
+          // Host's current size must be at least the import's declared min;
+          // host's max (if any) must be at most the import's declared max (if any).
+          if hm.currentPages < mi.limits.min then
+            fail(WasmError.InvalidModule(
+              s"memory import ${mi.module}.${mi.name}: host size ${hm.currentPages} pages < declared min ${mi.limits.min}"))
+          (mi.limits.max, hm.maxPages) match
+            case (Some(declaredMax), Some(hostMax)) if hostMax > declaredMax =>
+              fail(WasmError.InvalidModule(
+                s"memory import ${mi.module}.${mi.name}: host max $hostMax pages > declared max $declaredMax"))
+            case (Some(_), None) =>
+              fail(WasmError.InvalidModule(
+                s"memory import ${mi.module}.${mi.name}: module declared a max but host memory is unbounded"))
+            case _ => ()
+          if mi.limits.shared && !hm.shared then
+            fail(WasmError.InvalidModule(
+              s"memory import ${mi.module}.${mi.name}: module declared shared but host memory is unshared"))
+          arr(mim) = hm
+          mim += 1
+        var mdi = 0
+        while mdi < nMemoryDefs do
+          val ml   = module.memories(mdi)
+          val midx = nMemoryImports + mdi
           if ml.min < 0 || ml.min.toLong * Memory.PageSize > Int.MaxValue then
-            fail(WasmError.InvalidModule(s"memory $mi: unsupported size ${ml.min} pages"))
-          arr(mi) = new Memory(ml.min, ml.max, ml.shared)
-          mi += 1
+            fail(WasmError.InvalidModule(s"memory $midx: unsupported size ${ml.min} pages"))
+          arr(midx) = new Memory(ml.min, ml.max, ml.shared)
+          mdi += 1
         arr
 
     // === globals ============================================================
@@ -371,22 +440,46 @@ object Runtime:
       di += 1
 
     // === tables =============================================================
-    // One [[RuntimeTable]] per defined table. Each slot starts as a typed
-    // null (`RefNull(table.refType)`); element segments then populate the
-    // active subset. Imported tables aren't surfaced yet (Phase 5), so
-    // tableidx N in the binary maps 1:1 to `tables(N)` here. Each segment's
-    // refs resolve against the module's whole `funcs` index space (imports
-    // + defined), the same way `call funcidx` does — so a `(elem
+    // Unified tableidx space: imports first (live `RuntimeTable` instances
+    // from host modules), then module-defined tables. Each segment's refs
+    // resolve against the module's whole `funcs` index space (imports +
+    // defined), the same way `call funcidx` does — so a `(elem
     // (i32.const 0) func 0)` referring to the first imported function
     // resolves correctly.
-    val tables: Array[RuntimeTable] = new Array[RuntimeTable](module.tables.size)
+    val nTableImports = module.tableImports.length
+    val nTableDefs    = module.tables.length
+    val totalTables   = nTableImports + nTableDefs
+    val tables: Array[RuntimeTable] = new Array[RuntimeTable](totalTables)
+    var tim = 0
+    while tim < nTableImports do
+      val ti = module.tableImports(tim)
+      val ht = hostsTables.get(ti.module).flatMap(_.get(ti.name)).getOrElse {
+        fail(WasmError.UnknownImport(ti.module, ti.name))
+      }
+      if ht.refType != ti.refType then
+        fail(WasmError.InvalidModule(
+          s"table import ${ti.module}.${ti.name}: reftype mismatch (host=${ht.refType}, module=${ti.refType})"))
+      if ht.size < ti.min then
+        fail(WasmError.InvalidModule(
+          s"table import ${ti.module}.${ti.name}: host size ${ht.size} < declared min ${ti.min}"))
+      (ti.max, ht.max) match
+        case (Some(declMax), Some(hostMax)) if hostMax > declMax =>
+          fail(WasmError.InvalidModule(
+            s"table import ${ti.module}.${ti.name}: host max $hostMax > declared max $declMax"))
+        case (Some(_), None) =>
+          fail(WasmError.InvalidModule(
+            s"table import ${ti.module}.${ti.name}: module declared a max but host table is unbounded"))
+        case _ => ()
+      tables(tim) = ht
+      tim += 1
     var ti = 0
-    while ti < module.tables.size do
-      val t = module.tables(ti)
-      if t.min < 0 then fail(WasmError.InvalidModule(s"table $ti: negative min size"))
+    while ti < nTableDefs do
+      val t    = module.tables(ti)
+      val tidx = nTableImports + ti
+      if t.min < 0 then fail(WasmError.InvalidModule(s"table $tidx: negative min size"))
       val rt = new RuntimeTable(t.refType, t.max)
       rt.allocate(t.min, RefNull(t.refType))
-      tables(ti) = rt
+      tables(tidx) = rt
       ti += 1
 
     // === element segments ==================================================
@@ -467,16 +560,15 @@ object Runtime:
         name -> idx
     }.toMap
 
-    // Validate any TableExport indices up front. Phase 3 doesn't ship a
-    // host-side `tableValue` accessor (the surface is internal to
-    // `call_indirect`), but a bogus index in the binary should still
-    // surface here rather than wait for a runtime read.
-    module.exports.foreach {
+    // Surface TableExport so a host can pull an exported table back out
+    // by name (used by the spec runner's cross-module `register` flow,
+    // which forwards one module's tables as another module's imports).
+    val exportTables: Map[String, Int] = module.exports.iterator.collect {
       case TableExport(name, idx) =>
         if idx < 0 || idx >= tables.length then
           fail(WasmError.InvalidModule(s"export `$name` references invalid table $idx"))
-      case _ => ()
-    }
+        name -> idx
+    }.toMap
 
     // === tags (EH proposal) ================================================
     // Build the per-tag payload-types vector — imports first, then defs —
@@ -538,6 +630,7 @@ object Runtime:
       exportFuncs,
       exportGlobals,
       exportMemories,
+      exportTables,
       dataBytes,
       dataDropped,
       elemRefs,

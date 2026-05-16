@@ -103,12 +103,12 @@ object Validator:
       // Export-section validation. Every export must (a) reference an index
       // that's in range for its kind and (b) have a name distinct from every
       // other export in the module — the spec's `unique-names` invariant on
-      // the export section. Funcidxs and globalidxs unify imports + defs;
-      // tags unify tagImports + tags; tables/memories are module-defined
-      // only (imports of those kinds not yet surfaced in the model).
-      val totalFuncs   = module.imports.length + module.functions.length
-      val totalGlobals = module.globalImports.length + module.globals.length
-      val totalTags    = module.tagImports.length + module.tags.length
+      // the export section. All five index spaces unify imports + defs.
+      val totalFuncs    = module.imports.length       + module.functions.length
+      val totalGlobals  = module.globalImports.length + module.globals.length
+      val totalTables   = module.tableImports.length  + module.tables.length
+      val totalMemories = module.memoryImports.length + module.memories.length
+      val totalTags     = module.tagImports.length    + module.tags.length
       val seenExports = scala.collection.mutable.HashSet.empty[String]
       module.exports.foreach { exp =>
         if !seenExports.add(exp.name) then
@@ -120,11 +120,11 @@ object Validator:
               throw new ValFail(WasmError.InvalidModule(
                 s"export $name: unknown function $idx"))
           case TableExport(name, idx) =>
-            if idx < 0 || idx >= module.tables.length then
+            if idx < 0 || idx >= totalTables then
               throw new ValFail(WasmError.InvalidModule(
                 s"export $name: unknown table $idx"))
           case MemoryExport(name, idx) =>
-            if idx < 0 || idx >= module.memories.length then
+            if idx < 0 || idx >= totalMemories then
               throw new ValFail(WasmError.InvalidModule(
                 s"export $name: unknown memory $idx"))
           case GlobalExport(name, idx) =>
@@ -137,6 +137,11 @@ object Validator:
                 s"export $name: unknown tag $idx"))
       }
       val funcSigs       = collectFuncSigs(module)
+      // Unified table reftypes — imports first, then defs — for opcode
+      // immediate type-checking inside function bodies. Same imports-
+      // first ordering the runtime uses for its `tables` array.
+      val tableRefTypes  =
+        module.tableImports.map(_.refType) ++ module.tables.map(_.refType)
       // Unified global signatures — imports first (carrying their declared
       // mutability and valuetype), then defined globals. Function bodies'
       // `global.get` / `global.set` immediates and any `global.get` in a
@@ -200,7 +205,6 @@ object Validator:
           checkConstInit(s"element segment $idx offset", offset, ValueType.I32Type, maxGlobalIdx = totalGlobals)
         case _ => ()
       }
-      val tableRefTypes  = module.tables.map(_.refType)
       val elemRefTypes   = module.elements.map(_.refType)
       val tagTypes       = collectTagTypes(module)
       // Phase 8.C: build the set of "declared" funcidxs — those that may
@@ -238,9 +242,9 @@ object Validator:
           funcSigs         = funcSigs,
           globalSigs       = globalSigs,
           types            = module.types,
-          tableCount       = module.tables.length,
+          tableCount       = totalTables,
           tableRefTypes    = tableRefTypes,
-          memoryCount      = module.memories.length,
+          memoryCount      = totalMemories,
           dataSegmentCount = module.data.length,
           elemSegmentCount = module.elements.length,
           elemRefTypes     = elemRefTypes,

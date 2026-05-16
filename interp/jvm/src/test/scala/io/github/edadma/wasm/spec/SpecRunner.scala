@@ -21,6 +21,18 @@ private[spec] final class SpecRunner(manifestPath: Path):
     * command and after a load failure. */
   private var current: Option[ModuleInstance] = None
 
+  /** Modules addressable by `$name` (from `(module $Mf ...)` declarations).
+    * Cross-module-targeted actions look up modules here when the action
+    * specifies `"module": "$Mf"`. */
+  private val namedModules = scala.collection.mutable.HashMap.empty[String, ModuleInstance]
+
+  /** Cross-module `register` registry. `(register "Mf")` binds the current
+    * (or named) module to host-name `"Mf"`. Subsequent module loads pass
+    * these instances as additional `HostModule`s so imports of the form
+    * `(import "Mf" "func" ...)` resolve against the registered module's
+    * exports. */
+  private val registered = scala.collection.mutable.HashMap.empty[String, ModuleInstance]
+
   def run(): Stats =
     val text     = new String(Files.readAllBytes(manifestPath), java.nio.charset.StandardCharsets.UTF_8)
     val manifest = MiniJson.parseObject(text)
@@ -40,12 +52,26 @@ private[spec] final class SpecRunner(manifestPath: Path):
     stats
 
   private def execute(cmd: SpecCommand, stats: Stats): Unit = cmd match
-    case SpecCommand.Module(line, fn) =>
+    case SpecCommand.Module(line, name, fn) =>
       loadModule(fn) match
-        case Right(inst) => current = Some(inst); stats.pass()
+        case Right(inst) =>
+          current = Some(inst)
+          name.foreach(n => namedModules(n) = inst)
+          stats.pass()
         case Left(err)   =>
           current = None
           stats.fail(line, s"module load failed: $err")
+
+    case SpecCommand.Register(line, asName, modName) =>
+      val target = modName match
+        case Some(n) => namedModules.get(n)
+        case None    => current
+      target match
+        case Some(inst) =>
+          registered(asName) = inst
+          stats.pass()
+        case None =>
+          stats.fail(line, s"register $asName: ${modName.getOrElse("current module")} not found")
 
     case SpecCommand.Action(_, action) =>
       runAction(action) match
@@ -101,14 +127,25 @@ private[spec] final class SpecRunner(manifestPath: Path):
   private def loadModule(filename: String): Either[WasmError, ModuleInstance] =
     val p     = baseDir.resolve(filename)
     val bytes = Files.readAllBytes(p)
-    Runtime.instantiate(bytes, Seq(EnvModule.default, SpectestModule))
+    // Hosts available to the new module: built-ins (env, spectest) +
+    // every previously-registered module wrapped as a HostModule.
+    val hosts = Seq(EnvModule.default, SpectestModule) ++
+      registered.iterator.map { case (name, inst) => SpecRunner.wrapAsHostModule(name, inst) }
+    Runtime.instantiate(bytes, hosts)
+
+  /** Resolve the target instance for an action — either a `$name`-bound
+    * module or the current one. */
+  private def actionTarget(modName: Option[String]): Either[WasmError, ModuleInstance] =
+    modName match
+      case Some(n) => namedModules.get(n).toRight(WasmError.InvalidModule(s"no module named $n"))
+      case None    => current.toRight(WasmError.InvalidModule("no current module"))
 
   private def runAction(action: SpecCommand.ActionExpr): Either[WasmError, Seq[Value]] =
-    current match
-      case None       => Left(WasmError.InvalidModule("no current module"))
-      case Some(inst) => action match
-        case SpecCommand.Invoke(field, args) => inst.invoke(field, args.map(_.asInstanceOf[Value]))
-        case SpecCommand.GetGlobal(field)    => inst.globalValue(field).map(v => Seq(v))
+    action match
+      case SpecCommand.Invoke(modName, field, args) =>
+        actionTarget(modName).flatMap(_.invoke(field, args.map(_.asInstanceOf[Value])))
+      case SpecCommand.GetGlobal(modName, field) =>
+        actionTarget(modName).flatMap(_.globalValue(field)).map(v => Seq(v))
 
   private def compareReturn(line: Int, actual: Seq[Value], expected: Vector[SpecValue.Expected], stats: Stats): Unit =
     if actual.length != expected.length then
@@ -124,6 +161,61 @@ private[spec] final class SpecRunner(manifestPath: Path):
       if ok then stats.pass()
 
 private[spec] object SpecRunner:
+
+  /** Wrap an instantiated module as a HostModule so its exports satisfy
+    * another module's imports — the workhorse behind the wast2json
+    * `register` command. Each exported function becomes a HostFunc that
+    * forwards through `inst.invoke`; exported memories and tables
+    * forward by reference (the same backing array, so guest writes are
+    * mutually observable); exported globals forward as a snapshot taken
+    * at register time. (Live mutable-global sharing across module
+    * boundaries would need an extra layer of indirection; the linking
+    * manifest's mutable-global tests will surface that gap if they
+    * matter for our slice.) */
+  private[spec] def wrapAsHostModule(hostName: String, inst: ModuleInstance): HostModule =
+    new HostModule:
+      val name: String = hostName
+
+      override val functions: Map[String, HostFunc] =
+        inst.exportedFunctionNames.iterator.map { fname =>
+          // Propagate any trap from the inner invoke as `ExecFail`, which
+          // the calling Interpreter's outer catch converts back to
+          // `Left(err)` at the API boundary.
+          val fn: HostFunc = (_, args) =>
+            inst.invoke(fname, args) match
+              case Right(values) => values
+              case Left(err)     => throw new Interpreter.ExecFail(err)
+          fname -> fn
+        }.toMap
+
+      override val memories: Map[String, Memory] =
+        inst.exportedMemoryNames.iterator.flatMap { n =>
+          inst.exportedMemory(n).toOption.map(n -> _)
+        }.toMap
+
+      override val tables: Map[String, RuntimeTable] =
+        inst.exportedTableNames.iterator.flatMap { n =>
+          inst.exportedTable(n).toOption.map(n -> _)
+        }.toMap
+
+      override val globals: Map[String, HostGlobal] =
+        inst.exportedGlobalNames.iterator.flatMap { n =>
+          for
+            v   <- inst.globalValue(n).toOption
+            mut <- inst.exportedGlobalMutability(n).toOption
+          yield
+            val vt = v match
+              case _: I32       => ValueType.I32Type
+              case _: I64       => ValueType.I64Type
+              case _: F32       => ValueType.F32Type
+              case _: F64       => ValueType.F64Type
+              case _: V128      => ValueType.V128Type
+              case RefNull(rt)  => ValueType.fromRef(rt)
+              case _: RefFunc   => ValueType.FuncRefType
+              case _: RefExtern => ValueType.ExternRefType
+              case _: RefExn    => ValueType.ExnRefType
+            n -> HostGlobal(vt, mutable = mut, v)
+        }.toMap
 
   final class Stats(val name: String):
     var passed:    Int                                = 0
