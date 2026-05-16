@@ -241,7 +241,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 615 interpreter tests
+sbt 'interpJVM/Test/run'    # 619 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -252,7 +252,7 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **837 tests** on JVM (615 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **841 tests** on JVM (619 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ### W3C testsuite
 

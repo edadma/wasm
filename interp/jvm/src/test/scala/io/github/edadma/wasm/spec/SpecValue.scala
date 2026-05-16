@@ -49,13 +49,81 @@ private[spec] object SpecValue:
   // ----------------------------------------------------------------------
 
   /** Decode a wast2json value record on the *argument* side (always a
-    * concrete bit pattern — no NaN literals on inputs). */
+    * concrete bit pattern — no NaN literals on inputs). v128 arguments
+    * are packed back into a 16-byte `V128` from the per-lane bit pattern
+    * record `wast2json` emits. */
   def decodeArg(rec: Map[String, Any]): Value =
-    decodeExpected(rec) match
-      case Exact(v)             => v
-      case RefNullExpected(rt)  => RefNull(rt)
-      case RefExternExpected(i) => RefExtern(java.lang.Long.valueOf(i))
-      case other                => sys.error(s"argument cannot be a NaN class or v128 expectation: $other")
+    rec("type") match
+      case "v128" => decodeV128Arg(rec)
+      case _ =>
+        decodeExpected(rec) match
+          case Exact(v)             => v
+          case RefNullExpected(rt)  => RefNull(rt)
+          case RefExternExpected(i) => RefExtern(java.lang.Long.valueOf(i))
+          case other                => sys.error(s"argument cannot be a NaN class: $other")
+
+  /** Pack a v128 argument record's lane-shaped value array back into a
+    * little-endian 16-byte block. Mirrors `unpackLanes` but in reverse
+    * — and rejects NaN class literals (arguments are always concrete). */
+  private def decodeV128Arg(rec: Map[String, Any]): Value =
+    val laneType = rec("lane_type").asInstanceOf[String]
+    val raw      = rec("value").asInstanceOf[Vector[Any]].map(_.asInstanceOf[String])
+    val bytes    = new Array[Byte](16)
+    laneType match
+      case "i8" =>
+        var i = 0
+        while i < 16 do
+          bytes(i) = (java.lang.Long.parseUnsignedLong(raw(i)) & 0xffL).toByte
+          i += 1
+      case "i16" =>
+        var i = 0
+        while i < 8 do
+          val v = (java.lang.Long.parseUnsignedLong(raw(i)) & 0xffffL).toInt
+          bytes(i * 2)     = (v & 0xff).toByte
+          bytes(i * 2 + 1) = ((v >>> 8) & 0xff).toByte
+          i += 1
+      case "i32" =>
+        var i = 0
+        while i < 4 do
+          val v = java.lang.Long.parseUnsignedLong(raw(i)).toInt
+          val o = i * 4
+          bytes(o)     = (v & 0xff).toByte
+          bytes(o + 1) = ((v >>> 8) & 0xff).toByte
+          bytes(o + 2) = ((v >>> 16) & 0xff).toByte
+          bytes(o + 3) = ((v >>> 24) & 0xff).toByte
+          i += 1
+      case "i64" =>
+        var i = 0
+        while i < 2 do
+          val v = java.lang.Long.parseUnsignedLong(raw(i))
+          val o = i * 8
+          var k = 0
+          while k < 8 do
+            bytes(o + k) = ((v >>> (k * 8)) & 0xffL).toByte
+            k += 1
+          i += 1
+      case "f32" =>
+        var i = 0
+        while i < 4 do
+          val bits = java.lang.Long.parseUnsignedLong(raw(i)).toInt
+          val o    = i * 4
+          bytes(o)     = (bits & 0xff).toByte
+          bytes(o + 1) = ((bits >>> 8) & 0xff).toByte
+          bytes(o + 2) = ((bits >>> 16) & 0xff).toByte
+          bytes(o + 3) = ((bits >>> 24) & 0xff).toByte
+          i += 1
+      case "f64" =>
+        var i = 0
+        while i < 2 do
+          val bits = java.lang.Long.parseUnsignedLong(raw(i))
+          val o    = i * 8
+          var k    = 0
+          while k < 8 do
+            bytes(o + k) = ((bits >>> (k * 8)) & 0xffL).toByte
+            k += 1
+          i += 1
+      case other => sys.error(s"bad v128 arg lane_type '$other'")
+    V128(bytes)
 
   /** Decode a wast2json value record into an `Expected`. */
   def decodeExpected(rec: Map[String, Any]): Expected =

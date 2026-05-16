@@ -88,3 +88,20 @@ object SimdConstTests:
       val actual = callV128(inst, "zero_init_local")
       check(bytesEq(actual, zeros), s"v128 zero-init wrong: ${actual.mkString(",")}")
     }
+
+    test("v128.const works inside a const-expr (global initializer)") {
+      // Regression — surfaced by simd_const.wast / simd_splat.wast /
+      // simd_lane.wast / simd_store{8,16,32,64}_lane.wast in the W3C
+      // spec runner. The const-expr reader rejected the 0xFD prefix
+      // because only scalar/ref const forms were recognised; now
+      // accepts `0xFD 0x0C` + 16 raw bytes.
+      val inst = instantiate(Fixtures.simd_const_global)
+      val actual = callV128(inst, "read")
+      // i32x4 0x11223344 0x55667788 0x99aabbcc 0xddeeff00 in little-endian:
+      val expected = b16(
+        0x44, 0x33, 0x22, 0x11,
+        0x88, 0x77, 0x66, 0x55,
+        0xcc, 0xbb, 0xaa, 0x99,
+        0x00, 0xff, 0xee, 0xdd)
+      check(bytesEq(actual, expected), s"v128 global init wrong: ${actual.mkString(",")}")
+    }
