@@ -54,15 +54,16 @@
     {{ if .page.summary }}
       <p class="juicerdocs-hero-summary">{{ .page.summary }}</p>
     {{ end }}
-    {{ // Hero call-to-action row. The two buttons are independently
-       // opt-in: "Get started" appears when `[juicerdocs].getStarted = true`,
+    {{ // Hero call-to-action row. "Get started" is ON BY DEFAULT — set
+       // `[juicerdocs].getStarted = false` in site.toml to hide it (use
+       // this when the site has no `/getting-started/` section).
        // "Star on GitHub" appears when top-level `repoURL` is set. When
        // BOTH are off the wrapper isn't emitted at all — the hero
        // collapses cleanly (no empty <div> taking the `margin-top: 2rem`
        // the actions row normally reserves). }}
-    {{ if .site.juicerdocs.getStarted or .site.repoURL }}
+    {{ if (.site.juicerdocs.getStarted != false) or .site.repoURL }}
     <div class="juicerdocs-hero-actions">
-      {{ if .site.juicerdocs.getStarted }}
+      {{ if .site.juicerdocs.getStarted != false }}
       <a href="{{ relURL '/getting-started/' }}" class="juicerdocs-btn juicerdocs-btn-primary">
         Get started
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="m9 5 7 7-7 7"/></svg>
