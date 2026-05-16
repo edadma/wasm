@@ -103,8 +103,8 @@ object ParserAndRuntimeTests:
     test("parser: section size overflowing file returns InvalidModule") {
       val bad = Header ++ b(0x01, 0x7f)            // section 1 claims 127 bytes, content 0 bytes
       Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("overflows"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(overflows), got $other")
+        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("length out of bounds"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule(length out of bounds), got $other")
     }
     test("parser: non-0x60 functype tag returns InvalidModule") {
       val bad = patchFirst(Fixtures.arith, 0x60, 0x61)
@@ -768,6 +768,102 @@ object ParserAndRuntimeTests:
       Runtime.instantiate(mod, Seq(EnvModule.default)) match
         case Right(_)  => ()
         case Left(err) => check(false, s"valid UTF-8 emoji should round-trip, got $err")
+    }
+
+    test("leb128: 6-byte ULEB128 is rejected (integer representation too long)") {
+      // A u32 LEB128 with 6 high-bit-set bytes — past the 5-byte cap.
+      // Use a 6-byte memory section size: 80 80 80 80 80 00 (= 0 but 6 bytes).
+      val bad = Header ++ b(0x05, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("representation too long") || msg.contains("integer"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("leb128: u32 with high data bits on 5th byte rejected (integer too large)") {
+      // 80 80 80 80 10 = 0x10 << 28 — bit 32 is set, doesn't fit u32.
+      // Place as a memory section size.
+      val bad = Header ++ b(0x05, 0x80, 0x80, 0x80, 0x80, 0x10)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("integer too large") || msg.contains("integer"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: section id 14 (out of range) rejected as malformed section id") {
+      val bad = Header ++ b(0x0e, 0x01, 0x00)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("malformed section id"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: duplicate non-custom section is rejected") {
+      // Two Type sections — both id=1, second should fail.
+      val bad = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+      )
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("duplicate or out-of-order"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: out-of-order non-custom section is rejected") {
+      // Section 3 (Function) before section 1 (Type) — out of order.
+      val bad = Header ++ b(
+        0x03, 0x02, 0x01, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+      )
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("duplicate or out-of-order"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: section with size mismatch (overshoot) is rejected") {
+      // Type section: declared size 4 bytes but only 1 byte of content (count=0).
+      val bad = Header ++ b(0x01, 0x04, 0x00)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          // Either the size-mismatch or length-out-of-bounds path can
+          // surface — both name the section id, both are correct rejections.
+          check(msg.contains("section") && (msg.contains("size") || msg.contains("length")), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: too many locals (sum exceeds u32) rejected without OOM") {
+      // 4 groups of count 0x40000000 each — sum = 2^32 (>= u32 max + 1).
+      // Body: bodySize=0x1c, 4 groups (count=0x40000000 ff ff ff ff 0f, type)...
+      // Use the binary.44 shape: each count is 80 80 80 80 04 (= 0x40000000)
+      val bad = Header ++ b(
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,                 // type (i32,i32)->()
+        0x03, 0x02, 0x01, 0x00,                                          // 1 func, type 0
+        0x0a, 0x1c, 0x01,                                                // code section
+        0x1a, 0x04,                                                      // body size, 4 groups
+        0x80, 0x80, 0x80, 0x80, 0x04, 0x7f,                              // count 0x40000000, i32
+        0x80, 0x80, 0x80, 0x80, 0x04, 0x7e,                              // count 0x40000000, i64
+        0x80, 0x80, 0x80, 0x80, 0x04, 0x7d,                              // count 0x40000000, f32
+        0x80, 0x80, 0x80, 0x80, 0x04, 0x7c,                              // count 0x40000000, f64
+        0x0b,                                                            // end
+      )
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("too many locals"), s"message: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("parser: custom section with size 0 is rejected (no room for name)") {
+      // A custom section's name is mandatory — size 0 means no bytes
+      // for even the name length prefix. We reject either with "unexpected
+      // end" (the name-overruns-section check) or the LEB128 reader's
+      // own EOF diagnostic, depending on whether the file has trailing
+      // bytes after the section. Both rejections are correct.
+      val bad = Header ++ b(0x00, 0x00)
+      Runtime.instantiate(bad, Seq(EnvModule.default)) match
+        case Left(WasmError.InvalidModule(_)) => ()
+        case other => check(false, s"expected InvalidModule, got $other")
     }
 
   // === EnvModule.default smoke test =======================================

@@ -30,7 +30,7 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 51005 passed, 909 failed, 1296 skipped (of 53210) ==
+== Spec totals: 51063 passed, 851 failed, 1296 skipped (of 53210) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -59,7 +59,7 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 
 ## Known failures
 
-16 manifests are pinned in `SpecComplianceTests.KnownFailures` — each one needs non-trivial implementation work beyond the surgical bug-fix pattern. They're grouped by the feature gap they represent:
+13 manifests are pinned in `SpecComplianceTests.KnownFailures` — each one needs non-trivial implementation work beyond the surgical bug-fix pattern. They're grouped by the feature gap they represent:
 
 **Function-references / GC proposals** (not on the roadmap):
 
@@ -94,21 +94,11 @@ The wast2json command stream includes `register` commands that bind a module ins
 |-----------|
 | `linking` |
 
-**Binary-format strictness** (parser-side `assert_malformed`):
-
-Various spec rules around LEB termination bits, section ordering, and malformed type encodings that our parser is currently lax about.
-
-| Manifest        |
-|-----------------|
-| `binary`        |
-| `binary-leb128` |
-| `custom`        |
-
 Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest is removed from `KnownFailures.names`.
 
 ## What the runner caught
 
-Triage across the initial run-up and four coverage-expansion passes surfaced eleven real interpreter bugs:
+Triage across the initial run-up and four coverage-expansion passes surfaced twelve real interpreter bugs:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
@@ -121,5 +111,12 @@ Triage across the initial run-up and four coverage-expansion passes surfaced ele
 9. **`try_table` catch labels counted with the try_table on the label stack.** Per the EH proposal, catch label indices count from the OUTER scope — the try_table is not yet on the label stack from the catch clause's perspective. Both the validator (pushed the try_table frame before validating catches) and the runtime (didn't pop the try_table label before `branchTo`) had matching off-by-one errors. Fix moves the `pushCtrl` after the catch-vector validation and adds a label-pop in the runtime's throw-dispatch path.
 10. **Export-section validation was missing entirely.** Two spec rules went unenforced: (a) export names must be unique within a module (duplicate `(export "foo" ...)` declarations were silently accepted, with the second shadowing the first); (b) each export's index must be in range for its kind (a `funcidx` past the imports+defs count, a `globalidx` past the global section, etc. all instantiated). Added a single pass over `module.exports` at the top of `Validator.validate` that checks both invariants.
 11. **Name-field UTF-8 validation was missing.** Every `name` byte sequence in the wire format (import module/field names, export names, custom-section ids, name-section subsections) must be valid UTF-8 per the spec. We were decoding via `new String(bytes, "UTF-8")` which silently maps malformed bytes to U+FFFD instead of rejecting. Added an RFC 3629 strict walker called from `Cursor.readName` that rejects stray continuations, overlong forms (`0xC0`/`0xC1` and the overlong 3/4-byte variants), surrogate codepoints (U+D800..U+DFFF), values past U+10FFFF, lead bytes `0xF5`..`0xFF`, and truncated multi-byte sequences. Also let the diagnostic propagate from `parseCustomSection` so the section name itself is enforced (was silently caught).
+12. **Binary-format strictness gaps** — seven small rules our parser was lax about, surfaced together by the `binary`, `binary-leb128`, and `custom` manifests:
+    - **LEB128 range checks.** `readU32` / `readS32` / `readS64` accepted oversize encodings: a 5-byte ULEB whose final byte had data bits past position 32 silently overflowed; signed forms were equally permissive on the sign-extension bits. Final byte now enforces the u32 / s32 / s64 width, with the spec's distinct diagnostics for "integer too large" (value outside type range) and "integer representation too long" (more bytes than the type's max).
+    - **Section ID range.** IDs outside 0..13 silently fell through `case _ => ()`. Now rejected as "malformed section id".
+    - **Section order + uniqueness.** Non-custom sections must appear at most once and in canonical *logical* order. The IDs aren't monotonically ascending — Tag (13) is logically between Memory (5) and Global (6), and DataCount (12) is between Element (9) and Code (10). A small id → position table enforces both rules.
+    - **Section size mismatch.** `c.pos = secEnd` after each section silently absorbed under- or over-consumed bytes; now each non-custom section must land exactly at `secEnd`.
+    - **Custom section name overruns size.** A custom section with declared size 0 has no bytes for even the name-length prefix. We were reading past the section into the next one. `parseCustomSection` now verifies the name read didn't overshoot `secEnd`.
+    - **Too many locals.** A function's local-count groups summed past `2^32 - 1` were accepted; even a single huge group (e.g. `count = 0x40000000`) OOM-ed the allocation loop before the sum check could fire. Now the code reads all (count, type) groups first, sums in `Long` arithmetic with overflow check, *then* expands.
 
-All eleven ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.
+All twelve ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.
