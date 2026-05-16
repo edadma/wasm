@@ -132,12 +132,6 @@ private[spec] object KnownFailures:
     * runner doesn't implement that dispatch yet.
     *   - `linking`
     *
-    * --- Binary-format strictness (parser-side `assert_malformed`) ---
-    * Various spec rules around LEB termination bits, section ordering,
-    * malformed type encodings that our parser is lax about.
-    *   - `binary`
-    *   - `binary-leb128`
-    *   - `custom`
     */
   private val names: Set[String] = Set(
     // Function-references / GC proposals
@@ -157,10 +151,6 @@ private[spec] object KnownFailures:
     "table_grow",
     // Cross-module register
     "linking",
-    // Binary-format strictness
-    "binary",
-    "binary-leb128",
-    "custom",
   )
 
   def expected(name: String): Boolean = names.contains(name)

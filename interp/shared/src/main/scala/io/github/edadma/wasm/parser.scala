@@ -166,11 +166,42 @@ object Parser:
     var tagImports = Vector.empty[TagImport]
     var tags       = Vector.empty[Tag]
 
+    // Spec: known section IDs are 0..13. Anything else is "malformed
+    // section id". Non-custom sections must appear at most once and in
+    // canonical *logical* order — the numeric IDs are NOT monotonically
+    // ascending because the EH proposal slotted Tag (13) between Memory
+    // (5) and Global (6), and bulk-memory slotted DataCount (12) between
+    // Element (9) and Code (10). `sectionOrder` maps id → logical
+    // position so we can enforce ascending order across both insertions.
+    val sectionOrder: Array[Int] = Array(
+      /*  0 Custom    */ -1,  // handled separately
+      /*  1 Type      */ 1,
+      /*  2 Import    */ 2,
+      /*  3 Function  */ 3,
+      /*  4 Table     */ 4,
+      /*  5 Memory    */ 5,
+      /*  6 Global    */ 7,
+      /*  7 Export    */ 8,
+      /*  8 Start     */ 9,
+      /*  9 Element   */ 10,
+      /* 10 Code      */ 12,
+      /* 11 Data      */ 13,
+      /* 12 DataCount */ 11,
+      /* 13 Tag       */ 6,
+    )
+    var lastNonCustomPos = 0
     while c.hasMore do
       val id      = c.readByte()
       val size    = c.readU32()
       val secEnd  = c.pos + size
-      if secEnd > c.bytes.length then fail(WasmError.InvalidModule(s"section $id overflows file"))
+      if secEnd > c.bytes.length then fail(WasmError.InvalidModule(s"section $id: length out of bounds"))
+      if id < 0 || id > 13 then
+        fail(WasmError.InvalidModule(s"malformed section id 0x${id.toHexString}"))
+      if id != 0 then
+        val pos = sectionOrder(id)
+        if pos <= lastNonCustomPos then
+          fail(WasmError.InvalidModule(s"unexpected content after last section: duplicate or out-of-order section id $id"))
+        lastNonCustomPos = pos
 
       id match
         case 0  => funcNames = parseCustomSection(c, secEnd, funcNames)       // section 0 is "custom" — `name` is one of these
@@ -190,8 +221,17 @@ object Parser:
         case 11 => data      = parseDataSection(c)
         case 12 => dataCount = Some(c.readU32())                              // Section 12 (Data Count)
         case 13 => tags      = parseTagSection(c)                             // Section 13 (Tag) — EH proposal
-        case _  => () // ignore any future / unknown id
-      c.pos = secEnd
+      // Spec: after parsing a section, the cursor must land exactly on
+      // the declared section end — under-consumed bytes are "section
+      // size mismatch" (the declared size was wrong) and over-consumed
+      // bytes mean we read past where the section header said we should.
+      // Custom sections are allowed to leave trailing payload (any
+      // bytes after the recognised content are arbitrary debug info),
+      // so the position is forced to secEnd for id == 0.
+      if id == 0 then
+        c.pos = secEnd
+      else if c.pos != secEnd then
+        fail(WasmError.InvalidModule(s"section $id: section size mismatch"))
 
     if codes.size != functions.size then
       fail(WasmError.InvalidModule(
@@ -445,6 +485,8 @@ object Parser:
     // The inner subsection-1 parse below remains best-effort (truncated
     // debug info shouldn't take down a binary that's otherwise fine).
     val sectionName = c.readName()
+    if c.pos > secEnd then
+      fail(WasmError.InvalidModule("unexpected end: custom section name reads past declared section size"))
     if sectionName != "name" then return current
     var out = current
     while c.pos < secEnd do
@@ -604,12 +646,27 @@ object Parser:
       val bodySize = c.readU32()
       val bodyEnd  = c.pos + bodySize
       val nLocals  = c.readU32()
-      val locals   = ArrayBuffer.empty[ValueType]
+      // Spec: the sum of all group counts must fit in a u32. We can't just
+      // accumulate as we expand because a single huge count (e.g.
+      // 0x40000000) would OOM the allocation loop before a later group
+      // tips the sum past 2^32 - 1. Read all the (count, type) pairs into
+      // a small array first, sum-check, *then* expand.
+      val groups: Array[(Int, ValueType)] = new Array(nLocals)
+      var localsTotal: Long = 0L
       var i = 0
       while i < nLocals do
         val count = c.readU32()
         val t     = readValType(c)
-        var k     = 0
+        groups(i) = (count, t)
+        localsTotal += (count.toLong & 0xffffffffL)
+        if localsTotal > 0xffffffffL then
+          fail(WasmError.InvalidModule(s"too many locals: sum exceeds u32"))
+        i += 1
+      val locals = ArrayBuffer.empty[ValueType]
+      i = 0
+      while i < nLocals do
+        val (count, t) = groups(i)
+        var k = 0
         while k < count do { locals += t; k += 1 }
         i += 1
       // Whatever is left in the body slot is the instruction stream (terminated by 0x0B).
