@@ -50,6 +50,10 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 
 See [Development → Architecture](https://edadma.github.io/wasm/development/architecture/) for the full source-tree layout, and [Development → Testing](https://edadma.github.io/wasm/development/testing/) for the unit suites, W3C testsuite runner, and fixture regeneration.
 
+## Status
+
+**881 tests** on JVM (653 interp + 209 wasi + 19 cli), all green; interp + wasi also green on Scala.js (Node 20+) and Scala Native (0.5.11). W3C testsuite slice: **133 of 142 manifests fully green**, 9 pinned in `KnownFailures` with documented residuals. See [docs/spec-compliance](https://edadma.github.io/wasm/reference/spec-compliance/) for details.
+
 ## License
 
 ISC — see [LICENSE](LICENSE).

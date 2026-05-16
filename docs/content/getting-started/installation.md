@@ -32,12 +32,12 @@ If you want to build the repo locally — to run the test suite, hack on the int
 git clone https://github.com/edadma/wasm.git
 cd wasm
 sbt test                                              # whole tree, all backends
-sbt 'interpJVM/Test/run'                              # 648 interpreter tests, JVM
-sbt 'wasiJVM/Test/run'                                # 208 WASI tests, JVM
-sbt 'cliJVM/Test/run'                                 # 14 CLI tests
+sbt 'interpJVM/Test/run'                              # 653 interpreter tests, JVM
+sbt 'wasiJVM/Test/run'                                # 209 WASI tests, JVM
+sbt 'cliJVM/Test/run'                                 # 19 CLI tests
 ```
 
-The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **870 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
+The aggregate `sbt test` runs the interpreter and WASI suites on JVM, Scala.js (Node 20+), and Scala Native, plus the CLI suite on the JVM. **881 tests** total on JVM; the interpreter and WASI also pass on JS and Native.
 
 ## Linking against a local checkout
 

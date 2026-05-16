@@ -483,19 +483,49 @@ object WasiFsTests:
             "dst[0] must remain 'a' — no write past EOF")
     }
 
-    test("fd_read: EBADF on stdio/preopen/never-opened fds") {
+    test("fd_read: EBADF on stdout/stderr/preopen/never-opened fds; stdin reads default-EOF") {
       val files = Map("h" -> "x".getBytes("UTF-8"))
       val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
                                   preopens = Seq(Preopen.inMemory("/s", files)))
       storeI32(inst, 256, 768)
       storeI32(inst, 260, 4)
-      // fd 0/1/2 — stdio. fd 3 — preopen (directory, not readable). fd 99
-      // — never opened.
-      for badFd <- Seq(0, 1, 2, 3, 99) do
+      // fd 1/2 — stdio writes. fd 3 — preopen (directory, not readable).
+      // fd 99 — never opened. All four reject with EBADF.
+      for badFd <- Seq(1, 2, 3, 99) do
         callFdRead(inst, fd = badFd, iovs = 256, iovsLen = 1, nreadOut = 320) match
           case Right(Seq(I32(errno))) =>
             check(errno == Wasi.EBADF, s"fd=$badFd errno=$errno (want EBADF)")
           case other => check(false, s"call_fd_read(fd=$badFd): $other")
+      // fd 0 — stdin — now dispatches to ctx.stdin. Default impl returns 0
+      // bytes (EOF), so the read succeeds with nread=0 rather than EBADF.
+      callFdRead(inst, fd = 0, iovs = 256, iovsLen = 1, nreadOut = 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"fd=0 errno=$errno (want ESUCCESS for empty stdin)")
+          check(peekI32(inst, 320) == 0, "fd_read on default stdin should report 0 bytes")
+        case other => check(false, s"call_fd_read(fd=0): $other")
+    }
+
+    test("fd_read: host-supplied stdin streams bytes through fd 0") {
+      val payload   = "hello".getBytes("UTF-8")
+      val (inst, _) = instantiate(WasiFixtures.wasi_fd_io,
+                                  stdin = WasiContext.stdinFromBytes(payload))
+      // Single iovec: buf=768, len=10 — bigger than the payload so we see
+      // the partial-read (short-read = EOF) behaviour.
+      storeI32(inst, 256, 768)
+      storeI32(inst, 260, 10)
+      callFdRead(inst, fd = 0, iovs = 256, iovsLen = 1, nreadOut = 320) match
+        case Right(Seq(I32(errno))) =>
+          check(errno == Wasi.ESUCCESS, s"errno=$errno (want ESUCCESS)")
+          check(peekI32(inst, 320) == payload.length, s"nread=${peekI32(inst, 320)} (want ${payload.length})")
+          val readBackBytes = new Array[Byte](payload.length)
+          (0 until payload.length).foreach { i =>
+            inst.invoke("load_byte", Seq(I32(768 + i))) match
+              case Right(Seq(I32(b))) => readBackBytes(i) = b.toByte
+              case other              => throw new AssertionError(s"load_byte: $other")
+          }
+          val readBack = new String(readBackBytes, "UTF-8")
+          check(readBack == "hello", s"stdin payload mismatch: got '$readBack'")
+        case other => check(false, s"call_fd_read(fd=0): $other")
     }
 
     test("fd_read: EFAULT when iovec buffer falls outside live memory") {

@@ -536,38 +536,39 @@ object Wasi:
                      ctx: WasiContext, fdTable: FdTable): Seq[Value] =
     args match
       case Seq(I32(fd), I32(iovsPtr), I32(iovsLen), I32(nreadPtr)) =>
-        lookupFile(fd, ctx, fdTable) match
-          case None => Seq(I32(EBADF))
-          case Some(file) =>
-            val data    = memory.data
-            val dataLen = data.length
+        val data    = memory.data
+        val dataLen = data.length
 
-            val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
-            if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
-              return Seq(I32(EFAULT))
-            if nreadPtr < 0 || nreadPtr.toLong + 4L > dataLen then
-              return Seq(I32(EFAULT))
+        val tableEnd = iovsPtr.toLong + iovsLen.toLong * 8L
+        if iovsPtr < 0 || iovsLen < 0 || tableEnd > dataLen then
+          return Seq(I32(EFAULT))
+        if nreadPtr < 0 || nreadPtr.toLong + 4L > dataLen then
+          return Seq(I32(EFAULT))
 
-            // Walk the iovec table. For each entry, bounds-check the
-            // destination buffer before reading; the read itself may
-            // come up short (EOF), at which point we stop walking —
-            // matches POSIX `readv` semantics.
-            var total = 0
-            var i     = 0
-            var done  = false
-            while i < iovsLen && !done do
-              val iovec = iovsPtr + i * 8
-              val buf   = readI32LE(data, iovec)
-              val len   = readI32LE(data, iovec + 4)
-              val end   = buf.toLong + len.toLong
-              if buf < 0 || len < 0 || end > dataLen then
-                return Seq(I32(EFAULT))
-              val n = file.read(data, buf, len)
-              total += n
-              if n < len then done = true
-              i += 1
-            writeI32LE(data, nreadPtr, total)
-            Seq(I32(ESUCCESS))
+        // Pick the reader: stdin (fd 0) goes to the host-supplied
+        // callback; everything else falls through to the open-file table.
+        val reader: (Array[Byte], Int, Int) => Int =
+          if fd == 0 then ctx.stdin
+          else lookupFile(fd, ctx, fdTable) match
+            case Some(file) => file.read(_, _, _)
+            case None       => return Seq(I32(EBADF))
+
+        var total = 0
+        var i     = 0
+        var done  = false
+        while i < iovsLen && !done do
+          val iovec = iovsPtr + i * 8
+          val buf   = readI32LE(data, iovec)
+          val len   = readI32LE(data, iovec + 4)
+          val end   = buf.toLong + len.toLong
+          if buf < 0 || len < 0 || end > dataLen then
+            return Seq(I32(EFAULT))
+          val n = reader(data, buf, len)
+          total += n
+          if n < len then done = true
+          i += 1
+        writeI32LE(data, nreadPtr, total)
+        Seq(I32(ESUCCESS))
       case _ => Seq(I32(EINVAL))
 
   /** `fd_seek(fd: i32, offset: i64, whence: i32, newoffset: i32) -> errno`
@@ -2338,6 +2339,14 @@ final case class WasiContext(
     envs:     Seq[(String, String)]             = Seq.empty,
     stdout:   Int => Unit                       = WasiContext.defaultStdout,
     stderr:   Int => Unit                       = WasiContext.defaultStderr,
+    /** stdin reader. Signature mirrors POSIX read: fill `dst[offset ..
+      * offset + length)` with up to `length` bytes from the current
+      * stream position, returning the number of bytes actually written
+      * (0 = EOF, never negative). Default returns 0 immediately —
+      * matches the historical behaviour where `fd_read` on fd 0
+      * returned EBADF. Callers that want real stdin install a
+      * cursor-tracking reader here. */
+    stdin:    (Array[Byte], Int, Int) => Int    = WasiContext.defaultStdin,
     clock:    WasiContext.Clock                 = WasiContext.systemClock,
     random:   Int => Array[Byte]                = WasiContext.defaultRandom,
     preopens: Seq[WasiContext.Preopen]          = Seq.empty,
@@ -2879,6 +2888,12 @@ object WasiContext:
     * not depend on this default; use [[collecting]]. */
   def defaultStdout(b: Int): Unit = System.out.write(b)
 
+  /** Default stdin reader — always returns 0 (EOF). Programs that
+    * `fd_read` on fd 0 get a clean empty read without erroring. To wire
+    * real input, install a closure that pulls from a file, an
+    * `Array[Byte]` cursor, or `System.in`. */
+  def defaultStdin(@unused dst: Array[Byte], @unused off: Int, @unused len: Int): Int = 0
+
   /** Default stderr sink — same shape as [[defaultStdout]], but to
     * `System.err`. */
   def defaultStderr(b: Int): Unit = System.err.write(b)
@@ -2896,19 +2911,36 @@ object WasiContext:
     * `clock` / `random` / `preopens` overrides let them assert on
     * deterministic clock, random, and filesystem-introspection reads
     * as well. */
-  def collecting(args:     Seq[String]              = Seq.empty,
-                 envs:     Seq[(String, String)]    = Seq.empty,
-                 clock:    Clock                    = systemClock,
-                 random:   Int => Array[Byte]       = defaultRandom,
-                 preopens: Seq[Preopen]             = Seq.empty,
-                 sockets:  Seq[ServerSocket]        = Seq.empty): Collecting =
-    new Collecting(args, envs, clock, random, preopens, sockets)
+  def collecting(args:     Seq[String]                       = Seq.empty,
+                 envs:     Seq[(String, String)]             = Seq.empty,
+                 stdin:    (Array[Byte], Int, Int) => Int    = defaultStdin,
+                 clock:    Clock                             = systemClock,
+                 random:   Int => Array[Byte]                = defaultRandom,
+                 preopens: Seq[Preopen]                      = Seq.empty,
+                 sockets:  Seq[ServerSocket]                 = Seq.empty): Collecting =
+    new Collecting(args, envs, stdin, clock, random, preopens, sockets)
+
+  /** Build a stdin reader that streams `src` byte-by-byte until exhausted.
+    * Convenient for tests that want to assert on what a program sees on
+    * fd 0 — handing them a fresh `Array[Byte]` is more ergonomic than
+    * threading a cursor closure. */
+  def stdinFromBytes(src: Array[Byte]): (Array[Byte], Int, Int) => Int =
+    var cursor = 0
+    (dst, off, len) =>
+      val remaining = src.length - cursor
+      if remaining <= 0 then 0
+      else
+        val n = math.min(remaining, len)
+        System.arraycopy(src, cursor, dst, off, n)
+        cursor += n
+        n
 
   /** Captures stdout/stderr bytes from a wasi program. Threading-wise
     * this is single-threaded — the interpreter is single-threaded, so
     * we don't synchronize the underlying buffers. */
   final class Collecting private[wasi] (args:     Seq[String],
                                         envs:     Seq[(String, String)],
+                                        stdin:    (Array[Byte], Int, Int) => Int,
                                         clock:    Clock,
                                         random:   Int => Array[Byte],
                                         preopens: Seq[Preopen],
@@ -2920,6 +2952,7 @@ object WasiContext:
       envs     = envs,
       stdout   = b => stdoutBuf += b.toByte,
       stderr   = b => stderrBuf += b.toByte,
+      stdin    = stdin,
       clock    = clock,
       random   = random,
       preopens = preopens,

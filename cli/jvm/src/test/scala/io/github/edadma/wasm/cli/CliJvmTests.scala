@@ -290,6 +290,46 @@ object CliJvmTests:
         s"expected diagnostic about the spec format, was:\n$err")
     }
 
+    test("--validate-only on a good module exits 0 and prints `ok` on stderr") {
+      val (code, _, err) = runCli(HelloPutchar, "--validate-only")
+      check(code == 0, s"expected exit 0 for valid module, got $code")
+      check(err.contains("ok"), s"expected stderr to mention ok, was:\n$err")
+    }
+
+    test("--validate-only on a non-wasm file exits 1 with a diagnostic") {
+      // The .wat source is text, not a wasm binary — magic check fails.
+      val (code, _, err) = runCli("examples/hello.wat", "--validate-only")
+      check(code == 1, s"expected exit 1 for invalid module, got $code")
+      check(err.nonEmpty, s"expected diagnostic on stderr, was empty")
+    }
+
+    test("--trace prints opcode/call/throw/trap totals to stderr after the run") {
+      val (code, _, err) = runCli(HelloPutchar, "--trace")
+      check(code == 0, s"expected exit 0, got $code")
+      check(err.contains("[trace]") && err.contains("ops="),
+        s"expected `[trace] ops=...` line on stderr, was:\n$err")
+    }
+
+    test("--stdin <file> redirects fd 0 from the given path") {
+      // Hello_putchar doesn't read stdin, but the flag should still
+      // parse and not affect the run. The richer assertion (that fd 0
+      // actually streams the bytes) lives in WasiFsTests.
+      val tmpStdin = java.nio.file.Files.createTempFile("wasm-stdin", ".txt")
+      try
+        java.nio.file.Files.write(tmpStdin, "hello".getBytes("UTF-8"))
+        val (code, _, _) = runCli(HelloPutchar, "--stdin", tmpStdin.toString)
+        check(code == 0, s"expected exit 0 with --stdin, got $code")
+      finally
+        java.nio.file.Files.deleteIfExists(tmpStdin)
+    }
+
+    test("--stdin on a non-existent file exits 1 with a clear diagnostic") {
+      val (code, _, err) = runCli(HelloPutchar, "--stdin", "/this/path/does/not/exist")
+      check(code == 1, s"expected exit 1 for missing --stdin file, got $code")
+      check(err.contains("--stdin") || err.contains("stdin"),
+        s"expected diagnostic mentioning stdin, was:\n$err")
+    }
+
     println()
     val total = passed + failures.size
     if failures.isEmpty then

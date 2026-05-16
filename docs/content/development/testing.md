@@ -9,18 +9,18 @@ weight: 20
 The interpreter has no test framework dependency — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 648 interpreter tests
+sbt 'interpJVM/Test/run'    # 653 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
-sbt 'wasiJVM/Test/run'      # 208 WASI tests on JVM/Native (192 on JS,
+sbt 'wasiJVM/Test/run'      # 209 WASI tests on JVM/Native (193 on JS,
 sbt 'wasiJS/Test/run'       #                   16 socket tests skipped)
 sbt 'wasiNative/Test/run'
 
-sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
+sbt 'cliJVM/Test/run'       # 19 CLI tests (JVM-only)
 ```
 
-Total: **870 tests** on JVM (648 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **881 tests** on JVM (653 interp + 209 wasi + 19 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 Each `Test/run` target prints one `OK <name>` or `FAIL <name> — <reason>` line per assertion plus a final summary; the process exits non-zero if any assertion failed. Add new tests by appending `test("name") { ... }` calls inside the appropriate category file under `interp/shared/src/test/scala/io/github/edadma/wasm/`.
 
