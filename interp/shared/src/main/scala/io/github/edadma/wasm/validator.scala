@@ -433,16 +433,19 @@ object Validator:
     /** Read + validate one memarg (every load/store op). Phase 8.D: the
       * alignment LEB carries a bit-6 "memidx-present" flag; when set, a
       * memidx LEB follows. The validator range-checks the memidx against
-      * the module's memory count. Alignment + offset values are ignored
-      * by the type check (alignment is dynamic, offset doesn't affect
-      * typing) — we just advance pc. */
-    def skipMemArg(label: String): Unit =
+      * the module's memory count. Spec rule: `align <= log2(natural-width)`
+      * — the alignment is advisory at run time (misaligned effective
+      * addresses still produce a result), but stating a stronger alignment
+      * than the access actually has is a validation error. */
+    def skipMemArg(label: String, accessWidth: Int): Unit =
       val alignFlag = readU32()
-      val memIdx =
-        if (alignFlag & 0x40) != 0 then readU32()
-        else 0
+      val align     = if (alignFlag & 0x40) != 0 then alignFlag & ~0x40 else alignFlag
+      val memIdx    = if (alignFlag & 0x40) != 0 then readU32() else 0
       if memIdx < 0 || memIdx >= memoryCount then
         fail(s"$label: memidx $memIdx out of range (have $memoryCount memories)")
+      val maxAlign = jl.Integer.numberOfTrailingZeros(accessWidth)
+      if align > maxAlign then
+        fail(s"$label: alignment $align exceeds natural log2(width=$accessWidth)=$maxAlign")
       val _ = readU32() // offset (discarded)
       ()
 
@@ -887,20 +890,29 @@ object Validator:
 
       // === memory loads / stores =======================================
 
-      case 0x28 => memLoad(ValueType.I32Type)                                   // i32.load
-      case 0x29 => memLoad(ValueType.I64Type)                                   // i64.load
-      case 0x2a => memLoad(ValueType.F32Type)                                   // f32.load
-      case 0x2b => memLoad(ValueType.F64Type)                                   // f64.load
-      case 0x2c | 0x2d | 0x2e | 0x2f =>                                         // i32.load{8,16}_{s,u}
-        memLoad(ValueType.I32Type)
-      case 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 =>                           // i64.load{8,16,32}_{s,u}
-        memLoad(ValueType.I64Type)
-      case 0x36 => memStore(ValueType.I32Type)                                  // i32.store
-      case 0x37 => memStore(ValueType.I64Type)                                  // i64.store
-      case 0x38 => memStore(ValueType.F32Type)                                  // f32.store
-      case 0x39 => memStore(ValueType.F64Type)                                  // f64.store
-      case 0x3a | 0x3b => memStore(ValueType.I32Type)                           // i32.store{8,16}
-      case 0x3c | 0x3d | 0x3e => memStore(ValueType.I64Type)                    // i64.store{8,16,32}
+      case 0x28 => memLoad(ValueType.I32Type, 4, "i32.load")                    // i32.load
+      case 0x29 => memLoad(ValueType.I64Type, 8, "i64.load")                    // i64.load
+      case 0x2a => memLoad(ValueType.F32Type, 4, "f32.load")                    // f32.load
+      case 0x2b => memLoad(ValueType.F64Type, 8, "f64.load")                    // f64.load
+      case 0x2c => memLoad(ValueType.I32Type, 1, "i32.load8_s")
+      case 0x2d => memLoad(ValueType.I32Type, 1, "i32.load8_u")
+      case 0x2e => memLoad(ValueType.I32Type, 2, "i32.load16_s")
+      case 0x2f => memLoad(ValueType.I32Type, 2, "i32.load16_u")
+      case 0x30 => memLoad(ValueType.I64Type, 1, "i64.load8_s")
+      case 0x31 => memLoad(ValueType.I64Type, 1, "i64.load8_u")
+      case 0x32 => memLoad(ValueType.I64Type, 2, "i64.load16_s")
+      case 0x33 => memLoad(ValueType.I64Type, 2, "i64.load16_u")
+      case 0x34 => memLoad(ValueType.I64Type, 4, "i64.load32_s")
+      case 0x35 => memLoad(ValueType.I64Type, 4, "i64.load32_u")
+      case 0x36 => memStore(ValueType.I32Type, 4, "i32.store")                  // i32.store
+      case 0x37 => memStore(ValueType.I64Type, 8, "i64.store")                  // i64.store
+      case 0x38 => memStore(ValueType.F32Type, 4, "f32.store")                  // f32.store
+      case 0x39 => memStore(ValueType.F64Type, 8, "f64.store")                  // f64.store
+      case 0x3a => memStore(ValueType.I32Type, 1, "i32.store8")
+      case 0x3b => memStore(ValueType.I32Type, 2, "i32.store16")
+      case 0x3c => memStore(ValueType.I64Type, 1, "i64.store8")
+      case 0x3d => memStore(ValueType.I64Type, 2, "i64.store16")
+      case 0x3e => memStore(ValueType.I64Type, 4, "i64.store32")
 
       case 0x3f =>                                                              // memory.size memidx
         requireMemory("memory.size")
@@ -1108,14 +1120,40 @@ object Validator:
           // --- Chunk B — loads ----------------------------------------
           //
           // Every SIMD load: pop i32 addr, push v128. The immediate is a
-          // memarg, identical to the scalar loads in Phase 8.D.
-          case 0 |                                                                // v128.load
-               1 | 2 |                                                            // v128.load8x8_s / _u
-               3 | 4 |                                                            // v128.load16x4_s / _u
-               5 | 6 |                                                            // v128.load32x2_s / _u
-               7 | 8 | 9 | 10 |                                                   // v128.load{8,16,32,64}_splat
-               92 | 93 =>                                                         // v128.load32_zero / v128.load64_zero
-            skipMemArg("v128 load")
+          // memarg, identical to the scalar loads in Phase 8.D. Each
+          // sub-opcode has a distinct access width (full 16-byte vector,
+          // 8-byte half-vector for the *_extend / splat64 / load64_zero
+          // forms, or narrow splat widths).
+          case 0 =>                                                               // v128.load
+            skipMemArg("v128.load", 16)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 1 | 2 | 3 | 4 | 5 | 6 =>                                           // v128.load{8x8,16x4,32x2}_{s,u}
+            skipMemArg("v128.load_extend", 8)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 7 =>                                                               // v128.load8_splat
+            skipMemArg("v128.load8_splat", 1)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 8 =>                                                               // v128.load16_splat
+            skipMemArg("v128.load16_splat", 2)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 9 =>                                                               // v128.load32_splat
+            skipMemArg("v128.load32_splat", 4)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 10 =>                                                              // v128.load64_splat
+            skipMemArg("v128.load64_splat", 8)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 92 =>                                                              // v128.load32_zero
+            skipMemArg("v128.load32_zero", 4)
+            popVal(ValueType.I32Type)
+            pushVal(ValueType.V128Type)
+          case 93 =>                                                              // v128.load64_zero
+            skipMemArg("v128.load64_zero", 8)
             popVal(ValueType.I32Type)
             pushVal(ValueType.V128Type)
 
@@ -1124,7 +1162,7 @@ object Validator:
           // Pops the v128 value first, then the i32 address (stack-top
           // is the value, just like the scalar stores).
           case 11 =>                                                              // v128.store
-            skipMemArg("v128.store")
+            skipMemArg("v128.store", 16)
             popVal(ValueType.V128Type)
             popVal(ValueType.I32Type)
 
@@ -1454,18 +1492,20 @@ object Validator:
       pushVal(out)
 
     /** Walk a memory load: addr=i32 → result type. Memory must exist;
-      * the memarg's memidx must be in range (Phase 8.D). */
-    def memLoad(out: ValueType): Unit =
-      requireMemory("memory load")
-      skipMemArg("memory load")
+      * the memarg's memidx must be in range (Phase 8.D); align is
+      * checked against the access width. */
+    def memLoad(out: ValueType, accessWidth: Int, label: String): Unit =
+      requireMemory(label)
+      skipMemArg(label, accessWidth)
       popVal(ValueType.I32Type)
       pushVal(out)
 
     /** Walk a memory store: addr=i32, value=t. Memory must exist;
-      * the memarg's memidx must be in range. */
-    def memStore(t: ValueType): Unit =
-      requireMemory("memory store")
-      skipMemArg("memory store")
+      * the memarg's memidx must be in range; align is checked against
+      * the access width. */
+    def memStore(t: ValueType, accessWidth: Int, label: String): Unit =
+      requireMemory(label)
+      skipMemArg(label, accessWidth)
       popVal(t)
       popVal(ValueType.I32Type)
 
@@ -1497,10 +1537,11 @@ object Validator:
 
     /** Phase 8.E.I: `v128.load{8,16,32,64}_lane` carries a memarg
       * followed by a 1-byte lane index (< max). Pops the v128 src (top),
-      * pops the i32 addr (below), pushes the modified v128. */
+      * pops the i32 addr (below), pushes the modified v128. Access
+      * width is 128 / max bytes (load8_lane=1, load16_lane=2, etc.). */
     def simdLoadLane(label: String, max: Int): Unit =
       requireMemory(label)
-      skipMemArg(label)
+      skipMemArg(label, 16 / max)
       readLaneIdx(label, max)
       popVal(ValueType.V128Type)
       popVal(ValueType.I32Type)
@@ -1508,10 +1549,10 @@ object Validator:
 
     /** Phase 8.E.I: `v128.store{8,16,32,64}_lane` carries a memarg
       * followed by a 1-byte lane index (< max). Pops the v128 src (top),
-      * pops the i32 addr (below). No push. */
+      * pops the i32 addr (below). No push. Access width is 16 / max. */
     def simdStoreLane(label: String, max: Int): Unit =
       requireMemory(label)
-      skipMemArg(label)
+      skipMemArg(label, 16 / max)
       readLaneIdx(label, max)
       popVal(ValueType.V128Type)
       popVal(ValueType.I32Type)

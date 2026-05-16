@@ -56,6 +56,16 @@ object MemoryTests:
       expectError(inst, "load_off_max", Seq(I32(1))) { case WasmError.MemoryOutOfBounds => true }
     }
 
+    test("validator: memarg.align > log2(natural-width) is rejected") {
+      // Regression — surfaced by the W3C spec runner against
+      // testsuite/align.wast. The validator now enforces
+      // `align <= log2(natural-width)` for plain load/store ops, matching
+      // the spec rule that atomics already enforce.
+      expectInstantiateError(Fixtures.memarg_align_too_big) {
+        case WasmError.InvalidModule(msg) => msg.contains("alignment")
+      }
+    }
+
     test("data section: active segment writes bytes into memory at offset") {
       val inst = instantiate(Fixtures.data_segment)
       // "AB" at offset 0 → i32.load reads [0x41, 0x42, 0x00, 0x00] little-endian
