@@ -306,6 +306,7 @@ object Runtime:
         case (ValueType.I64Type, _: I64) => true
         case (ValueType.F32Type, _: F32) => true
         case (ValueType.F64Type, _: F64) => true
+        case (ValueType.V128Type, _: V128) => true
         case (ValueType.FuncRefType,   RefNull(RefType.FuncRef))   => true
         case (ValueType.FuncRefType,   RefFunc(_))                 => true
         case (ValueType.ExternRefType, RefNull(RefType.ExternRef)) => true

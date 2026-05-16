@@ -644,6 +644,11 @@ object Parser:
           ((b(6) & 0xffL) << 48) |
           ((b(7) & 0xffL) << 56)
         F64(java.lang.Double.longBitsToDouble(bits))
+      case (0xfd, ValueType.V128Type) =>                               // v128.const (prefix + sub-opcode 12 + 16 raw bytes)
+        val sub = c.readU32()
+        if sub != 12 then
+          fail(WasmError.InvalidModule(s"expected v128.const (sub-opcode 12) in const expr, got SIMD sub-opcode $sub"))
+        V128(c.readBytes(16))
       case (0xd0, ValueType.FuncRefType) =>                            // ref.null funcref
         val rt = readRefType(c, "ref.null")
         if rt != RefType.FuncRef then

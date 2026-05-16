@@ -354,3 +354,54 @@ object SimdIntArithTests:
       val want = fromI64( 1000000000000L, 6L)
       check(bytesEq(out, want), s"i64x2.mul: ${out.mkString(",")}")
     }
+
+    // === regressions surfaced by the W3C spec runner =====================
+
+    test("i8x16.popcnt counts set bits per byte lane (SIMD sub-opcode 0x62)") {
+      // Regression — surfaced by simd_i8x16_arith2.wast. Sub-opcode 0x62
+      // was unimplemented (we jumped from 0x61 neg to 0x63 all_true).
+      val inst = instantiate(Fixtures.simd_popcnt)
+      val a    = fromI8(0, 1, 2, 3, 4, 5, 6, 7, 0xff.toByte, 0x80.toByte,
+                        0x55, 0xaa.toByte, 0x0f, 0xf0.toByte, 127, -128)
+      val out  = callV128(inst, "popcnt", V128(a))
+      val want = fromI8(0, 1, 1, 2, 1, 2, 2, 3, 8, 1,
+                        4, 4, 4, 4, 7, 1)
+      check(bytesEq(out, want), s"i8x16.popcnt: ${out.mkString(",")}")
+    }
+
+    test("i16x8.q15mulr_sat_s — Q15 mulr with saturation at lane bounds") {
+      // Regression — surfaced by simd_i16x8_q15mulr_sat_s.wast. Only the
+      // relaxed-SIMD variant (0x111) was implemented; non-relaxed 0x82
+      // was missing. Spec: (a*b + 0x4000) >> 15, saturated to i16 range.
+      // The shift is arithmetic (sign-extending), so for negative
+      // products it rounds toward negative infinity. (-32768) * (-32768)
+      // is the only case that needs the clamp.
+      val inst = instantiate(Fixtures.simd_q15mulr)
+      val a    = fromI16(   0,  16384,  -32768, 32767, 32767, -32768,  100,  -1)
+      val b    = fromI16(   0,  16384,  -32768, 32767, -32768, 32767,  200,  -1)
+      val out  = callV128(inst, "q15mulr", V128(a), V128(b))
+      // lane 0: 0
+      // lane 1: 16384² + 0x4000 = 0x10004000; >>15 = 0x2000 = 8192
+      // lane 2: 32768² + 0x4000 = 32769 → clamp 32767
+      // lane 3: 32767² + 0x4000 = 0x3FFE4001; >>15 = 0x7FFE = 32766
+      // lane 4 / 5: 32767 * -32768 + 0x4000 = -0x3FFF4000;
+      //             arithmetic >>15 floors to -32767
+      // lane 6: (20000+16384)>>15 = 1
+      // lane 7: (1+16384)>>15 = 0
+      val want = fromI16( 0, 8192, 32767, 32766, -32767, -32767, 1, 0)
+      check(bytesEq(out, want), s"i16x8.q15mulr_sat_s: ${out.mkString(",")}")
+    }
+
+    test("select (untyped 0x1B) accepts v128 operands (SIMD numtype rule)") {
+      // Regression — surfaced by simd_select.wast. The validator's
+      // numeric predicate excluded v128; the SIMD proposal extends
+      // "numtype" to include v128 for the purpose of the untyped
+      // select form.
+      val inst = instantiate(Fixtures.simd_v128_select)
+      val a    = fromI32(1, 2, 3, 4)
+      val b    = fromI32(10, 20, 30, 40)
+      val pick = callV128(inst, "vselect", V128(a), V128(b), I32(1))
+      check(bytesEq(pick, a), s"cond=1 should pick first operand, got ${pick.mkString(",")}")
+      val drop = callV128(inst, "vselect", V128(a), V128(b), I32(0))
+      check(bytesEq(drop, b), s"cond=0 should pick second operand, got ${drop.mkString(",")}")
+    }

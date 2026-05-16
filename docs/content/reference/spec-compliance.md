@@ -6,7 +6,7 @@ weight: 30
 
 The interpreter has an integrated runner for the official [WebAssembly testsuite](https://github.com/WebAssembly/testsuite). It consumes the `.wast` files, dispatches each `assert_return` / `assert_trap` / `assert_invalid` / `assert_malformed` command against `Runtime.instantiate` + `inst.invoke`, and tracks per-file pass / fail / skip totals.
 
-The slice that's wired in covers 33 manifests — numerics, conversions, control flow, memory addressing, function pointers — over **~9,500 assertions**.
+The slice that's wired in covers **89 manifests** — numerics, conversions, control flow, memory addressing, function pointers, plus the complete SIMD proposal — over **~35,000 assertions**.
 
 ## Running it
 
@@ -21,12 +21,16 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
 ```text
 == W3C spec compliance ==
   OK    address                  259 pass,    0 fail,    1 skip
-  KNOWN align                     76 pass,   43 fail,   46 skip
+  OK    align                    119 pass,    0 fail,   46 skip
   OK    block                    208 pass,    0 fail,   15 skip
+  ...
+  KNOWN br_table                  24 pass,  162 fail,    0 skip
+  ...
+  OK    simd_i16x8_q15mulr_sat_s    30 pass,    0 fail,    0 skip
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 9285 passed, 209 failed, 285 skipped (of 9779) ==
+== Spec totals: 34807 passed, 162 failed, 796 skipped (of 35765) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -65,11 +69,15 @@ Fixing this will trip an "UNEXPECTED PASSES" warning until the manifest is remov
 
 ## What the runner caught
 
-Light triage during the initial run-up and follow-up validator fixes surfaced four real interpreter bugs:
+Light triage during the initial run-up and follow-up validator + SIMD coverage passes surfaced eight real interpreter bugs:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
 3. **`align` immediate validation was missing for plain load / store.** The atomic path enforced `align == log2(natural-width)` but `skipMemArg` (the plain path) read the field and dropped it. A module with `i32.load8_s align=2` (natural width 1, log2 = 0) instantiated successfully. Now enforced — every load/store opcode and every SIMD load/store carries an `accessWidth` to `skipMemArg`, which rejects `align > log2(width)`.
 4. **`if` without `else` accepted mismatched params/results.** The form `if bt e* end` (no else) has an implicit empty else-branch with type `[t1*] → [t1*]`, so it only validates iff `startTypes == endTypes`. We were silently accepting cases like `(if (result i32) (then (i32.const 0)))` where the implicit else can't satisfy the result. Now rejected at instantiation.
+5. **`v128.const` (SIMD prefix 0xFD + sub 0x0C) wasn't accepted in const expressions** — only scalar/ref const forms were recognised. `(global v128 (v128.const ...))` and v128 data-segment offsets failed to parse. Const-expr reader now decodes the 16 raw bytes.
+6. **Untyped `select` (0x1B) rejected v128 operands.** The SIMD proposal treats v128 as a numtype for the purpose of `select`; only the typed `select t*` form (0x1C) is reserved for reftypes. Numeric predicate now includes v128.
+7. **`i8x16.popcnt` (SIMD sub-opcode 0x62) was completely unimplemented** — we had abs (0x60) and neg (0x61) but jumped to 0x63 (all_true).
+8. **`i16x8.q15mulr_sat_s` (SIMD sub-opcode 0x82) was completely unimplemented** — only the relaxed-SIMD variant (0x111) was present. Spec semantics: `(a*b + 0x4000) >> 15`, saturated to i16 range.
 
-All four ship with regression tests in `NumericTests`, `MemoryTests`, and `MultiValueAndStartTests`.
+All eight ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, and `SimdConstTests`.

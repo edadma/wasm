@@ -772,12 +772,15 @@ object Validator:
         val t2 = popVal()
         // Phase 8.C: the untyped `select` (0x1B) is now spec-restricted to
         // numeric value types — reftype operands must use the typed
-        // `select t*` form (0x1C). Both operands must agree and neither
-        // may be a reftype.
+        // `select t*` form (0x1C). The SIMD proposal extends "numeric"
+        // to include `v128` (spec terminology: "vectype is a numtype
+        // for the purpose of select"). Both operands must agree and
+        // neither may be a reftype.
         def numeric(t: ValueType): Boolean = t match
           case ValueType.I32Type | ValueType.I64Type |
-               ValueType.F32Type | ValueType.F64Type => true
-          case _                                     => false
+               ValueType.F32Type | ValueType.F64Type |
+               ValueType.V128Type => true
+          case _                  => false
         (t1, t2) match
           case (AbsValue.Known(a), AbsValue.Known(b)) =>
             if a != b then
@@ -1228,13 +1231,14 @@ object Validator:
           // neg) and binary (v128, v128) → v128 (everything else,
           // including saturating + mul + avgr_u).
 
-          case 0x60 | 0x61 |                                                      // i8x16 abs/neg
+          case 0x60 | 0x61 | 0x62 |                                               // i8x16 abs/neg/popcnt
                0x80 | 0x81 |                                                      // i16x8 abs/neg
                0xA0 | 0xA1 |                                                      // i32x4 abs/neg
                0xC0 | 0xC1 =>                                                     // i64x2 abs/neg
             unop(ValueType.V128Type, ValueType.V128Type)
 
           case 0x6E | 0x6F | 0x70 | 0x71 | 0x72 | 0x73 | 0x7B |                   // i8x16
+               0x82 |                                                             // i16x8.q15mulr_sat_s
                0x8E | 0x8F | 0x90 | 0x91 | 0x92 | 0x93 | 0x95 | 0x9B |            // i16x8
                0xAE | 0xB1 | 0xB5 |                                               // i32x4
                0xCE | 0xD1 | 0xD5 =>                                              // i64x2

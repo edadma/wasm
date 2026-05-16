@@ -328,6 +328,11 @@ private[wasm] trait SimdDispatch:
         f.pc = p1
         valueStack += V128(i8x16UnOpS(a, x => -x))
 
+      case 0x62 =>                                                                        // i8x16.popcnt — bits set per byte lane
+        val a = popV128()
+        f.pc = p1
+        valueStack += V128(i8x16UnOpU(a, x => java.lang.Integer.bitCount(x & 0xff)))
+
       case 0x6E =>                                                                        // i8x16.add
         val b = popV128(); val a = popV128()
         f.pc = p1
@@ -382,6 +387,15 @@ private[wasm] trait SimdDispatch:
         val a = popV128()
         f.pc = p1
         valueStack += V128(i16x8UnOpS(a, x => -x))
+
+      case 0x82 =>                                                                        // i16x8.q15mulr_sat_s — saturating signed Q15 mulr per i16 lane
+        // (a * b + 0x4000) >> 15, saturated to [-32768, 32767]. -32768 * -32768
+        // would otherwise produce 32768 — the only value that needs the clamp.
+        val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(i16x8BinOpS(a, b, (x, y) =>
+          val p = (x * y + 0x4000) >> 15
+          if p > 32767 then 32767 else if p < -32768 then -32768 else p))
 
       case 0x8E =>                                                                        // i16x8.add
         val b = popV128(); val a = popV128()
@@ -2584,9 +2598,9 @@ private[wasm] object SimdDispatch:
 
       // Chunk D — integer arithmetic (all unary or binary on v128
       // → v128, no immediate past the sub-opcode).
-      case 0x60 | 0x61 |                                                          // i8x16  abs / neg
+      case 0x60 | 0x61 | 0x62 |                                                   // i8x16  abs / neg / popcnt
            0x6E | 0x6F | 0x70 | 0x71 | 0x72 | 0x73 | 0x7B |                       // i8x16  add/sub/sat/avgr
-           0x80 | 0x81 |                                                          // i16x8  abs / neg
+           0x80 | 0x81 | 0x82 |                                                   // i16x8  abs / neg / q15mulr_sat_s
            0x8E | 0x8F | 0x90 | 0x91 | 0x92 | 0x93 | 0x95 | 0x9B |                // i16x8  add/sub/sat/mul/avgr
            0xA0 | 0xA1 | 0xAE | 0xB1 | 0xB5 |                                     // i32x4  abs/neg/add/sub/mul
            0xC0 | 0xC1 | 0xCE | 0xD1 | 0xD5 =>                                    // i64x2  abs/neg/add/sub/mul
