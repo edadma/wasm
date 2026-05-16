@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**784 tests** on the JVM (562 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
+**791 tests** on the JVM (569 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
 
 ## Try it
 

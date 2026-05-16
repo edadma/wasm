@@ -53,6 +53,8 @@ An uncaught throw surfaces as `Left(WasmError.UncaughtException(tagIdx, args))` 
 
 **Tail calls** — `return_call funcidx` (`0x12`) and `return_call_indirect typeidx tableidx` (`0x13`). The callee replaces the current frame; deeply recursive tail calls run in constant `frames` memory. The validator enforces that the callee's results equal the current function's results.
 
+**Profile / trace hooks** — `Tracer` interface with `onOp` / `onCall` / `onHostCall` / `onReturn` / `onThrow` / `onTrap` callbacks. Pass any implementation through the optional `tracer` parameter on `ModuleInstance.invoke` and `Wasi.run`; the bundled `Tracer.Counting` totals ops, calls, host calls, throws, traps, and max wasm-frame depth.
+
 **Not yet implemented (Phase 9+):** threads/atomics; GC proposal; component model. Each is independently scoped.
 
 ## WASI Preview 1
@@ -237,7 +239,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 562 interpreter tests
+sbt 'interpJVM/Test/run'    # 569 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -248,7 +250,7 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **784 tests** on JVM (562 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **791 tests** on JVM (569 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ## Regenerating fixtures
 

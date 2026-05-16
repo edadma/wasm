@@ -639,9 +639,12 @@ object Interpreter:
 
   /** One activation record. `stackBase` is the value-stack height at the
     * moment this frame's first instruction starts; on `return` or normal
-    * function exit we trim back to `stackBase + resultArity`. */
+    * function exit we trim back to `stackBase + resultArity`. `funcIdx`
+    * lets the Tracer correlate onCall / onReturn pairs without
+    * threading the value through every call site. */
   private[wasm] final class Frame(
       val func: WasmFunc,
+      val funcIdx: Int,
       val locals: Array[Value],
       val stackBase: Int,
   ):
@@ -724,6 +727,10 @@ final class Interpreter private[wasm] (
       * surfaces can re-type the payload. Empty array if the module has no
       * tags. */
     private val tagParams: Array[Vector[ValueType]] = Array.empty,
+    /** Instrumentation hook — receives onOp/onCall/onReturn/onThrow/onTrap
+      * callbacks. Defaults to `Tracer.NoOp`; the JIT inlines the empty
+      * methods so untraced invocations pay no per-op cost. */
+    private val tracer: Tracer = Tracer.NoOp,
 ) extends SimdDispatch:
   import Interpreter.*
 
@@ -757,6 +764,8 @@ final class Interpreter private[wasm] (
         try step()
         catch case t: ThrowFail =>
           if !deliverException(t.exc) then
+            // onThrow already fired at the raise site; the uncaught
+            // surface doesn't double-count via onTrap.
             valueStack.clear()
             frames.clear()
             return Left(WasmError.UncaughtException(t.exc.tagIdx, t.exc.args.toSeq))
@@ -766,8 +775,13 @@ final class Interpreter private[wasm] (
       valueStack.clear()
       Right(results)
     catch
-      case e: ExecFail                       => Left(e.err)
-      case _: ArrayIndexOutOfBoundsException => Left(WasmError.InvalidModule("VM ran off end of body"))
+      case e: ExecFail                       =>
+        tracer.onTrap(e.err)
+        Left(e.err)
+      case _: ArrayIndexOutOfBoundsException =>
+        val err = WasmError.InvalidModule("VM ran off end of body")
+        tracer.onTrap(err)
+        Left(err)
 
   /** Walk frame/label stacks to find a matching `catch tagidx` or `catch_all`
     * for `exc`. On match: trim the operand stack to the try label's base
@@ -928,6 +942,7 @@ final class Interpreter private[wasm] (
       // running past the body's end without an explicit `end` is malformed
       fail(WasmError.InvalidModule("missing function-body end"))
     val op = body(f.pc) & 0xff
+    tracer.onOp(op)
 
     op match
 
@@ -1003,6 +1018,7 @@ final class Interpreter private[wasm] (
           if valueStack.isEmpty then fail(WasmError.TypeMismatch)
           payload(k) = valueStack.remove(valueStack.size - 1)
           k -= 1
+        tracer.onThrow(tagIdx)
         throw new ThrowFail(WasmException(tagIdx, payload))
 
       case 0x09 =>                                                                        // rethrow labelidx
@@ -1013,6 +1029,7 @@ final class Interpreter private[wasm] (
         val target = f.labels(f.labels.size - 1 - labelIdx)
         if target.caught == null then
           fail(WasmError.InvalidModule(s"rethrow: label $labelIdx is not an active catch handler"))
+        tracer.onThrow(target.caught.tagIdx)
         throw new ThrowFail(target.caught)
 
       case 0x0a =>                                                                        // throw_ref
@@ -1022,7 +1039,9 @@ final class Interpreter private[wasm] (
         f.pc += 1
         if valueStack.isEmpty then fail(WasmError.TypeMismatch)
         valueStack.remove(valueStack.size - 1) match
-          case RefExn(exc)              => throw new ThrowFail(exc)
+          case RefExn(exc)              =>
+            tracer.onThrow(exc.tagIdx)
+            throw new ThrowFail(exc)
           case RefNull(RefType.ExnRef)  =>
             fail(WasmError.InvalidModule("throw_ref: null exnref"))
           case _ =>
@@ -2223,6 +2242,7 @@ final class Interpreter private[wasm] (
     var j = 0
     while j < results.length do { valueStack += results(j); j += 1 }
     val _ = frames.remove(frames.size - 1)
+    tracer.onReturn(f.funcIdx)
 
   // === call ================================================================
 
@@ -2234,6 +2254,7 @@ final class Interpreter private[wasm] (
       fail(WasmError.InvalidModule(s"invalid function index $funcIdx"))
     funcs(funcIdx) match
       case HostBound(sig, fn) =>
+        tracer.onHostCall(funcIdx)
         val n = sig.params.size
         if valueStack.size < n then fail(WasmError.TypeMismatch)
         val args = new Array[Value](n)
@@ -2250,6 +2271,7 @@ final class Interpreter private[wasm] (
         results.foreach(valueStack += _)
 
       case wf @ WasmFunc(_, paramCount, localCount, localTypes, _, _) =>
+        tracer.onCall(funcIdx)
         if valueStack.size < paramCount then fail(WasmError.TypeMismatch)
         val locals = new Array[Value](localCount)
         // Pop params right-to-left so locals[0..paramCount-1] hold them in declared order.
@@ -2274,7 +2296,7 @@ final class Interpreter private[wasm] (
             // try_table proposal: exnref locals zero-init to typed null.
             case ValueType.ExnRefType    => RefNull(RefType.ExnRef)
           j += 1
-        frames += new Frame(wf, locals, stackBase = valueStack.size)
+        frames += new Frame(wf, funcIdx, locals, stackBase = valueStack.size)
 
   /** Tail-call dispatch — implements `return_call` / `return_call_indirect`
     * from the tail-call proposal. The callee replaces the current frame on
@@ -2305,6 +2327,7 @@ final class Interpreter private[wasm] (
     var k    = n - 1
     while k >= 0 do { args(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
     val caller = frames.remove(frames.size - 1)
+    tracer.onReturn(caller.funcIdx)
     while valueStack.size > caller.stackBase do
       val _ = valueStack.remove(valueStack.size - 1)
     var j = 0
