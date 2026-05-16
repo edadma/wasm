@@ -51,6 +51,8 @@ Binary sections recognised: Type (1), Import (2), Function (3), Table (4), Memor
 
 An uncaught throw surfaces as `Left(WasmError.UncaughtException(tagIdx, args))` so a host can pattern-match and re-throw natively.
 
+**Tail calls** — `return_call funcidx` (`0x12`) and `return_call_indirect typeidx tableidx` (`0x13`). The callee replaces the current frame; deeply recursive tail calls run in constant `frames` memory. The validator enforces that the callee's results equal the current function's results.
+
 **Not yet implemented (Phase 9+):** threads/atomics; GC proposal; component model. Each is independently scoped.
 
 ## WASI Preview 1
@@ -235,7 +237,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 554 interpreter tests
+sbt 'interpJVM/Test/run'    # 562 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -246,7 +248,7 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **776 tests** on JVM (554 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **784 tests** on JVM (562 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ## Regenerating fixtures
 
