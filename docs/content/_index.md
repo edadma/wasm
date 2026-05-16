@@ -3,7 +3,7 @@ title: wasm
 splash: true
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: A Scala 3 WebAssembly interpreter and WASI Preview 1 host shim. Runs real rustc-built `wasm32-wasip1` binaries. Zero runtime dependencies; one codebase across JVM, Scala.js, and Scala Native. See [Reference](/reference/opcodes/) for the supported-features table.
+summary: A Scala 3 WebAssembly interpreter and WASI Preview 1 host shim. Runs real rustc-built `wasm32-wasip1` binaries. Zero runtime dependencies; one codebase across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
