@@ -262,7 +262,7 @@ object Parser:
     val n = c.readU32()
     Vector.tabulate(n) { _ =>
       val rt  = readRefType(c, "table section")
-      val lim = readLimits(c)
+      val lim = readTableLimits(c)
       Table(rt, lim.min, lim.max)
     }
 
@@ -270,13 +270,40 @@ object Parser:
 
   private def parseMemorySection(c: Cursor): Vector[MemoryLimits] =
     val n = c.readU32()
-    Vector.tabulate(n)(_ => readLimits(c))
+    Vector.tabulate(n)(_ => readMemLimits(c))
 
-  private def readLimits(c: Cursor): MemoryLimits =
-    val flag = c.readByte()
-    val min  = c.readU32()
-    val max  = if (flag & 0x01) != 0 then Some(c.readU32()) else None
-    MemoryLimits(min, max)
+  /** Memory limits flag byte:
+    *   bit 0x01 — has-max
+    *   bit 0x02 — shared (threads proposal)
+    * Memory64 (bit 0x04) isn't surfaced yet — when it lands it'll join here.
+    *
+    * The threads proposal pins shared memories to a known maximum so a host
+    * can size its bookkeeping up front; we enforce `shared ⇒ has-max` at
+    * parse time, with a clear diagnostic on violation. */
+  private def readMemLimits(c: Cursor): MemoryLimits =
+    val flag    = c.readByte()
+    val hasMax  = (flag & 0x01) != 0
+    val shared  = (flag & 0x02) != 0
+    val unknown = (flag & ~0x03) != 0
+    if unknown then fail(WasmError.InvalidModule(s"unknown memory limits flag 0x${flag.toHexString}"))
+    if shared && !hasMax then
+      fail(WasmError.InvalidModule("shared memory requires a maximum (limits flag 0x03)"))
+    val min = c.readU32()
+    val max = if hasMax then Some(c.readU32()) else None
+    MemoryLimits(min, max, shared)
+
+  /** Table limits flag byte — only bit 0x01 (has-max). The `shared` bit is
+    * memory-only per the threads proposal; reject it explicitly so a binary
+    * trying to declare a shared table fails with a clear diagnostic instead
+    * of silently parsing as a regular table. */
+  private def readTableLimits(c: Cursor): MemoryLimits =
+    val flag    = c.readByte()
+    val hasMax  = (flag & 0x01) != 0
+    val unknown = (flag & ~0x01) != 0
+    if unknown then fail(WasmError.InvalidModule(s"unknown table limits flag 0x${flag.toHexString}"))
+    val min = c.readU32()
+    val max = if hasMax then Some(c.readU32()) else None
+    MemoryLimits(min, max, shared = false)
 
   // === Global section ===
 

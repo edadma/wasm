@@ -17,6 +17,8 @@ object WasmError:
   final case class ExportNotFound(name: String)                     extends WasmError
   final case class InvalidModule(message: String)                   extends WasmError
   final case class UncaughtException(tagIdx: Int, args: Seq[Value]) extends WasmError
+  case object UnalignedAtomicAccess                                 extends WasmError
+  case object ExpectedSharedMemory                                  extends WasmError
 ```
 
 ## Lookup
@@ -32,6 +34,8 @@ object WasmError:
 | `ExportNotFound(name)`   | runtime            | `inst.invoke(name, …)` or `Wasi.run(inst, name)` looked up a non-existent export. |
 | `InvalidModule(message)` | validator + runtime traps | Static type-check failure, **or** a runtime trap that isn't a memory bound — divide-by-zero, signed-`div` overflow, `trunc` of NaN, `call_indirect` signature mismatch, branch index out of range, etc. The message names the operation. |
 | `UncaughtException(tag, args)` | runtime | A `throw` propagated past the outermost call without a matching `catch tagidx` / `catch_all`. `tag` is the unified tagidx (imports first, then defs); `args` is the payload, top-of-stack at throw site = last element. |
+| `UnalignedAtomicAccess`        | runtime | Threads proposal: the effective address of an atomic memory op (base + memarg.offset) was not naturally aligned to the access width. |
+| `ExpectedSharedMemory`         | runtime | Threads proposal: `memory.atomic.wait{32,64}` was executed against a memory that wasn't declared `shared` (limits flag bit 0x02). |
 
 ## InvalidModule prefixes
 
@@ -74,6 +78,8 @@ result match
   case Left(MemoryOutOfBounds)          => println("guest read/wrote out of bounds")
   case Left(ExportNotFound(name))       => println(s"no such export: $name")
   case Left(UncaughtException(t, args)) => println(s"uncaught wasm exception: tag=$t payload=$args")
+  case Left(UnalignedAtomicAccess)      => println("atomic op: misaligned effective address")
+  case Left(ExpectedSharedMemory)       => println("atomic wait: target memory is not shared")
 
   // -- host or interpreter bug --
   case Left(TypeMismatch)                => println("internal type tag mismatch (bug)")

@@ -1,6 +1,7 @@
 package io.github.edadma.wasm
 
 import scala.collection.mutable.ArrayBuffer
+import java.lang as jl
 
 /** Module validator — Phase 6.
   *
@@ -444,6 +445,43 @@ object Validator:
         fail(s"$label: memidx $memIdx out of range (have $memoryCount memories)")
       val _ = readU32() // offset (discarded)
       ()
+
+    /** Same as `skipMemArg` but additionally validates that the alignment
+      * immediate equals `log2(accessWidth)`. The threads proposal mandates
+      * strict natural alignment for atomic ops at validation time
+      * (regular load/store treats alignment as advisory and only
+      * traps on misaligned effective addresses at run time). */
+    def skipAtomicMemArg(label: String, accessWidth: Int): Unit =
+      val alignFlag = readU32()
+      val align     = if (alignFlag & 0x40) != 0 then alignFlag & ~0x40 else alignFlag
+      val memIdx    = if (alignFlag & 0x40) != 0 then readU32() else 0
+      if memIdx < 0 || memIdx >= memoryCount then
+        fail(s"$label: memidx $memIdx out of range (have $memoryCount memories)")
+      val expectedAlign = jl.Integer.numberOfTrailingZeros(accessWidth)
+      if align != expectedAlign then
+        fail(s"$label: atomic alignment $align must equal log2(width=$accessWidth)=$expectedAlign")
+      val _ = readU32() // offset (discarded)
+      ()
+
+    /** Access width in bytes for the rmw width-code (0..6) shared between
+      * runtime and validator. */
+    def atomicWidthBytes(widthCode: Int): Int = widthCode match
+      case 0 => 4
+      case 1 => 8
+      case 2 => 1
+      case 3 => 2
+      case 4 => 1
+      case 5 => 2
+      case 6 => 4
+      case _ => fail(s"internal: bad atomic width code $widthCode")
+
+    /** Wasm value type produced/consumed by the rmw width-code. Codes 0/2/3
+      * are i32 forms, 1/4/5/6 are i64 forms (the i64 family covers 8/16/32-
+      * bit sub-word accesses on top of full-width). */
+    def atomicValType(widthCode: Int): ValueType = widthCode match
+      case 0 | 2 | 3       => ValueType.I32Type
+      case 1 | 4 | 5 | 6   => ValueType.I64Type
+      case _               => fail(s"internal: bad atomic width code $widthCode")
 
     /** Read + validate a single memidx LEB immediate. Phase 8.D introduced
       * this shape in place of the single-memory "must-be-zero reserved
@@ -1306,6 +1344,87 @@ object Validator:
 
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
+
+      // === atomic prefix (0xFE) ==========================================
+      //
+      // The threads proposal's atomic family. Wire shape mirrors regular
+      // load/store + a 1-byte fence immediate. Validation rules unique to
+      // this prefix:
+      //   1. The declared alignment must equal log2(accessWidth) — atomic
+      //      ops require strict natural alignment, unlike plain loads/
+      //      stores where alignment is merely advisory.
+      //   2. Sub-opcode must be in the recognised range; an unknown sub
+      //      surfaces as UnknownOpcode(0xFE) here so a host can
+      //      distinguish it from a recognised-but-mis-typed op.
+
+      case 0xfe =>
+        val sub = readU32()
+        sub match
+          case 0x00 =>                                                              // memory.atomic.notify
+            skipAtomicMemArg("memory.atomic.notify", 4)
+            popVal(ValueType.I32Type)                                               // count
+            popVal(ValueType.I32Type)                                               // addr
+            pushVal(ValueType.I32Type)
+          case 0x01 =>                                                              // memory.atomic.wait32
+            skipAtomicMemArg("memory.atomic.wait32", 4)
+            popVal(ValueType.I64Type)                                               // timeout
+            popVal(ValueType.I32Type)                                               // expected
+            popVal(ValueType.I32Type)                                               // addr
+            pushVal(ValueType.I32Type)
+          case 0x02 =>                                                              // memory.atomic.wait64
+            skipAtomicMemArg("memory.atomic.wait64", 8)
+            popVal(ValueType.I64Type)                                               // timeout
+            popVal(ValueType.I64Type)                                               // expected
+            popVal(ValueType.I32Type)                                               // addr
+            pushVal(ValueType.I32Type)
+          case 0x03 =>                                                              // atomic.fence
+            if pc + 1 > body.length then fail("atomic.fence: truncated immediate")
+            pc += 1
+          // Atomic load: pop addr, push value of the per-op result type.
+          case 0x10 => skipAtomicMemArg("i32.atomic.load",     4); popVal(ValueType.I32Type); pushVal(ValueType.I32Type)
+          case 0x11 => skipAtomicMemArg("i64.atomic.load",     8); popVal(ValueType.I32Type); pushVal(ValueType.I64Type)
+          case 0x12 => skipAtomicMemArg("i32.atomic.load8_u",  1); popVal(ValueType.I32Type); pushVal(ValueType.I32Type)
+          case 0x13 => skipAtomicMemArg("i32.atomic.load16_u", 2); popVal(ValueType.I32Type); pushVal(ValueType.I32Type)
+          case 0x14 => skipAtomicMemArg("i64.atomic.load8_u",  1); popVal(ValueType.I32Type); pushVal(ValueType.I64Type)
+          case 0x15 => skipAtomicMemArg("i64.atomic.load16_u", 2); popVal(ValueType.I32Type); pushVal(ValueType.I64Type)
+          case 0x16 => skipAtomicMemArg("i64.atomic.load32_u", 4); popVal(ValueType.I32Type); pushVal(ValueType.I64Type)
+          // Atomic store: pop value, then addr; no result.
+          case 0x17 => skipAtomicMemArg("i32.atomic.store",   4); popVal(ValueType.I32Type); popVal(ValueType.I32Type)
+          case 0x18 => skipAtomicMemArg("i64.atomic.store",   8); popVal(ValueType.I64Type); popVal(ValueType.I32Type)
+          case 0x19 => skipAtomicMemArg("i32.atomic.store8",  1); popVal(ValueType.I32Type); popVal(ValueType.I32Type)
+          case 0x1a => skipAtomicMemArg("i32.atomic.store16", 2); popVal(ValueType.I32Type); popVal(ValueType.I32Type)
+          case 0x1b => skipAtomicMemArg("i64.atomic.store8",  1); popVal(ValueType.I64Type); popVal(ValueType.I32Type)
+          case 0x1c => skipAtomicMemArg("i64.atomic.store16", 2); popVal(ValueType.I64Type); popVal(ValueType.I32Type)
+          case 0x1d => skipAtomicMemArg("i64.atomic.store32", 4); popVal(ValueType.I64Type); popVal(ValueType.I32Type)
+          // RMW family — uniform shape `(addr, v) → old`, type and width
+          // derived from the same `(sub - 0x1e) / 7` / `(sub - 0x1e) % 7`
+          // decoding the runtime uses.
+          case s if s >= 0x1e && s <= 0x47 =>
+            val width    = (s - 0x1e) % 7
+            val accessW  = atomicWidthBytes(width)
+            val valType  = atomicValType(width)
+            skipAtomicMemArg(s"atomic.rmw sub=0x${s.toHexString}", accessW)
+            popVal(valType)
+            popVal(ValueType.I32Type)
+            pushVal(valType)
+          // cmpxchg — `(addr, expected, replacement) → old`. Both operands
+          // and result share the same wasm type per width.
+          case s if s >= 0x48 && s <= 0x4e =>
+            val (valType, accessW) = s match
+              case 0x48 => (ValueType.I32Type, 4)
+              case 0x49 => (ValueType.I64Type, 8)
+              case 0x4a => (ValueType.I32Type, 1)
+              case 0x4b => (ValueType.I32Type, 2)
+              case 0x4c => (ValueType.I64Type, 1)
+              case 0x4d => (ValueType.I64Type, 2)
+              case 0x4e => (ValueType.I64Type, 4)
+            skipAtomicMemArg(s"atomic.cmpxchg sub=0x${s.toHexString}", accessW)
+            popVal(valType)
+            popVal(valType)
+            popVal(ValueType.I32Type)
+            pushVal(valType)
+          case _ =>
+            throw new ValFail(WasmError.UnknownOpcode(0xfe))
 
       // === unhandled ===================================================
 

@@ -249,7 +249,7 @@ object Runtime:
           val ml = module.memories(mi)
           if ml.min < 0 || ml.min.toLong * Memory.PageSize > Int.MaxValue then
             fail(WasmError.InvalidModule(s"memory $mi: unsupported size ${ml.min} pages"))
-          arr(mi) = new Memory(ml.min, ml.max)
+          arr(mi) = new Memory(ml.min, ml.max, ml.shared)
           mi += 1
         arr
 
