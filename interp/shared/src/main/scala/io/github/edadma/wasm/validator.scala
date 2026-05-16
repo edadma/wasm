@@ -100,6 +100,41 @@ object Validator:
           throw new ValFail(WasmError.InvalidModule(
             s"import ${imp.module}.${imp.name}: type index ${imp.typeIdx} out of range"))
         im += 1
+      // Export-section validation. Every export must (a) reference an index
+      // that's in range for its kind and (b) have a name distinct from every
+      // other export in the module — the spec's `unique-names` invariant on
+      // the export section. The total funcidx range is imports + defs; tags
+      // unify tagImports + tags; tables/memories/globals are module-defined
+      // only (imports of those kinds not yet surfaced in the model).
+      val totalFuncs = module.imports.length + module.functions.length
+      val totalTags  = module.tagImports.length + module.tags.length
+      val seenExports = scala.collection.mutable.HashSet.empty[String]
+      module.exports.foreach { exp =>
+        if !seenExports.add(exp.name) then
+          throw new ValFail(WasmError.InvalidModule(
+            s"duplicate export name: ${exp.name}"))
+        exp match
+          case FuncExport(name, idx) =>
+            if idx < 0 || idx >= totalFuncs then
+              throw new ValFail(WasmError.InvalidModule(
+                s"export $name: unknown function $idx"))
+          case TableExport(name, idx) =>
+            if idx < 0 || idx >= module.tables.length then
+              throw new ValFail(WasmError.InvalidModule(
+                s"export $name: unknown table $idx"))
+          case MemoryExport(name, idx) =>
+            if idx < 0 || idx >= module.memories.length then
+              throw new ValFail(WasmError.InvalidModule(
+                s"export $name: unknown memory $idx"))
+          case GlobalExport(name, idx) =>
+            if idx < 0 || idx >= module.globals.length then
+              throw new ValFail(WasmError.InvalidModule(
+                s"export $name: unknown global $idx"))
+          case TagExport(name, idx) =>
+            if idx < 0 || idx >= totalTags then
+              throw new ValFail(WasmError.InvalidModule(
+                s"export $name: unknown tag $idx"))
+      }
       val funcSigs       = collectFuncSigs(module)
       val globalSigs     = module.globals.map(g => (g.valueType, g.mutable))
       val tableRefTypes  = module.tables.map(_.refType)

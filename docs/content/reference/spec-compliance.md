@@ -30,7 +30,7 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 50454 passed, 1460 failed, 1296 skipped (of 53210) ==
+== Spec totals: 50475 passed, 1439 failed, 1296 skipped (of 53210) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -118,7 +118,7 @@ Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest 
 
 ## What the runner caught
 
-Triage across the initial run-up and three coverage-expansion passes surfaced nine real interpreter bugs:
+Triage across the initial run-up and four coverage-expansion passes surfaced ten real interpreter bugs:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
@@ -129,5 +129,6 @@ Triage across the initial run-up and three coverage-expansion passes surfaced ni
 7. **`i8x16.popcnt` (SIMD sub-opcode 0x62) was completely unimplemented** — we had abs (0x60) and neg (0x61) but jumped to 0x63 (all_true).
 8. **`i16x8.q15mulr_sat_s` (SIMD sub-opcode 0x82) was completely unimplemented** — only the relaxed-SIMD variant (0x111) was present. Spec semantics: `(a*b + 0x4000) >> 15`, saturated to i16 range.
 9. **`try_table` catch labels counted with the try_table on the label stack.** Per the EH proposal, catch label indices count from the OUTER scope — the try_table is not yet on the label stack from the catch clause's perspective. Both the validator (pushed the try_table frame before validating catches) and the runtime (didn't pop the try_table label before `branchTo`) had matching off-by-one errors. Fix moves the `pushCtrl` after the catch-vector validation and adds a label-pop in the runtime's throw-dispatch path.
+10. **Export-section validation was missing entirely.** Two spec rules went unenforced: (a) export names must be unique within a module (duplicate `(export "foo" ...)` declarations were silently accepted, with the second shadowing the first); (b) each export's index must be in range for its kind (a `funcidx` past the imports+defs count, a `globalidx` past the global section, etc. all instantiated). Added a single pass over `module.exports` at the top of `Validator.validate` that checks both invariants.
 
-All nine ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, and `TryTableTests`.
+All ten ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.

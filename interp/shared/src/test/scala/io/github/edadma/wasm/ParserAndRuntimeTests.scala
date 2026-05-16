@@ -593,6 +593,114 @@ object ParserAndRuntimeTests:
         case other => check(false, s"expected InvalidModule, got $other")
     }
 
+    test("validator: duplicate export name (both function) is rejected") {
+      // Type: () -> ();  one function (typeidx 0);  two exports of "a"
+      // pointing at func 0;  empty function body.  Per the spec the export
+      // section's names must be unique within a module.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x09, 0x02,                                            // export sec: 9-byte content, 2 entries
+                  0x01, 0x61, 0x00, 0x00,                            //   "a" func 0
+                  0x01, 0x61, 0x00, 0x00,                            //   "a" func 0 (dup)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("duplicate export name") && msg.contains("a")
+      }
+    }
+
+    test("validator: duplicate export name (function + global) is rejected") {
+      // Two exports of "x": one function, one global. Spec says names
+      // are unique across all export kinds — not per-kind buckets.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b,              // global[0]: (i32 const) i32.const 0
+        0x07, 0x09, 0x02,                                            // export sec: 9-byte content, 2 entries
+                  0x01, 0x78, 0x00, 0x00,                            //   "x" func 0
+                  0x01, 0x78, 0x03, 0x00,                            //   "x" global 0 (dup name)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("duplicate export name") && msg.contains("x")
+      }
+    }
+
+    test("validator: export referencing unknown function index is rejected") {
+      // One function (idx 0), export references funcidx 5.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x05, 0x01, 0x01, 0x61, 0x00, 0x05,                    // export "a" func 5 (OOB)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("unknown function") && msg.contains("a")
+      }
+    }
+
+    test("validator: export referencing unknown global index is rejected") {
+      // One global, export references globalidx 5.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b,              // global[0]
+        0x07, 0x05, 0x01, 0x01, 0x67, 0x03, 0x05,                    // export "g" global 5 (OOB)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("unknown global") && msg.contains("g")
+      }
+    }
+
+    test("validator: export referencing unknown table index is rejected") {
+      // Zero tables, export references tableidx 0.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x05, 0x01, 0x01, 0x74, 0x01, 0x00,                    // export "t" table 0 (OOB)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("unknown table") && msg.contains("t")
+      }
+    }
+
+    test("validator: export referencing unknown memory index is rejected") {
+      // Zero memories, export references memidx 0.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x05, 0x01, 0x01, 0x6d, 0x02, 0x00,                    // export "m" memory 0 (OOB)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) =>
+          msg.contains("unknown memory") && msg.contains("m")
+      }
+    }
+
+    test("validator: two distinct export names accepted (sanity)") {
+      // Distinct names must NOT trip the duplicate check.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x09, 0x02,                                            // export sec: 9-byte content, 2 entries
+                  0x01, 0x61, 0x00, 0x00,                            //   "a" func 0
+                  0x01, 0x62, 0x00, 0x00,                            //   "b" func 0
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      Runtime.instantiate(mod, Seq(EnvModule.default)) match
+        case Right(_)  => ()
+        case Left(err) => check(false, s"distinct names should validate, got $err")
+    }
+
   // === EnvModule.default smoke test =======================================
 
   private def envModule(): Unit =
