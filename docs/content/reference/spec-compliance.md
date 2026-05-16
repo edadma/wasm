@@ -30,7 +30,7 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 51713 passed, 224 failed, 1273 skipped (of 53210) ==
+== Spec totals: 51714 passed, 223 failed, 1273 skipped (of 53210) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -80,7 +80,7 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 | `elem`    | Mostly wasm-3.0 GC reftype short form `0x40` in table sections (15 fails); 6 result-value mismatches on elem-segment edge cases |
 | `global`  | One wasm-3.0 GC reftype short form in a table section, plus 5 cascading "no current module" |
 | `imports` | Niche import-shape mismatches                                                           |
-| `linking` | Mutable-global cross-module sharing (snapshot model in `wrapAsHostModule` doesn't propagate guest `global.set` back to the exporting module); `(ref heaptype)` short forms `0x63`/`0x64` in element segments; cascade from earlier-failed modules |
+| `linking` | `(ref heaptype)` short forms `0x63`/`0x64` in element segments; cascade from earlier-failed modules (function-references proposal needed)                                                                |
 
 **Cross-module `register`** (runner-side):
 
@@ -94,7 +94,7 @@ Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest 
 
 ## What the runner caught
 
-Triage across the initial run-up and seven coverage-expansion passes surfaced thirteen real interpreter bugs plus three feature gaps the runner unblocked:
+Triage across the initial run-up and eight coverage-expansion passes surfaced thirteen real interpreter bugs plus four feature gaps the runner unblocked:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
@@ -120,4 +120,5 @@ All thirteen ship with regression tests in `NumericTests`, `MemoryTests`, `Multi
 
 14. **Compact-imports wire format.** The wasm-3.0 testsuite emits a compact import-section encoding where a regular-looking import with `field_name == ""` and a kind byte of `0x7E` (shared-kind) or `0x7F` (per-import-kind) signals that the just-read `mod_name` is shared across a group of sub-imports. The 0x7E form is `kind sub_count (field_name desc)*`; the 0x7F form is `sub_count (field_name kind desc)*`. The outer `count` field in the import-section header is the TOTAL number of imports across all groups, not the count of groups — so the parser advances `i` by `sub_count` per compact group. Without this, modules using the compact form failed at parse time with `unknown import kind 0x7F`. The `names` manifest was fully unlocked by this fix; eight other manifests gated on compact-imports now decode but still hit secondary residual gaps (imported memories / tables and cross-module register).
 15. **Imported memories + tables.** Parser silently skipped import kinds `0x01` (table) and `0x02` (memory); the module then failed when an instruction referenced a memidx or tableidx with "no memory / no table". `MemoryImport` and `TableImport` now surface in the model alongside `GlobalImport`; the runtime resolves them from `HostModule.memories: Map[String, Memory]` and `HostModule.tables: Map[String, RuntimeTable]` and prepends them to the live memories/tables arrays. Type checks: host's current size ≥ module's declared min, host's max (if any) ≤ module's declared max (if any), reftype match for tables, shared-vs-unshared match for memories. Four manifests fully unlocked: `exports`, `memory_grow`, `table_copy`, `table_grow`.
-16. **Cross-module `register` in the spec runner.** wast2json emits `(register "Mf" $Mf)` commands that bind a previously-loaded module to a host name so later modules can import from it. The runner now tracks two registries (`namedModules` for action-targeted invokes, `registered` for import resolution); the `Module` command optionally binds a `$name`; the `Register` command picks a target by `$name` (or current) and adds it to the import registry. `wrapAsHostModule` builds a `HostModule` from a `ModuleInstance`'s exports — exported functions forward through `inst.invoke` with traps re-thrown as `ExecFail` so the calling interpreter resurfaces them as `Left`, memories/tables/globals forward by reference (globals are still a snapshot at register time — live mutable-global sharing is the residual gap in `linking`).
+16. **Cross-module `register` in the spec runner.** wast2json emits `(register "Mf" $Mf)` commands that bind a previously-loaded module to a host name so later modules can import from it. The runner now tracks two registries (`namedModules` for action-targeted invokes, `registered` for import resolution); the `Module` command optionally binds a `$name`; the `Register` command picks a target by `$name` (or current) and adds it to the import registry. `wrapAsHostModule` builds a `HostModule` from a `ModuleInstance`'s exports — exported functions forward through `inst.invoke` with traps re-thrown as `ExecFail` so the calling interpreter resurfaces them as `Left`, and memories / tables / globals forward by reference.
+17. **Shared mutable globals across module boundaries.** Module storage for globals is now `Array[GlobalCell]` instead of `Array[Value]`. A `GlobalCell` is a tiny mutable holder; an imported mutable global installs the *exporter's* cell directly into the importing module's slot, so `global.set` from either side writes through the same storage — matching the wasm-3.0 spec's "imported mutable globals are aliases for the exporter's storage" rule. The host-import surface gains `HostGlobal.live(vt, mut, cell)` for sharing externally-owned cells; the existing `HostGlobal(vt, mut, value)` factory still works for the snapshot case (immutable globals + mutable globals the host doesn't need to observe). `ModuleInstance.exportedGlobalCell(name)` is the public accessor the spec runner uses when wrapping one module's exports as another module's imports. The `linking` manifest's mutable-global tests now exercise the shared-storage path correctly; residual `linking` failures are wasm-3.0 GC reftype short forms, unrelated.

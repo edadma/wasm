@@ -200,11 +200,15 @@ private[spec] object SpecRunner:
 
       override val globals: Map[String, HostGlobal] =
         inst.exportedGlobalNames.iterator.flatMap { n =>
+          // Forward by SHARED CELL, not by snapshot. For mutable globals
+          // this is the load-bearing part — `global.set` from the
+          // importing module writes through to the same storage the
+          // exporting module reads from, matching the wasm-3.0 spec.
           for
-            v   <- inst.globalValue(n).toOption
-            mut <- inst.exportedGlobalMutability(n).toOption
+            cell <- inst.exportedGlobalCell(n).toOption
+            mut  <- inst.exportedGlobalMutability(n).toOption
           yield
-            val vt = v match
+            val vt = cell.value match
               case _: I32       => ValueType.I32Type
               case _: I64       => ValueType.I64Type
               case _: F32       => ValueType.F32Type
@@ -214,7 +218,7 @@ private[spec] object SpecRunner:
               case _: RefFunc   => ValueType.FuncRefType
               case _: RefExtern => ValueType.ExternRefType
               case _: RefExn    => ValueType.ExnRefType
-            n -> HostGlobal(vt, mutable = mut, v)
+            n -> HostGlobal.live(vt, mutable = mut, cell)
         }.toMap
 
   final class Stats(val name: String):

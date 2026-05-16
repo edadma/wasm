@@ -9,21 +9,32 @@ WebAssembly modules can declare imports — functions provided by the host. The 
 ```scala
 trait HostModule:
   def name: String
-  def functions:      Map[String, HostFunc]      = Map.empty
-  def functionsMulti: Map[String, HostFuncMulti] = Map.empty
-  def globals:        Map[String, HostGlobal]    = Map.empty
+  def functions:      Map[String, HostFunc]        = Map.empty
+  def functionsMulti: Map[String, HostFuncMulti]   = Map.empty
+  def globals:        Map[String, HostGlobal]      = Map.empty
+  def memories:       Map[String, Memory]          = Map.empty
+  def tables:         Map[String, RuntimeTable]    = Map.empty
 
 type HostFunc      = (Memory,             Seq[Value]) => Seq[Value]
 type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
 
-final case class HostGlobal(valueType: ValueType, mutable: Boolean, value: Value)
+// HostGlobal is internally backed by a GlobalCell. Two factories:
+//   - HostGlobal(vt, mut, value)        — wraps the value in a fresh cell
+//   - HostGlobal.live(vt, mut, cell)    — shares an externally-owned cell
+
+final class GlobalCell(var value: Value)
 ```
 
 A `HostFunc` takes the guest's `Memory` instance (memidx 0) plus a sequence of `Value` arguments matching the import's declared signature, and returns a sequence of `Value` results matching the import's declared results. Pure functions, no `Future` / `IO` wrapping.
 
 A `HostFuncMulti` takes the guest's full vector of memories (length ≥ 1) instead of just memidx 0 — useful only for multi-memory modules. Single-memory programs should stay on `HostFunc`; multi-memory hosts that need to inspect or write a non-zero memidx use `HostFuncMulti`. A name registered in *both* maps resolves to the multi-memory form.
 
-A `HostGlobal` is a typed constant the host exposes for guest modules to import as `(import "..." "..." (global <type>))`. The runtime copies the value into the importing module's globalidx slot at instantiation; the declared `valueType` and `mutable` flag must match the import declaration exactly. The current model treats the import as a snapshot (a `global.set` from the guest mutates the guest's own slot, not the host's). Pin host-side `HostGlobal` entries as `mutable = false` to match the W3C spec-test convention.
+A `HostGlobal` is a typed global the host exposes for guest modules to import as `(import "..." "..." (global <type>))`. The declared `valueType` and `mutable` flag must match the import declaration exactly. Internally, every `HostGlobal` is backed by a `GlobalCell` — a tiny mutable holder for one `Value`:
+
+  - `HostGlobal(vt, mut, value)` wraps the literal in a *fresh* cell that nobody else holds a reference to. Guest `global.set` updates this private cell. Use this for immutable globals (where there's nothing to share anyway) and for mutable globals the host doesn't need to read back.
+  - `HostGlobal.live(vt, mut, cell)` shares an externally-owned cell. The host keeps a reference; guest writes flow through the same storage; the host can read and write the cell directly. This is how to satisfy the wasm-3.0 spec's "imported mutable globals alias the exporter's storage" rule when forwarding one module's exports as another module's imports.
+
+A `Memory` or `RuntimeTable` exposed via `memories` / `tables` forwards by reference — guest reads and writes hit the same backing array the host can inspect. Limits checking happens at instantiation: the host's current size must be at least the importing module's declared min, and the host's max (if any) must be at most the module's declared max (if any). Reftype must match for tables; shared-vs-unshared must match for memories.
 
 ## EnvModule.default
 

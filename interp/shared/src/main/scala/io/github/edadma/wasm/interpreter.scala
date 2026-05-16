@@ -741,7 +741,7 @@ final class Interpreter private[wasm] (
     /** Module-instance globals (shared across calls — that persistence is
       * the whole point of globals). The interpreter mutates entries in
       * place on `global.set`. */
-    private val globals: Array[Value],
+    private val globals: Array[GlobalCell],
     /** Parallel to `globals` — true if the corresponding slot is `var`,
       * false if `const`. `global.set` traps if the bit is false. */
     private val globalMutable: Array[Boolean],
@@ -1270,7 +1270,7 @@ final class Interpreter private[wasm] (
         val (i, p) = readU32At(f, f.pc + 1)
         f.pc = p
         if i < 0 || i >= globals.length then fail(WasmError.InvalidModule(s"global.get $i out of range"))
-        valueStack += globals(i)
+        valueStack += globals(i).value
 
       case 0x24 =>                                                                        // global.set
         val (i, p) = readU32At(f, f.pc + 1)
@@ -1281,8 +1281,9 @@ final class Interpreter private[wasm] (
         // Spec validates types statically (Phase 6). Here we accept whatever's
         // on the stack — a mistyped store would be caught by the operator
         // that reads the global next, and Phase 6's validator will lift this
-        // into a structural error.
-        globals(i) = valueStack.remove(valueStack.size - 1)
+        // into a structural error. The cell may be shared with another
+        // module via an imported mutable global — the write flows through.
+        globals(i).value = valueStack.remove(valueStack.size - 1)
 
       // === memory ========================================================
 

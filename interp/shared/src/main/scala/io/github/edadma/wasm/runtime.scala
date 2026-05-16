@@ -28,7 +28,7 @@ final class ModuleInstance private[wasm] (
       * a zero-page placeholder if the module has none), keeping the
       * existing public API + WASI shim contract intact. */
     val memories: Array[Memory],
-    private val globals: Array[Value],
+    private val globals: Array[GlobalCell],
     private val globalMutable: Array[Boolean],
     private val tables: Array[RuntimeTable],
     private val types: Vector[FuncType],
@@ -94,6 +94,15 @@ final class ModuleInstance private[wasm] (
   def globalValue(name: String): Either[WasmError, Value] =
     exportGlobals.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
+      case Some(idx) => Right(globals(idx).value)
+
+  /** Look up the live [[GlobalCell]] backing an exported global. Used
+    * by hosts forwarding one module's globals as another module's
+    * imports — sharing the cell preserves the wasm-spec rule that
+    * imported mutable globals alias the exporter's storage. */
+  def exportedGlobalCell(name: String): Either[WasmError, GlobalCell] =
+    exportGlobals.get(name) match
+      case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(globals(idx))
 
   /** Look up an exported memory by name. Phase 8.D surface: most modules
@@ -139,6 +148,18 @@ final class ModuleInstance private[wasm] (
     exportGlobals.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => Right(globalMutable(idx))
+
+/** A mutable cell holding one wasm `Value` — the storage backing a single
+  * global. Globals are stored in `Array[GlobalCell]` (not `Array[Value]`)
+  * specifically so that an imported mutable global can SHARE its cell
+  * with the exporting module: writes by either side flow through the
+  * same `value` slot, satisfying the wasm spec's "imported mutable
+  * globals are aliases for the exporter's storage" rule.
+  *
+  * Immutable globals also live in cells — there's no second code path —
+  * but the validator rejects `global.set` on them, so the `value` field
+  * is effectively write-once after instantiation. */
+final class GlobalCell(var value: Value)
 
 /** A runtime-side table. Slots are typed [[Value]]s — `RefNull` for empty
   * slots, `RefFunc` / `RefExtern` for populated ones — and the table
@@ -334,7 +355,7 @@ object Runtime:
     val nGlobalImports = module.globalImports.length
     val nGlobalDefs    = module.globals.length
     val gN             = nGlobalImports + nGlobalDefs
-    val globals        = new Array[Value](gN)
+    val globals        = new Array[GlobalCell](gN)
     val globalMutable  = new Array[Boolean](gN)
 
     var gim = 0
@@ -349,7 +370,12 @@ object Runtime:
       if hg.mutable != gi.mutable then
         fail(WasmError.InvalidModule(
           s"global import ${gi.module}.${gi.name}: mutability mismatch (host=${hg.mutable}, module=${gi.mutable})"))
-      globals(gim)       = hg.value
+      // Share the host's cell directly. For mutable imports this is the
+      // load-bearing line — `global.set` from inside this module writes
+      // through to the same storage the exporting module sees, matching
+      // the wasm-3.0 spec's shared-storage rule. For immutable imports
+      // the sharing is harmless (the validator rejects writes anyway).
+      globals(gim)       = hg.cell
       globalMutable(gim) = gi.mutable
       gim += 1
 
@@ -365,7 +391,7 @@ object Runtime:
           if idx < 0 || idx >= maxGlobalIdx then
             fail(WasmError.InvalidModule(
               s"$where: global.get $idx out of range (max $maxGlobalIdx)"))
-          globals(idx)
+          globals(idx).value
         case ConstInit.BinOp(opcode, lhs, rhs, ty) =>
           (eval(lhs), eval(rhs), ty, opcode) match
             case (I32(a), I32(b), ValueType.I32Type, ConstBinOp.Add) => I32(a + b)
@@ -399,7 +425,8 @@ object Runtime:
       val gidx = nGlobalImports + gdi
       // Self-references and forward references aren't legal — a defined
       // global's init expression can only see globals at indices < gidx.
-      globals(gidx)       = evalConstInit(s"global $gidx init", g.init, g.valueType, maxGlobalIdx = gidx)
+      val v = evalConstInit(s"global $gidx init", g.init, g.valueType, maxGlobalIdx = gidx)
+      globals(gidx)       = new GlobalCell(v)
       globalMutable(gidx) = g.mutable
       gdi += 1
 
