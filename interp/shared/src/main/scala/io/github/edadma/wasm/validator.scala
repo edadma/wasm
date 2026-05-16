@@ -64,12 +64,18 @@ object Validator:
 
   enum CtrlKind:
     case Function, Block, Loop, If, Else
-    /** EH proposal frames. `Try` is opened by `0x06`; `Catch` and `CatchAll`
+    /** Legacy EH frames. `Try` is opened by `0x06`; `Catch` and `CatchAll`
       * are opened by `0x07 tagidx` / `0x19` respectively (each replaces the
       * previous Try/Catch/CatchAll on the control stack but inherits the
       * try's `endTypes`). `rethrow N` is only legal when the label-frame at
       * depth N is a `Catch` or `CatchAll`. */
     case Try, Catch, CatchAll
+    /** Modern EH frame. `TryTable` is opened by `0x1F` and is structurally
+      * a `Block` — body produces `endTypes`, normal fall-through pops the
+      * frame at `end`. Handlers branch to outer labels at throw delivery
+      * time; the validator just type-checks the handler payload against
+      * the target label's branch arity. */
+    case TryTable
 
   // === Public API =========================================================
 
@@ -309,6 +315,7 @@ object Validator:
       case ValueType.FuncRefType   => "funcref"
       case ValueType.ExternRefType => "externref"
       case ValueType.V128Type      => "v128"
+      case ValueType.ExnRefType    => "exnref"
 
     // --- operand stack ----
 
@@ -570,6 +577,49 @@ object Validator:
         if target.kind != CtrlKind.Catch && target.kind != CtrlKind.CatchAll then
           fail(s"rethrow target must be a catch/catch_all frame, got ${target.kind}")
         unreachable()
+      case 0x0a =>                                                              // throw_ref
+        popVal(ValueType.ExnRefType)
+        unreachable()
+      case 0x1f =>                                                              // try_table blocktype catchvec
+        // Same blocktype shape as block/loop/if/try. Resolve through the
+        // shared decoder so future blocktype extensions land here too.
+        val (_, np) = Interpreter.readBlocktype(body, pc, types) match
+          case Right(t) => t
+          case Left(e)  => throw new ValFail(e)
+        pc = np
+        val ft = resolveBlockSig()
+        // Then the catch-clause vector (re-decoded via the same shared
+        // reader the pre-scan uses, so byte-offsets stay in lockstep).
+        val handlers = Interpreter.readTryTableCatches(body, pc) match
+          case Right((hs, np2)) => pc = np2; hs
+          case Left(e)          => throw new ValFail(e)
+        popVals(ft.params)
+        pushCtrl(CtrlKind.TryTable, ft.params, ft.results)
+        // Validate each handler clause. labelidx is counted with the
+        // TryTable frame on the ctrl stack — so labelidx 0 is the
+        // try_table itself, and a catch targeting 0 means "exit the
+        // try_table with the handler's payload on the stack".
+        handlers.foreach { h =>
+          val (payloadTypes, lbl) = h match
+            case Interpreter.TryTableHandler.Catch(tagIdx, l) =>
+              if tagIdx < 0 || tagIdx >= tagTypes.length then
+                fail(s"try_table catch: tag index $tagIdx out of range (have ${tagTypes.length} tags)")
+              (tagTypes(tagIdx), l)
+            case Interpreter.TryTableHandler.CatchRef(tagIdx, l) =>
+              if tagIdx < 0 || tagIdx >= tagTypes.length then
+                fail(s"try_table catch_ref: tag index $tagIdx out of range (have ${tagTypes.length} tags)")
+              (tagTypes(tagIdx) :+ ValueType.ExnRefType, l)
+            case Interpreter.TryTableHandler.CatchAll(l) =>
+              (Vector.empty[ValueType], l)
+            case Interpreter.TryTableHandler.CatchAllRef(l) =>
+              (Vector(ValueType.ExnRefType), l)
+          if lbl < 0 || lbl >= ctrlStack.length then
+            fail(s"try_table catch: label index $lbl out of range (have ${ctrlStack.length} labels)")
+          val targetFrame = ctrlStack(ctrlStack.length - 1 - lbl)
+          val targetTypes = labelTypes(targetFrame)
+          if targetTypes != payloadTypes then
+            fail(s"try_table catch: payload types ${payloadTypes.map(typeName).mkString("[", ",", "]")} don't match label $lbl arity ${targetTypes.map(typeName).mkString("[", ",", "]")}")
+        }
       case 0x0b =>                                                              // end
         val frame = popCtrl()
         pushVals(frame.endTypes)
@@ -727,7 +777,7 @@ object Validator:
         v match
           case AbsValue.Known(t) =>
             t match
-              case ValueType.FuncRefType | ValueType.ExternRefType => ()
+              case ValueType.FuncRefType | ValueType.ExternRefType | ValueType.ExnRefType => ()
               case other => fail(s"ref.is_null: expected reference, got ${typeName(other)}")
           case AbsValue.Unknown  => ()
         pushVal(ValueType.I32Type)
@@ -1320,6 +1370,8 @@ object Validator:
         case 0x6f => FuncType(Vector.empty, Vector(ValueType.ExternRefType))
         // Phase 8.E: v128-valued blocktypes — `(block (result v128))`.
         case 0x7b => FuncType(Vector.empty, Vector(ValueType.V128Type))
+        // try_table proposal: exnref-valued blocktype.
+        case 0x69 => FuncType(Vector.empty, Vector(ValueType.ExnRefType))
         case _    =>
           Leb128.readS32(body, pos) match
             case Right((idx, _)) if idx >= 0 && idx < types.length =>

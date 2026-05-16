@@ -275,12 +275,12 @@ object ParserAndRuntimeTests:
     test("interpreter: 0xC5 (unassigned) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc5), 0xc5, "0xC5 (reserved)")
     }
-    // 0x0A is unassigned in the spec opcode space (sits between `rethrow`
-    // 0x09 and `end` 0x0B). Same code path through `skipImmediates`'s
-    // default branch — was previously checked via 0x06 / 0x07 (try/catch)
-    // before the EH proposal landed.
-    test("interpreter: 0x0A (unassigned) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x0a), 0x0a, "0x0A (unassigned)")
+    // 0x1D is unassigned (sits between `select t*` 0x1C and `try_table`
+    // 0x1F). Same code path through `skipImmediates`'s default branch —
+    // previously checked via 0x06 / 0x07, then 0x0A, all of which are
+    // now real opcodes (legacy EH + try_table).
+    test("interpreter: 0x1D (unassigned) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x1d), 0x1d, "0x1D (unassigned)")
     }
     test("interpreter: completely unused opcode (0xFF) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xff), 0xff, "0xFF")

@@ -302,6 +302,8 @@ object Runtime:
         case (ValueType.FuncRefType,   RefFunc(_))                 => true
         case (ValueType.ExternRefType, RefNull(RefType.ExternRef)) => true
         case (ValueType.ExternRefType, RefExtern(_))               => true
+        case (ValueType.ExnRefType,    RefNull(RefType.ExnRef))    => true
+        case (ValueType.ExnRefType,    RefExn(_))                  => true
         case _                                                     => false
       if !ok then fail(WasmError.InvalidModule(s"global $gi: init value doesn't match declared type"))
       globals(gi)       = g.initialValue

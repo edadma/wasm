@@ -45,7 +45,9 @@ Multi-value blocks, loops, and ifs are supported — block parameters get re-fed
 
 ## Exception handling
 
-The legacy ("phase 3") exception-handling proposal — what wasmtime, V8, SpiderMonkey, and `wat2wasm`'s `--enable-exceptions` all ship — is supported end-to-end:
+Both forms of the exception-handling proposal are supported end-to-end — the **legacy "phase 3"** form (`try` / `catch` / `catch_all` / `delegate` / `rethrow`, what wasmtime + V8 + SpiderMonkey + `wat2wasm`'s `--enable-exceptions` emit today) **and** the **modern `try_table`** form (`0x1F` plus an `exnref` value type and `throw_ref`, the phase-4 redesign that's standardising now).
+
+### Legacy form
 
 - **`try blocktype`** (`0x06`) — open a block-shaped region whose body can be guarded by one or more `catch` clauses, a single `catch_all`, or a single `delegate`.
 - **`catch tagidx`** (`0x07`) — handle an exception whose tag matches `tagidx`; the tag's payload params are pushed onto the operand stack at handler entry.
@@ -56,7 +58,28 @@ The legacy ("phase 3") exception-handling proposal — what wasmtime, V8, Spider
 
 A `catch` / `catch_all` arrived at by normal fall-through (i.e. the try body completed without throwing) is dead code; control jumps past the entire try/catch chain.
 
-Tags are declared in [Section 13](#binary-sections) or imported from a host module under import-kind `0x04`. Each tag references a functype in section 1 whose `results` must be empty — the params are the tag's payload shape. A `throw` whose tag has params `(i32, i64)` pops two values (top of stack = last param). The validator rejects tagidxs out of range, rethrows outside any catch frame, delegates whose target is not an enclosing try or the function frame, and tag functypes with non-empty results.
+### Modern `try_table` form
+
+A single new opcode replaces the `try` / `catch` / `delegate` / `rethrow` cluster. The handler vector is parsed up front as an immediate, then the body runs as a regular block.
+
+- **`try_table blocktype vec(catch-clause)`** (`0x1F`) — open a block-shaped region. Each catch clause selects a tagidx (or wildcard) and a labelidx to branch to when a matching throw escapes the body.
+- **`throw_ref`** (`0x0A`) — pop an `exnref` and re-raise the carried exception. Replaces `rethrow`.
+- **`exnref`** valtype (wire byte `0x69`) — carries a caught exception. Bound by `catch_ref` / `catch_all_ref` handler clauses; consumed by `throw_ref`. Locals, params, results, and blocktypes may all be `exnref`.
+
+The four catch-clause shapes (encoded as a byte before each clause's immediates):
+
+| Byte | Clause           | Branch arity at target                |
+|------|------------------|---------------------------------------|
+| `0x00` | `catch tagidx labelidx`        | tag's payload params               |
+| `0x01` | `catch_ref tagidx labelidx`    | tag's payload params + `exnref`    |
+| `0x02` | `catch_all labelidx`           | (empty)                            |
+| `0x03` | `catch_all_ref labelidx`       | `exnref`                           |
+
+`labelidx` is counted with the `try_table` frame on the control stack — `labelidx 0` names the `try_table` itself, `1` the next outer block, etc. On a matching throw delivery, the runtime trims the operand stack to the `try_table`'s entry height, pushes the handler's declared payload, then performs the equivalent of `br labelidx`. Clauses are scanned in declared order; the first match wins.
+
+### Tags
+
+Tags are declared in [Section 13](#binary-sections) or imported from a host module under import-kind `0x04`. Each tag references a functype in section 1 whose `results` must be empty — the params are the tag's payload shape. A `throw` whose tag has params `(i32, i64)` pops two values (top of stack = last param). The validator rejects tagidxs out of range, rethrows outside any catch frame, delegates whose target is not an enclosing try or the function frame, tag functypes with non-empty results, and `try_table` catch clauses whose payload doesn't match the target label's branch arity.
 
 An uncaught exception that propagates past the outermost `_start`/`invoke` call surfaces through the public API as `Left(WasmError.UncaughtException(tagIdx, args))`. The host can pattern-match against the tagidx and re-throw as a native exception.
 
