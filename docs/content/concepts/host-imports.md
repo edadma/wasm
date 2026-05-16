@@ -11,14 +11,19 @@ trait HostModule:
   def name: String
   def functions:      Map[String, HostFunc]      = Map.empty
   def functionsMulti: Map[String, HostFuncMulti] = Map.empty
+  def globals:        Map[String, HostGlobal]    = Map.empty
 
 type HostFunc      = (Memory,             Seq[Value]) => Seq[Value]
 type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
+
+final case class HostGlobal(valueType: ValueType, mutable: Boolean, value: Value)
 ```
 
 A `HostFunc` takes the guest's `Memory` instance (memidx 0) plus a sequence of `Value` arguments matching the import's declared signature, and returns a sequence of `Value` results matching the import's declared results. Pure functions, no `Future` / `IO` wrapping.
 
 A `HostFuncMulti` takes the guest's full vector of memories (length ≥ 1) instead of just memidx 0 — useful only for multi-memory modules. Single-memory programs should stay on `HostFunc`; multi-memory hosts that need to inspect or write a non-zero memidx use `HostFuncMulti`. A name registered in *both* maps resolves to the multi-memory form.
+
+A `HostGlobal` is a typed constant the host exposes for guest modules to import as `(import "..." "..." (global <type>))`. The runtime copies the value into the importing module's globalidx slot at instantiation; the declared `valueType` and `mutable` flag must match the import declaration exactly. The current model treats the import as a snapshot (a `global.set` from the guest mutates the guest's own slot, not the host's). Pin host-side `HostGlobal` entries as `mutable = false` to match the W3C spec-test convention.
 
 ## EnvModule.default
 

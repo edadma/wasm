@@ -162,9 +162,10 @@ object Parser:
     // `memory.init` / `data.drop`. We capture it on parse; the validator
     // gates those ops on its presence + agreement with `data.length`.
     var dataCount  = Option.empty[Int]
-    var funcNames  = Map.empty[Int, String]
-    var tagImports = Vector.empty[TagImport]
-    var tags       = Vector.empty[Tag]
+    var funcNames     = Map.empty[Int, String]
+    var tagImports    = Vector.empty[TagImport]
+    var tags          = Vector.empty[Tag]
+    var globalImports = Vector.empty[GlobalImport]
 
     // Spec: known section IDs are 0..13. Anything else is "malformed
     // section id". Non-custom sections must appear at most once and in
@@ -207,9 +208,10 @@ object Parser:
         case 0  => funcNames = parseCustomSection(c, secEnd, funcNames)       // section 0 is "custom" — `name` is one of these
         case 1  => types     = parseTypeSection(c)
         case 2  =>
-          val (funcImps, tagImps) = parseImportSection(c)
-          imports    = funcImps
-          tagImports = tagImps
+          val (funcImps, tagImps, globImps) = parseImportSection(c)
+          imports       = funcImps
+          tagImports    = tagImps
+          globalImports = globImps
         case 3  => functions = parseFunctionSection(c)
         case 4  => tables    = parseTableSection(c)
         case 5  => memories  = parseMemorySection(c)
@@ -259,9 +261,10 @@ object Parser:
       data        = data,
       startFunction = start,
       dataCount   = dataCount,
-      funcNames   = funcNames,
-      tagImports  = tagImports,
-      tags        = tags,
+      funcNames     = funcNames,
+      tagImports    = tagImports,
+      tags          = tags,
+      globalImports = globalImports,
     )
 
   // === Type section ===
@@ -310,11 +313,12 @@ object Parser:
 
   // === Import section ===
 
-  private def parseImportSection(c: Cursor): (Vector[FuncImport], Vector[TagImport]) =
-    val n    = c.readU32()
-    val out  = ArrayBuffer.empty[FuncImport]
-    val tags = ArrayBuffer.empty[TagImport]
-    var i    = 0
+  private def parseImportSection(c: Cursor): (Vector[FuncImport], Vector[TagImport], Vector[GlobalImport]) =
+    val n     = c.readU32()
+    val out   = ArrayBuffer.empty[FuncImport]
+    val tags  = ArrayBuffer.empty[TagImport]
+    val globs = ArrayBuffer.empty[GlobalImport]
+    var i     = 0
     while i < n do
       val mod  = c.readName()
       val name = c.readName()
@@ -333,9 +337,12 @@ object Parser:
           skipLimits(c)
         case 0x02 =>                                     // memory — skip
           skipLimits(c)
-        case 0x03 =>                                     // global — skip (Phase 5)
-          val _ = c.readByte()                           // valtype
-          val _ = c.readByte()                           // mut
+        case 0x03 =>                                     // global
+          val vt  = readValType(c)
+          val mut = c.readByte()
+          if mut != 0x00 && mut != 0x01 then
+            fail(WasmError.InvalidModule(s"global import ${mod}.${name}: invalid mutability byte 0x${mut.toHexString}"))
+          globs += GlobalImport(mod, name, vt, mut == 0x01)
         case 0x04 =>                                     // tag (EH proposal)
           // Wire shape: attribute byte (must be 0x00 = exception) + typeidx u32.
           val attr = c.readByte()
@@ -345,7 +352,7 @@ object Parser:
         case other =>
           fail(WasmError.InvalidModule(s"unknown import kind 0x${other.toHexString}"))
       i += 1
-    (out.toVector, tags.toVector)
+    (out.toVector, tags.toVector, globs.toVector)
 
   private def skipLimits(c: Cursor): Unit =
     val flag = c.readByte()
@@ -414,12 +421,11 @@ object Parser:
 
   /** Parse Section 6. Per global: valtype byte, mutability byte, init-expr.
     *
-    * For the scalar global types the init-expr is a single `*.const`
-    * instruction followed by the `end` byte. `global.get` against an
-    * imported global is also legal here per the spec, but we don't
-    * surface global imports yet (Phase 5), so the `global.get` form is
-    * rejected with a clear diagnostic rather than silently accepted with
-    * no live binding.
+    * The init-expr is a `ConstInit` — either a folded `*.const` /
+    * `v128.const` / `ref.null` / `ref.func` literal, or a `global.get`
+    * referencing an imported, immutable global of matching type. Type
+    * agreement for the `global.get` form is checked at validation time
+    * (the parser doesn't have the imported globals' typing yet).
     */
   private def parseGlobalSection(c: Cursor): Vector[Global] =
     val n = c.readU32()
@@ -429,7 +435,7 @@ object Parser:
         case 0x00 => false
         case 0x01 => true
         case b    => fail(WasmError.InvalidModule(s"unknown global mutability byte 0x${b.toHexString}"))
-      Global(vt, mut, readConstExpr(c, vt))
+      Global(vt, mut, readConstInitExpr(c))
     }
 
   // === Export section ===
@@ -545,7 +551,7 @@ object Parser:
       val flag = c.readU32()
       flag match
         case 0 =>
-          val offset = readConstI32Expr(c)
+          val offset = readConstI32InitExpr(c)
           val cnt    = c.readU32()
           val refs   = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
           ElementSegment.Active(0, offset, RefType.FuncRef, refs)
@@ -559,7 +565,7 @@ object Parser:
           ElementSegment.Passive(RefType.FuncRef, refs)
         case 2 =>
           val tableIdx = c.readU32()
-          val offset   = readConstI32Expr(c)
+          val offset   = readConstI32InitExpr(c)
           val ek       = c.readByte()
           if ek != 0x00 then
             fail(WasmError.InvalidModule(
@@ -576,7 +582,7 @@ object Parser:
           val refs = Vector.tabulate(cnt)(_ => RefFunc(c.readU32()))
           ElementSegment.Declarative(RefType.FuncRef, refs)
         case 4 =>
-          val offset = readConstI32Expr(c)
+          val offset = readConstI32InitExpr(c)
           val cnt    = c.readU32()
           val refs   = Vector.tabulate(cnt)(_ => readElemExpr(c, RefType.FuncRef))
           ElementSegment.Active(0, offset, RefType.FuncRef, refs)
@@ -587,7 +593,7 @@ object Parser:
           ElementSegment.Passive(rt, refs)
         case 6 =>
           val tableIdx = c.readU32()
-          val offset   = readConstI32Expr(c)
+          val offset   = readConstI32InitExpr(c)
           val rt       = readRefType(c, "active element segment")
           val cnt      = c.readU32()
           val refs     = Vector.tabulate(cnt)(_ => readElemExpr(c, rt))
@@ -711,7 +717,7 @@ object Parser:
       val flag = c.readU32()
       flag match
         case 0 =>
-          val offset = readConstI32Expr(c)
+          val offset = readConstI32InitExpr(c)
           val len    = c.readU32()
           DataSegment.Active(0, offset, c.readBytes(len))
         case 1 =>
@@ -719,91 +725,113 @@ object Parser:
           DataSegment.Passive(c.readBytes(len))
         case 2 =>
           val memIdx = c.readU32()
-          val offset = readConstI32Expr(c)
+          val offset = readConstI32InitExpr(c)
           val len    = c.readU32()
           DataSegment.Active(memIdx, offset, c.readBytes(len))
         case other =>
           fail(WasmError.InvalidModule(s"unknown data segment flag $other"))
     }
 
-  /** Data-segment offsets are constrained to be i32 const exprs. Phase 1's
-    * narrow reader stays as a thin wrapper around the type-checked
-    * `readConstExpr` so the active-data parse keeps its old signature.
-    */
-  private def readConstI32Expr(c: Cursor): Int =
-    readConstExpr(c, ValueType.I32Type) match
-      case I32(v) => v
-      case other  => fail(WasmError.InvalidModule(s"expected i32 const expr, got $other"))
+  /** Data-segment offsets are constrained to be i32 const exprs. Returns a
+    * [[ConstInit]] so the active-segment offset can be a folded
+    * `i32.const` literal, a `global.get` over an earlier immutable i32
+    * global, or an extended-const arithmetic tree — type-checked by the
+    * validator and resolved by the runtime. */
+  private def readConstI32InitExpr(c: Cursor): ConstInit = readConstInitExpr(c)
 
-  /** Read a constant initializer expression: a single `*.const` of the
-    * expected value type, followed by `end`. The `global.get`-on-imported-
-    * global form is also valid per spec, but until imports surface globals
-    * (Phase 5) we reject it explicitly. f32/f64 immediates are 4 / 8 raw
-    * little-endian IEEE-754 bytes (NOT LEB), the same encoding the
-    * interpreter uses for `0x43` / `0x44` in-body.
+  /** Read a constant initializer expression terminated by `end`. Per the
+    * wasm-3.0 spec const-exprs are stack-machine instruction sequences
+    * containing:
+    *   - `*.const` / `v128.const` / `ref.null` / `ref.func`
+    *   - `global.get globalidx` (any earlier immutable global; validator
+    *     enforces the rule because the typing/mutability of imports
+    *     isn't visible at parse time)
+    *   - `iN.add` / `iN.sub` / `iN.mul` (extended-const proposal)
+    *
+    * The parser maintains a small expression-tree stack so the resulting
+    * [[ConstInit]] is the operator tree rather than a raw op list — the
+    * validator and runtime can then walk it recursively. All type
+    * checks are deferred to the validator, which has full visibility
+    * into the unified globalidx space.
     */
-  private def readConstExpr(c: Cursor, expected: ValueType): Value =
-    val op  = c.readByte()
-    val v   = (op, expected) match
-      case (0x41, ValueType.I32Type) => I32(c.readS32())
-      case (0x42, ValueType.I64Type) =>
-        Leb128.readS64(c.bytes, c.pos) match
-          case Right((x, p)) => c.pos = p; I64(x)
-          case Left(e)       => fail(e)
-      case (0x43, ValueType.F32Type) =>
-        val b   = c.readBytes(4)
-        val bits = (b(0) & 0xff)        |
-                   ((b(1) & 0xff) <<  8) |
-                   ((b(2) & 0xff) << 16) |
-                   ((b(3) & 0xff) << 24)
-        F32(java.lang.Float.intBitsToFloat(bits))
-      case (0x44, ValueType.F64Type) =>
-        val b   = c.readBytes(8)
-        val bits =
-          (b(0) & 0xffL)        |
-          ((b(1) & 0xffL) <<  8) |
-          ((b(2) & 0xffL) << 16) |
-          ((b(3) & 0xffL) << 24) |
-          ((b(4) & 0xffL) << 32) |
-          ((b(5) & 0xffL) << 40) |
-          ((b(6) & 0xffL) << 48) |
-          ((b(7) & 0xffL) << 56)
-        F64(java.lang.Double.longBitsToDouble(bits))
-      case (0xfd, ValueType.V128Type) =>                               // v128.const (prefix + sub-opcode 12 + 16 raw bytes)
-        val sub = c.readU32()
-        if sub != 12 then
-          fail(WasmError.InvalidModule(s"expected v128.const (sub-opcode 12) in const expr, got SIMD sub-opcode $sub"))
-        V128(c.readBytes(16))
-      case (0xd0, ValueType.FuncRefType) =>                            // ref.null funcref
-        val rt = readRefType(c, "ref.null")
-        if rt != RefType.FuncRef then
-          fail(WasmError.InvalidModule(s"ref.null reftype mismatch: expected funcref, got $rt"))
-        RefNull(rt)
-      case (0xd0, ValueType.ExternRefType) =>                          // ref.null externref
-        val rt = readRefType(c, "ref.null")
-        if rt != RefType.ExternRef then
-          fail(WasmError.InvalidModule(s"ref.null reftype mismatch: expected externref, got $rt"))
-        RefNull(rt)
-      case (0xd2, ValueType.FuncRefType) =>                            // ref.func funcidx
-        RefFunc(c.readU32())
-      case (0x23, _) =>
-        fail(WasmError.InvalidModule(
-          "global.get in const expr requires an imported global, which isn't supported yet"))
-      case (other, _) =>
-        // Phrase the diagnostic in terms of the const form the declared
-        // type would have required, so it reads the same way the wat
-        // source does.
-        val expected_mnemonic = expected match
-          case ValueType.I32Type       => "i32.const"
-          case ValueType.I64Type       => "i64.const"
-          case ValueType.F32Type       => "f32.const"
-          case ValueType.F64Type       => "f64.const"
-          case ValueType.FuncRefType   => "ref.null func / ref.func funcidx"
-          case ValueType.ExternRefType => "ref.null extern"
-          case ValueType.V128Type      => "v128.const"
-          case ValueType.ExnRefType    => "ref.null exn"
-        fail(WasmError.InvalidModule(
-          s"expected $expected_mnemonic in const expr, got 0x${other.toHexString}"))
-    val end = c.readByte()
-    if end != 0x0b then fail(WasmError.InvalidModule(s"expected end after const expr, got 0x${end.toHexString}"))
-    v
+  private def readConstInitExpr(c: Cursor): ConstInit =
+    val stack = ArrayBuffer.empty[ConstInit]
+
+    def fail2(msg: String): Nothing = fail(WasmError.InvalidModule(msg))
+
+    var done = false
+    while !done do
+      val op = c.readByte()
+      op match
+        case 0x0b => done = true                                                  // end
+        case 0x41 =>                                                              // i32.const
+          stack += ConstInit.Literal(I32(c.readS32()))
+        case 0x42 =>                                                              // i64.const
+          Leb128.readS64(c.bytes, c.pos) match
+            case Right((x, p)) => c.pos = p; stack += ConstInit.Literal(I64(x))
+            case Left(e)       => fail(e)
+        case 0x43 =>                                                              // f32.const
+          val b   = c.readBytes(4)
+          val bits = (b(0) & 0xff)        |
+                     ((b(1) & 0xff) <<  8) |
+                     ((b(2) & 0xff) << 16) |
+                     ((b(3) & 0xff) << 24)
+          stack += ConstInit.Literal(F32(java.lang.Float.intBitsToFloat(bits)))
+        case 0x44 =>                                                              // f64.const
+          val b   = c.readBytes(8)
+          val bits =
+            (b(0) & 0xffL)        |
+            ((b(1) & 0xffL) <<  8) |
+            ((b(2) & 0xffL) << 16) |
+            ((b(3) & 0xffL) << 24) |
+            ((b(4) & 0xffL) << 32) |
+            ((b(5) & 0xffL) << 40) |
+            ((b(6) & 0xffL) << 48) |
+            ((b(7) & 0xffL) << 56)
+          stack += ConstInit.Literal(F64(java.lang.Double.longBitsToDouble(bits)))
+        case 0xfd =>                                                              // v128.const (prefix + sub-opcode 12 + 16 raw bytes)
+          val sub = c.readU32()
+          if sub != 12 then
+            fail2(s"const expr: unsupported SIMD sub-opcode $sub (only v128.const allowed)")
+          stack += ConstInit.Literal(V128(c.readBytes(16)))
+        case 0xd0 =>                                                              // ref.null reftype
+          val rt = readRefType(c, "ref.null")
+          stack += ConstInit.Literal(RefNull(rt))
+        case 0xd2 =>                                                              // ref.func funcidx
+          stack += ConstInit.Literal(RefFunc(c.readU32()))
+        case 0x23 =>                                                              // global.get globalidx
+          stack += ConstInit.GlobalGet(c.readU32())
+        case 0x6a =>                                                              // i32.add
+          val (rhs, lhs) = popPair(stack, "i32.add")
+          stack += ConstInit.BinOp(ConstBinOp.Add, lhs, rhs, ValueType.I32Type)
+        case 0x6b =>                                                              // i32.sub
+          val (rhs, lhs) = popPair(stack, "i32.sub")
+          stack += ConstInit.BinOp(ConstBinOp.Sub, lhs, rhs, ValueType.I32Type)
+        case 0x6c =>                                                              // i32.mul
+          val (rhs, lhs) = popPair(stack, "i32.mul")
+          stack += ConstInit.BinOp(ConstBinOp.Mul, lhs, rhs, ValueType.I32Type)
+        case 0x7c =>                                                              // i64.add
+          val (rhs, lhs) = popPair(stack, "i64.add")
+          stack += ConstInit.BinOp(ConstBinOp.Add, lhs, rhs, ValueType.I64Type)
+        case 0x7d =>                                                              // i64.sub
+          val (rhs, lhs) = popPair(stack, "i64.sub")
+          stack += ConstInit.BinOp(ConstBinOp.Sub, lhs, rhs, ValueType.I64Type)
+        case 0x7e =>                                                              // i64.mul
+          val (rhs, lhs) = popPair(stack, "i64.mul")
+          stack += ConstInit.BinOp(ConstBinOp.Mul, lhs, rhs, ValueType.I64Type)
+        case other =>
+          fail2(s"unsupported opcode 0x${other.toHexString} in const expr")
+
+    if stack.length != 1 then
+      fail2(s"const expr: expected exactly one value at end, got ${stack.length}")
+    stack(0)
+
+  /** Pop two values from a const-expr expression-tree stack; the second
+    * pop is the left operand (since wasm is stack-machine: lhs pushed
+    * first, rhs pushed second, op pops rhs then lhs). */
+  private def popPair(stack: ArrayBuffer[ConstInit], opName: String): (ConstInit, ConstInit) =
+    if stack.length < 2 then
+      fail(WasmError.InvalidModule(s"const expr: $opName needs 2 operands, stack has ${stack.length}"))
+    val rhs = stack.remove(stack.length - 1)
+    val lhs = stack.remove(stack.length - 1)
+    (rhs, lhs)

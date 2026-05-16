@@ -115,9 +115,46 @@ object ValueType:
   * it at one. */
 final case class FuncType(params: Vector[ValueType], results: Vector[ValueType])
 
-/** An imported function. Table / memory / global imports aren't surfaced yet
-  * (Phase 5); if the module needs them it will fail at instantiation or use. */
+/** An imported function. Table / memory imports aren't surfaced yet
+  * (Phase 5); if the module needs them it will fail at instantiation or use.
+  * Imported globals surface via [[GlobalImport]] (Phase 9). */
 final case class FuncImport(module: String, name: String, typeIdx: Int)
+
+/** An imported global. Surfaced via the import section (kind 0x03). The
+  * import's valuetype + mut bytes are parsed eagerly; instantiation
+  * resolves the live [[Value]] from a host module's [[HostGlobal]] entry.
+  *
+  * Imported globals occupy globalidx slots 0..k-1 in the unified global
+  * index space, ahead of any module-defined globals. The validator's
+  * `globalSigs` and the runtime's `globals` array both follow this layout
+  * so `global.get N` resolves consistently. */
+final case class GlobalImport(module: String, name: String, valueType: ValueType, mutable: Boolean)
+
+/** A constant initializer expression. Used wherever the spec requires a
+  * "constant expression": global init values, active data-segment offsets,
+  * active element-segment offsets.
+  *
+  * Per the wasm-3.0 spec (GC proposal const-expr relaxation + extended-const
+  * proposal) the legal forms are:
+  *
+  *   - [[ConstInit.Literal]] — a folded `*.const` / `v128.const` /
+  *     `ref.null` / `ref.func` value.
+  *   - [[ConstInit.GlobalGet]] — a `global.get globalidx` referencing any
+  *     *earlier-defined, immutable* global (imports occupy the leading
+  *     globalidx slots, defined globals follow in declaration order).
+  *   - [[ConstInit.BinOp]] — an `iN.add` / `iN.sub` / `iN.mul`
+  *     (`add`/`sub`/`mul` × `i32`/`i64`). Operands are recursively
+  *     [[ConstInit]] expressions; the parser flattens the wire-format
+  *     stack-machine sequence into this small tree at parse time. */
+sealed trait ConstInit
+
+object ConstInit:
+  final case class Literal(value: Value)                                            extends ConstInit
+  final case class GlobalGet(idx: Int)                                              extends ConstInit
+  final case class BinOp(op: ConstBinOp, lhs: ConstInit, rhs: ConstInit, ty: ValueType) extends ConstInit
+
+enum ConstBinOp:
+  case Add, Sub, Mul
 
 /** An imported exception tag (Exception Handling proposal). `typeIdx` names a
   * functype in section 1 whose `results` must be empty — the params are the
@@ -182,9 +219,11 @@ sealed trait ElementSegment:
 
 object ElementSegment:
   /** Active: copy `refs` into `tables(tableIdx)` at `offset` at
-    * instantiation. The runtime then marks this segment "dropped" so
-    * subsequent `table.init` with n > 0 traps. */
-  final case class Active(tableIdx: Int, offset: Int, refType: RefType, refs: Vector[Value]) extends ElementSegment
+    * instantiation. The offset is a [[ConstInit]] — either a folded
+    * `i32.const` or a `global.get` over an immutable imported i32 global,
+    * resolved at instantiation. The runtime then marks this segment
+    * "dropped" so subsequent `table.init` with n > 0 traps. */
+  final case class Active(tableIdx: Int, offset: ConstInit, refType: RefType, refs: Vector[Value]) extends ElementSegment
 
   /** Passive: refs remain addressable by elemidx until `elem.drop`. */
   final case class Passive(refType: RefType, refs: Vector[Value]) extends ElementSegment
@@ -192,17 +231,15 @@ object ElementSegment:
   /** Declarative: parsed for `ref.func` pre-declaration; runtime no-op. */
   final case class Declarative(refType: RefType, refs: Vector[Value]) extends ElementSegment
 
-/** A module-defined global. The init expression is evaluated at parse time
-  * for the `*.const` form and stored directly here as `initialValue`;
-  * `Runtime.instantiate` copies that into the live globals array. `mutable` is
-  * the section-6 mutability byte (0x00 = const, 0x01 = var) — `global.set` on
-  * an immutable global traps at run time (and once Phase 6 ships, at
-  * validation time).
+/** A module-defined global. The init expression is parsed into a
+  * [[ConstInit]] and resolved by `Runtime.instantiate` against the live
+  * (imports-first) globals array. `mutable` is the section-6 mutability
+  * byte (0x00 = const, 0x01 = var) — `global.set` on an immutable global
+  * is rejected at validation time.
   *
-  * Imported globals are not represented yet (Phase 5 — keeps the surface
-  * small while Phase 2 lands).
-  */
-final case class Global(valueType: ValueType, mutable: Boolean, initialValue: Value)
+  * Imported globals surface via [[GlobalImport]] and occupy globalidx
+  * slots ahead of these defined globals. */
+final case class Global(valueType: ValueType, mutable: Boolean, init: ConstInit)
 
 /** A data segment. Phase 8.B extends the original active-only shape with
   * a passive variant so `memory.init` / `data.drop` have something to
@@ -213,9 +250,11 @@ sealed trait DataSegment:
 
 object DataSegment:
   /** Active: copied into memory `memIdx` at `offset` during instantiation.
-    * Post-instantiation the segment is "dropped" — subsequent
-    * `memory.init` with n > 0 traps. */
-  final case class Active(memIdx: Int, offset: Int, bytes: Array[Byte]) extends DataSegment
+    * The offset is a [[ConstInit]] — either a folded `i32.const` or a
+    * `global.get` over an immutable imported i32 global, resolved at
+    * instantiation. Post-instantiation the segment is "dropped" —
+    * subsequent `memory.init` with n > 0 traps. */
+  final case class Active(memIdx: Int, offset: ConstInit, bytes: Array[Byte]) extends DataSegment
 
   /** Passive: bytes remain addressable by dataidx until `data.drop`. */
   final case class Passive(bytes: Array[Byte]) extends DataSegment
@@ -243,7 +282,7 @@ final case class WasmModule(
     functions: Vector[Int],          // type indices, one per defined function (matches `codes` 1:1)
     tables: Vector[Table],           // module-defined tables (imports not surfaced yet)
     memories: Vector[MemoryLimits],
-    globals: Vector[Global],         // module-defined globals (imports not surfaced yet)
+    globals: Vector[Global],         // module-defined globals; imports surface via globalImports
     exports: Vector[Export],
     elements: Vector[ElementSegment],// element segments — active ones populate `tables` at instantiation
     codes: Vector[FuncBody],
@@ -264,6 +303,10 @@ final case class WasmModule(
     // immediate and an exported tagidx resolve against the same vector.
     tagImports: Vector[TagImport] = Vector.empty,
     tags:       Vector[Tag]       = Vector.empty,
+    // Imported globals (kind 0x03). Occupy globalidx slots 0..k-1, ahead of
+    // module-defined globals. Resolved by `Runtime.instantiate` against the
+    // supplied host modules' `globals` maps.
+    globalImports: Vector[GlobalImport] = Vector.empty,
 )
 
 /** All failure modes surfaced by the public API.

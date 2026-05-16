@@ -27,6 +27,19 @@ type HostFunc = (Memory, Seq[Value]) => Seq[Value]
   */
 type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
 
+/** An exported global from a host module. Imported by a wasm module's
+  * import section (kind 0x03). The runtime copies the value into the
+  * importing module's globalidx slot at instantiation. The declared
+  * `valueType` and `mutable` flag must match the importing module's
+  * `(import "..." "..." (global <type> <mut>))` exactly.
+  *
+  * Mutability: currently the runtime treats the import as a snapshot
+  * taken at instantiation — `global.set` from inside the wasm module
+  * updates the wasm-side slot only. Sharing live mutable state across
+  * module boundaries isn't surfaced yet; pin imports as `mutable=false`
+  * to match the W3C spec-test convention. */
+final case class HostGlobal(valueType: ValueType, mutable: Boolean, value: Value)
+
 trait HostModule:
   def name: String
 
@@ -37,6 +50,11 @@ trait HostModule:
     * memory vector. Defaults to empty — a HostModule that only needs
     * single-memory access can ignore this surface entirely. */
   def functionsMulti: Map[String, HostFuncMulti] = Map.empty
+
+  /** Host-provided globals. Imported by a wasm module's import section
+    * (kind 0x03). Defaults to empty — most host modules don't expose
+    * globals. */
+  def globals: Map[String, HostGlobal] = Map.empty
 
 /** The single host module the interpreter ships with.
   *
