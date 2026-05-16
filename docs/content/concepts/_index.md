@@ -10,3 +10,4 @@ The Quickstart shows the three common shapes of caller code. This section is abo
 - [Validation](/concepts/validation/) — what runs before any wasm code does.
 - [Host imports](/concepts/host-imports/) — `HostModule` and `HostFunc` from the inside.
 - [Traps and errors](/concepts/traps-and-errors/) — the `WasmError` model and what causes each variant.
+- [Tracer](/concepts/tracer/) — instrumentation hooks for opcode counts, function transitions, throws, and traps.

@@ -3,7 +3,7 @@ package io.github.edadma.wasm.wasi
 import scala.annotation.unused
 import scala.collection.mutable.ArrayBuffer
 
-import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInstance, Value, WasmError}
+import io.github.edadma.wasm.{HostFunc, HostModule, I32, I64, Memory, ModuleInstance, Tracer, Value, WasmError}
 
 /** WASI Preview 1 host shim for the `wasm` interpreter.
   *
@@ -375,9 +375,13 @@ object Wasi:
     * Any other failure surfaces as `Left(WasmError.*)` — the runner
     * doesn't fold those into an exit code because they're genuinely
     * interpreter-level errors, not the program's reported exit state. */
-  def run(inst: ModuleInstance, entry: String = "_start"): Either[WasmError, Int] =
+  def run(
+      inst:   ModuleInstance,
+      entry:  String = "_start",
+      tracer: Tracer = Tracer.NoOp,
+  ): Either[WasmError, Int] =
     try
-      inst.invoke(entry, Seq.empty) match
+      inst.invoke(entry, Seq.empty, tracer) match
         case Right(_)  => Right(0)
         case Left(err) => Left(err)
     catch case e: WasiExit => Right(e.code)

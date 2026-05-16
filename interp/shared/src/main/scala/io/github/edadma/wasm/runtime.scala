@@ -60,13 +60,21 @@ final class ModuleInstance private[wasm] (
 
   /** Invoke an exported function. Each call gets a fresh interpreter so
     * memory, globals, and tables persist across calls but the value/call
-    * stacks don't. */
-  def invoke(name: String, args: Seq[Value] = Seq.empty): Either[WasmError, Seq[Value]] =
+    * stacks don't.
+    *
+    * `tracer` defaults to [[Tracer.NoOp]] — pass a [[Tracer.Counting]]
+    * (or your own implementation) to receive callbacks at each opcode,
+    * function transition, throw, and trap. */
+  def invoke(
+      name:   String,
+      args:   Seq[Value] = Seq.empty,
+      tracer: Tracer     = Tracer.NoOp,
+  ): Either[WasmError, Seq[Value]] =
     exportFuncs.get(name) match
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => new Interpreter(
         funcs, memories, globals, globalMutable, tables, types,
-        dataBytes, dataDropped, elemRefs, elemDropped, tagParams,
+        dataBytes, dataDropped, elemRefs, elemDropped, tagParams, tracer,
       ).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
