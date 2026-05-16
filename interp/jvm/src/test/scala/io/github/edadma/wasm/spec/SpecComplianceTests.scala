@@ -108,12 +108,6 @@ private[spec] object KnownFailures:
 
   /** Manifest names (sans `.json` extension) expected to have failures.
     *
-    *   - `align`    — the validator doesn't yet enforce "align <= natural"
-    *                  for plain load/store. Atomic loads / stores DO get
-    *                  the check (see `Validator.skipAtomicMemArg`), but
-    *                  the non-atomic path uses `skipMemArg` which only
-    *                  reads the align field without bounding it.
-    *
     *   - `br_table` — the testsuite's br_table module 0 uses the typed
     *                  function-references reftype short form
     *                  `(ref null func)` (wire byte 0x63). That's the
@@ -126,7 +120,6 @@ private[spec] object KnownFailures:
     *                  doesn't match the declared block result arity.
     */
   private val names: Set[String] = Set(
-    "align",
     "br_table",
     "if",
   )

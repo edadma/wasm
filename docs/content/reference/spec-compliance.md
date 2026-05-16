@@ -55,11 +55,10 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 
 ## Known failures
 
-Three manifests are pinned in `SpecComplianceTests.KnownFailures` with explicit reasons, so the overall sweep stays green while the gap stays visible:
+Two manifests are pinned in `SpecComplianceTests.KnownFailures` with explicit reasons, so the overall sweep stays green while the gap stays visible:
 
 | Manifest   | Why                                                                                                                          |
 |------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `align`    | Validator doesn't enforce `align <= log2(natural-width)` on plain load / store. Atomic ops *do* get the check.                |
 | `br_table` | Testsuite module 0 uses the typed function-references reftype `(ref null func)` (wire byte `0x63`); proposal not implemented. |
 | `if`       | Four validator gaps where an `if` branch's stack height doesn't match the declared block result arity.                        |
 
@@ -67,9 +66,10 @@ Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest 
 
 ## What the runner caught
 
-Light triage during the initial run-up surfaced two real interpreter bugs:
+Light triage during the initial run-up and follow-up validator fixes surfaced three real interpreter bugs:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
+3. **`align` immediate validation was missing for plain load / store.** The atomic path enforced `align == log2(natural-width)` but `skipMemArg` (the plain path) read the field and dropped it. A module with `i32.load8_s align=2` (natural width 1, log2 = 0) instantiated successfully. Now enforced — every load/store opcode and every SIMD load/store carries an `accessWidth` to `skipMemArg`, which rejects `align > log2(width)`.
 
-Both ship with regression tests in `NumericTests` and `MemoryTests`.
+All three ship with regression tests in `NumericTests` and `MemoryTests`.
