@@ -189,6 +189,10 @@ object Parser:
       // byte 0x7B. Legal anywhere the scalar types are — params, results,
       // locals, globals, blocktypes.
       case 0x7b => ValueType.V128Type
+      // try_table proposal (modern EH): exnref valtype, wire byte 0x69.
+      // Legal as param/result/local/global/blocktype. Carries a captured
+      // wasm exception via `catch_ref` / `throw_ref`.
+      case 0x69 => ValueType.ExnRefType
       case b    => fail(WasmError.InvalidModule(s"unknown valtype 0x${b.toHexString}"))
 
   /** Read a [[RefType]] byte (0x70 funcref / 0x6F externref). Used by
@@ -640,6 +644,7 @@ object Parser:
           case ValueType.FuncRefType   => "ref.null func / ref.func funcidx"
           case ValueType.ExternRefType => "ref.null extern"
           case ValueType.V128Type      => "v128.const"
+          case ValueType.ExnRefType    => "ref.null exn"
         fail(WasmError.InvalidModule(
           s"expected $expected_mnemonic in const expr, got 0x${other.toHexString}"))
     val end = c.readByte()

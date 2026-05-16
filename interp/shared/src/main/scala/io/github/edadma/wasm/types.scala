@@ -48,12 +48,27 @@ final case class RefFunc(funcIdx: Int) extends Value
   * and pulls them back out through the public API. */
 final case class RefExtern(value: AnyRef) extends Value
 
-/** The two reference kinds in the reference-types proposal. The wire
-  * encoding is `0x70` for funcref and `0x6F` for externref (both fit in
-  * the `ValueType` LEB-byte slot). */
+/** A non-null exnref — the new reference kind added by the `try_table`
+  * (modern EH) proposal. Wraps a wasm-side caught exception so it can be
+  * passed to handlers via `catch_ref` / `catch_all_ref` and re-thrown
+  * via `throw_ref`. Wasm code can only move it around; `throw_ref` is
+  * the only opcode that consumes it. */
+final case class RefExn(exception: WasmException) extends Value
+
+/** An in-flight (or recently-caught) wasm exception. `tagIdx` is the
+  * unified tagidx (imports first, then defs). `args` is the payload —
+  * the tag's typed params, captured in order, top-of-stack at throw site
+  * = last in `args`. Used by both legacy EH (`catch` / `rethrow`) and
+  * the `try_table` form (`catch_ref` / `throw_ref`). */
+final case class WasmException(tagIdx: Int, args: Array[Value])
+
+/** The three reference kinds. The wire encoding is `0x70` funcref,
+  * `0x6F` externref, and `0x69` exnref (all fit in the `ValueType`
+  * LEB-byte slot). */
 enum RefType:
   case FuncRef
   case ExternRef
+  case ExnRef
 
 object RefType:
   /** Reverse of the wire-byte encoding. Used by the parser when reading
@@ -63,11 +78,13 @@ object RefType:
   def fromByte(b: Int): Option[RefType] = b match
     case 0x70 => Some(FuncRef)
     case 0x6f => Some(ExternRef)
+    case 0x69 => Some(ExnRef)
     case _    => None
 
   def toByte(r: RefType): Int = r match
     case FuncRef   => 0x70
     case ExternRef => 0x6f
+    case ExnRef    => 0x69
 
 enum ValueType:
   case I32Type
@@ -79,6 +96,10 @@ enum ValueType:
   /** SIMD v128 (Phase 8.E). Wire byte `0x7B`. Joins the four scalar +
     * two reference value types as a first-class operand. */
   case V128Type
+  /** exnref (try_table proposal). Wire byte `0x69`. Carries a captured
+    * wasm exception so handlers reached via `catch_ref` / `catch_all_ref`
+    * can re-throw the same exception with `throw_ref`. */
+  case ExnRefType
 
 object ValueType:
   /** Convert a [[RefType]] into the matching `ValueType`. The validator's
@@ -87,6 +108,7 @@ object ValueType:
   def fromRef(r: RefType): ValueType = r match
     case RefType.FuncRef   => FuncRefType
     case RefType.ExternRef => ExternRefType
+    case RefType.ExnRef    => ExnRefType
 
 /** A function signature — vector of param types in, vector of result types out.
   * The multi-value proposal allows more than one result; the Core spec capped

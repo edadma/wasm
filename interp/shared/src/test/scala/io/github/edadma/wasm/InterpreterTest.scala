@@ -62,6 +62,7 @@ object InterpreterTest:
     SimdDotLaneMemTests.run()
     NameSectionTests.run()
     ExceptionHandlingTests.run()
+    TryTableTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size
