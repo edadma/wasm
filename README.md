@@ -154,7 +154,7 @@ Runtime traps that aren't memory bounds — divide-by-zero, integer-overflow on 
 
 ```text
 $ wasm --help
-wasm 0.0.1
+wasm 0.3.0
 Usage: wasm [options] <file>
 
   <file>                                       path to a .wasm module
