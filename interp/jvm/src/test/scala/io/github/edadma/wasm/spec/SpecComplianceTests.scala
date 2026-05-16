@@ -120,9 +120,15 @@ private[spec] object KnownFailures:
     *   - `local_init`    — `(ref func)` non-null short form (0x64)
     *   - `unreached-valid` — function-references + typed reftype lookup
     *
-    * --- Imported globals (gates 7 manifests) ---
-    * Parser doesn't yet handle the import kind 0x03 (global) form, so
-    * the globaltype bytes (valtype + mut) are misread as a new import.
+    * --- Compact-imports proposal (gates 9 manifests) ---
+    * The wasm-3.0 testsuite ships modules using a non-standard,
+    * experimental "compact-imports" wire format that groups imports by
+    * shared module name (see github.com/WebAssembly/compact-imports).
+    * Our parser still expects the wasm-2.0 `count import*` shape and
+    * rejects the compact form with "unknown import kind 0x7f". The
+    * imported-globals + extended-const + relaxed-const-expr support
+    * landed in this drop, but these manifests' modules can't be
+    * parsed until compact-imports lands too.
     *   - `data`, `elem`, `exports`, `global`, `imports`, `names`,
     *     `memory_grow`, `table_copy`, `table_grow`
     *
@@ -139,7 +145,7 @@ private[spec] object KnownFailures:
     "table-sub",
     "local_init",
     "unreached-valid",
-    // Imported globals
+    // Compact-imports proposal
     "data",
     "elem",
     "exports",

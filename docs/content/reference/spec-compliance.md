@@ -30,7 +30,7 @@ Output is one line per manifest plus a totals line. Each file is tagged `OK`, `K
   ...
   OK    unwind                    50 pass,    0 fail,    0 skip
 
-== Spec totals: 51063 passed, 851 failed, 1296 skipped (of 53210) ==
+== Spec totals: 51084 passed, 830 failed, 1296 skipped (of 53210) ==
 ```
 
 Exit code is non-zero iff at least one manifest is not `OK` or `KNOWN`.
@@ -70,9 +70,9 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 | `local_init`      | `(ref func)` non-null short form (`0x64`).                           |
 | `unreached-valid` | Function-references + typed reftype lookup.                          |
 
-**Imported globals** (gates 9 manifests):
+**Compact-imports proposal** (gates 9 manifests):
 
-The import parser doesn't yet handle kind `0x03` (global), so the `globaltype` bytes (valtype + mut) get misread as a new import kind, producing `unknown import kind 0x7f`.
+The wasm-3.0 testsuite ships modules using an experimental "compact-imports" wire format ([github.com/WebAssembly/compact-imports](https://github.com/WebAssembly/compact-imports)) that groups imports under a shared module name with a 3-byte magic header. Our parser still expects the wasm-2.0 `count import*` shape and rejects the compact form with `unknown import kind 0x7f`. The supporting features (kind `0x03` global imports, host-resolved `HostGlobal`, extended-const i32/i64 add/sub/mul, relaxed const-expr `global.get` over any earlier immutable global) all landed in 0.3.0; only the wire-format extension itself remains.
 
 | Manifest      |
 |---------------|
@@ -98,7 +98,7 @@ Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest 
 
 ## What the runner caught
 
-Triage across the initial run-up and four coverage-expansion passes surfaced twelve real interpreter bugs:
+Triage across the initial run-up and five coverage-expansion passes surfaced thirteen real interpreter bugs:
 
 1. **`i32.trunc_f64_s` over-rejected values strictly between `-2^31` and `-2^31 - 1`** (e.g. `-2147483648.9`, which truncates to `INT_MIN` and is in range). The range check was `v < -2^31` where it should have been `v <= -2^31 - 1`.
 2. **`MemArg.offset` was an `Int`**, so a wasm u32 offset like `0xFFFFFFFF` was stored as Java `-1`. The Long sum `addr + offset` then sign-extended, turning a guaranteed-OOB load into a wrap-to-low-memory load. Widening the field to `Long` and masking on construction restores the trap.
@@ -118,5 +118,6 @@ Triage across the initial run-up and four coverage-expansion passes surfaced twe
     - **Section size mismatch.** `c.pos = secEnd` after each section silently absorbed under- or over-consumed bytes; now each non-custom section must land exactly at `secEnd`.
     - **Custom section name overruns size.** A custom section with declared size 0 has no bytes for even the name-length prefix. We were reading past the section into the next one. `parseCustomSection` now verifies the name read didn't overshoot `secEnd`.
     - **Too many locals.** A function's local-count groups summed past `2^32 - 1` were accepted; even a single huge group (e.g. `count = 0x40000000`) OOM-ed the allocation loop before the sum check could fire. Now the code reads all (count, type) groups first, sums in `Long` arithmetic with overflow check, *then* expands.
+13. **Imported globals + extended-const + relaxed const-expr** were not surfaced. The parser silently skipped import kind `0x03`, every const-expr accepted only a single literal opcode, and `global.get` in a const-expr was rejected outright. Three spec features that travel together now land as one drop: (a) `GlobalImport` joins `FuncImport` / `TagImport` in the module model, surfaces at instantiation via a new `HostGlobal` resolved against `HostModule.globals`, and occupies the leading slots of the unified globalidx space; (b) the const-expr reader is now a small stack-machine parser that flattens `iN.add` / `iN.sub` / `iN.mul` (extended-const proposal) into an expression tree the validator and runtime evaluate recursively; (c) the validator allows `global.get N` over any earlier-defined immutable global (wasm-3.0 relaxation), with forward-reference and mutability rejection. Active data / element segment offsets accept the same const-expr forms. The wasm-3.0 testsuite's "compact-imports" wire format extension is a separate proposal and remains pinned.
 
-All twelve ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.
+All thirteen ship with regression tests in `NumericTests`, `MemoryTests`, `MultiValueAndStartTests`, `SimdIntArithTests`, `SimdConstTests`, `TryTableTests`, and `ParserAndRuntimeTests`.

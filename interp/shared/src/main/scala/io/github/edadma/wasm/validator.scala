@@ -103,11 +103,12 @@ object Validator:
       // Export-section validation. Every export must (a) reference an index
       // that's in range for its kind and (b) have a name distinct from every
       // other export in the module — the spec's `unique-names` invariant on
-      // the export section. The total funcidx range is imports + defs; tags
-      // unify tagImports + tags; tables/memories/globals are module-defined
+      // the export section. Funcidxs and globalidxs unify imports + defs;
+      // tags unify tagImports + tags; tables/memories are module-defined
       // only (imports of those kinds not yet surfaced in the model).
-      val totalFuncs = module.imports.length + module.functions.length
-      val totalTags  = module.tagImports.length + module.tags.length
+      val totalFuncs   = module.imports.length + module.functions.length
+      val totalGlobals = module.globalImports.length + module.globals.length
+      val totalTags    = module.tagImports.length + module.tags.length
       val seenExports = scala.collection.mutable.HashSet.empty[String]
       module.exports.foreach { exp =>
         if !seenExports.add(exp.name) then
@@ -127,7 +128,7 @@ object Validator:
               throw new ValFail(WasmError.InvalidModule(
                 s"export $name: unknown memory $idx"))
           case GlobalExport(name, idx) =>
-            if idx < 0 || idx >= module.globals.length then
+            if idx < 0 || idx >= totalGlobals then
               throw new ValFail(WasmError.InvalidModule(
                 s"export $name: unknown global $idx"))
           case TagExport(name, idx) =>
@@ -136,7 +137,69 @@ object Validator:
                 s"export $name: unknown tag $idx"))
       }
       val funcSigs       = collectFuncSigs(module)
-      val globalSigs     = module.globals.map(g => (g.valueType, g.mutable))
+      // Unified global signatures — imports first (carrying their declared
+      // mutability and valuetype), then defined globals. Function bodies'
+      // `global.get` / `global.set` immediates and any `global.get` in a
+      // const expr index against this same vector.
+      val globalSigs     =
+        module.globalImports.map(gi => (gi.valueType, gi.mutable)) ++
+        module.globals.map(g => (g.valueType, g.mutable))
+      // Module-level const-expr validation: defined globals, active data
+      // segment offsets, active element segment offsets. The wasm-3.0
+      // spec rule: a const expr is a stack-machine over `*.const`,
+      // `ref.null`, `ref.func`, `global.get` (immutable global before the
+      // current point in the global index space), and `iN.add` / sub /
+      // mul. We type-check the expression tree recursively, returning
+      // the produced type.
+      //
+      // `maxGlobalIdx` is the exclusive upper bound on legal globalidx
+      // for `global.get`. For a defined global being initialised, this
+      // is the global's own globalidx (so earlier globals are accessible
+      // but the current one and later ones are not). For data and
+      // element offsets, every declared global (imports + defs) is
+      // accessible — they're all initialised before the segments run.
+      def typeOf(where: String, init: ConstInit, maxGlobalIdx: Int): ValueType =
+        init match
+          case ConstInit.Literal(v) => valueTypeOf(v)
+          case ConstInit.GlobalGet(idx) =>
+            if idx < 0 || idx >= maxGlobalIdx then
+              throw new ValFail(WasmError.InvalidModule(
+                s"$where: global.get $idx in const expr refers to a global not yet defined (only globalidxs 0..${maxGlobalIdx - 1} are visible)"))
+            val (vt, mut) = globalSigsAt(module, idx)
+            if mut then
+              throw new ValFail(WasmError.InvalidModule(
+                s"$where: global.get $idx in const expr references a mutable global"))
+            vt
+          case ConstInit.BinOp(_, lhs, rhs, ty) =>
+            val lt = typeOf(where, lhs, maxGlobalIdx)
+            val rt = typeOf(where, rhs, maxGlobalIdx)
+            if lt != ty || rt != ty then
+              throw new ValFail(WasmError.InvalidModule(
+                s"$where: arithmetic in const expr expected $ty operands, got lhs=$lt rhs=$rt"))
+            ty
+
+      def checkConstInit(where: String, init: ConstInit, expected: ValueType, maxGlobalIdx: Int): Unit =
+        val actual = typeOf(where, init, maxGlobalIdx)
+        if actual != expected then
+          throw new ValFail(WasmError.InvalidModule(
+            s"$where: type mismatch (expected $expected, got $actual)"))
+
+      // Defined globals are visited in declaration order; each sees only
+      // the imports + previously-defined globals (i.e. globalidx < gidx).
+      module.globals.zipWithIndex.foreach { case (g, di) =>
+        val gidx = module.globalImports.length + di
+        checkConstInit(s"global $gidx init", g.init, g.valueType, maxGlobalIdx = gidx)
+      }
+      module.data.zipWithIndex.foreach {
+        case (DataSegment.Active(_, offset, _), idx) =>
+          checkConstInit(s"data segment $idx offset", offset, ValueType.I32Type, maxGlobalIdx = totalGlobals)
+        case _ => ()
+      }
+      module.elements.zipWithIndex.foreach {
+        case (ElementSegment.Active(_, offset, _, _), idx) =>
+          checkConstInit(s"element segment $idx offset", offset, ValueType.I32Type, maxGlobalIdx = totalGlobals)
+        case _ => ()
+      }
       val tableRefTypes  = module.tables.map(_.refType)
       val elemRefTypes   = module.elements.map(_.refType)
       val tagTypes       = collectTagTypes(module)
@@ -188,6 +251,32 @@ object Validator:
         i += 1
       Right(())
     catch case e: ValFail => Left(e.err)
+
+  /** Map a runtime [[Value]] back to its declared [[ValueType]]. Used by
+    * the const-expr validator to type-check `Literal(...)` operands. */
+  private def valueTypeOf(v: Value): ValueType = v match
+    case _: I32             => ValueType.I32Type
+    case _: I64             => ValueType.I64Type
+    case _: F32             => ValueType.F32Type
+    case _: F64             => ValueType.F64Type
+    case _: V128            => ValueType.V128Type
+    case RefNull(rt)        => ValueType.fromRef(rt)
+    case _: RefFunc         => ValueType.FuncRefType
+    case _: RefExtern       => ValueType.ExternRefType
+    case _: RefExn          => ValueType.ExnRefType
+
+  /** Look up the (valueType, mutable) pair for a globalidx in the unified
+    * index space (imports first, then defs). Used by const-expr
+    * validation; the runtime maintains a parallel `globals` /
+    * `globalMutable` array, so indices stay consistent. */
+  private def globalSigsAt(module: WasmModule, idx: Int): (ValueType, Boolean) =
+    val nImp = module.globalImports.length
+    if idx < nImp then
+      val gi = module.globalImports(idx)
+      (gi.valueType, gi.mutable)
+    else
+      val g = module.globals(idx - nImp)
+      (g.valueType, g.mutable)
 
   // === Per-module helpers =================================================
 

@@ -189,6 +189,8 @@ object Runtime:
       hostModules.iterator.map(m => m.name -> m.functions).toMap
     val hostsMulti: Map[String, Map[String, HostFuncMulti]] =
       hostModules.iterator.map(m => m.name -> m.functionsMulti).toMap
+    val hostsGlobals: Map[String, Map[String, HostGlobal]] =
+      hostModules.iterator.map(m => m.name -> m.globals).toMap
 
     val funcs = ArrayBuffer.empty[Interpreter.ResolvedFunc]
 
@@ -253,6 +255,85 @@ object Runtime:
           mi += 1
         arr
 
+    // === globals ============================================================
+    // Imported globals occupy slots 0..k-1 in the unified globalidx space;
+    // module-defined globals follow. Imports must be resolved BEFORE any
+    // defined-global init that references one via `global.get` — and before
+    // data / element segment offsets that do the same. We build the unified
+    // arrays here, eagerly, so the rest of instantiation sees the same
+    // imports-first layout the validator and interpreter expect.
+    val nGlobalImports = module.globalImports.length
+    val nGlobalDefs    = module.globals.length
+    val gN             = nGlobalImports + nGlobalDefs
+    val globals        = new Array[Value](gN)
+    val globalMutable  = new Array[Boolean](gN)
+
+    var gim = 0
+    while gim < nGlobalImports do
+      val gi = module.globalImports(gim)
+      val hg = hostsGlobals.get(gi.module).flatMap(_.get(gi.name)).getOrElse {
+        fail(WasmError.UnknownImport(gi.module, gi.name))
+      }
+      if hg.valueType != gi.valueType then
+        fail(WasmError.InvalidModule(
+          s"global import ${gi.module}.${gi.name}: type mismatch (host provides ${hg.valueType}, module imports ${gi.valueType})"))
+      if hg.mutable != gi.mutable then
+        fail(WasmError.InvalidModule(
+          s"global import ${gi.module}.${gi.name}: mutability mismatch (host=${hg.mutable}, module=${gi.mutable})"))
+      globals(gim)       = hg.value
+      globalMutable(gim) = gi.mutable
+      gim += 1
+
+    // `maxGlobalIdx` is the exclusive upper bound on legal globalidx in
+    // this evaluation context. The validator pre-pass enforces this rule
+    // structurally; here we still range-check defensively so a bad
+    // module that slipped past validation surfaces a clean diagnostic
+    // rather than an array-bounds exception.
+    def evalConstInit(where: String, init: ConstInit, expected: ValueType, maxGlobalIdx: Int): Value =
+      def eval(e: ConstInit): Value = e match
+        case ConstInit.Literal(value) => value
+        case ConstInit.GlobalGet(idx) =>
+          if idx < 0 || idx >= maxGlobalIdx then
+            fail(WasmError.InvalidModule(
+              s"$where: global.get $idx out of range (max $maxGlobalIdx)"))
+          globals(idx)
+        case ConstInit.BinOp(opcode, lhs, rhs, ty) =>
+          (eval(lhs), eval(rhs), ty, opcode) match
+            case (I32(a), I32(b), ValueType.I32Type, ConstBinOp.Add) => I32(a + b)
+            case (I32(a), I32(b), ValueType.I32Type, ConstBinOp.Sub) => I32(a - b)
+            case (I32(a), I32(b), ValueType.I32Type, ConstBinOp.Mul) => I32(a * b)
+            case (I64(a), I64(b), ValueType.I64Type, ConstBinOp.Add) => I64(a + b)
+            case (I64(a), I64(b), ValueType.I64Type, ConstBinOp.Sub) => I64(a - b)
+            case (I64(a), I64(b), ValueType.I64Type, ConstBinOp.Mul) => I64(a * b)
+            case (l, r, _, _) =>
+              fail(WasmError.InvalidModule(s"$where: const-expr arithmetic type mismatch ($l $opcode $r, declared $ty)"))
+      val v = eval(init)
+      val ok = (expected, v) match
+        case (ValueType.I32Type, _: I32) => true
+        case (ValueType.I64Type, _: I64) => true
+        case (ValueType.F32Type, _: F32) => true
+        case (ValueType.F64Type, _: F64) => true
+        case (ValueType.V128Type, _: V128) => true
+        case (ValueType.FuncRefType,   RefNull(RefType.FuncRef))   => true
+        case (ValueType.FuncRefType,   RefFunc(_))                 => true
+        case (ValueType.ExternRefType, RefNull(RefType.ExternRef)) => true
+        case (ValueType.ExternRefType, RefExtern(_))               => true
+        case (ValueType.ExnRefType,    RefNull(RefType.ExnRef))    => true
+        case (ValueType.ExnRefType,    RefExn(_))                  => true
+        case _                                                     => false
+      if !ok then fail(WasmError.InvalidModule(s"$where: init value doesn't match declared type $expected"))
+      v
+
+    var gdi = 0
+    while gdi < nGlobalDefs do
+      val g    = module.globals(gdi)
+      val gidx = nGlobalImports + gdi
+      // Self-references and forward references aren't legal — a defined
+      // global's init expression can only see globals at indices < gidx.
+      globals(gidx)       = evalConstInit(s"global $gidx init", g.init, g.valueType, maxGlobalIdx = gidx)
+      globalMutable(gidx) = g.mutable
+      gdi += 1
+
     // === data segments =====================================================
     // Active segments copy into their target memory at instantiation as they
     // did before Phase 8.B; post-init they're marked "dropped" so subsequent
@@ -270,13 +351,16 @@ object Runtime:
     var di = 0
     while di < nData do
       module.data(di) match
-        case DataSegment.Active(memIdx, offset, bytes) =>
+        case DataSegment.Active(memIdx, offsetInit, bytes) =>
           // Multi-memory modules can target memidx ≥ 1; range-check.
           if memIdx < 0 || memIdx >= memories.length then
             fail(WasmError.InvalidModule(
               s"active data segment $di: memidx $memIdx out of range (have ${memories.length} memories)"))
+          val offset = evalConstInit(s"data segment $di offset", offsetInit, ValueType.I32Type, maxGlobalIdx = gN) match
+            case I32(v) => v
+            case other  => fail(WasmError.InvalidModule(s"data segment $di offset: expected i32, got $other"))
           val targetMem = memories(memIdx)
-          val end       = offset.toLong + bytes.length
+          val end       = (offset.toLong & 0xffffffffL) + bytes.length
           if offset < 0 || end > targetMem.size then fail(WasmError.MemoryOutOfBounds)
           System.arraycopy(bytes, 0, targetMem.data, offset, bytes.length)
           dataBytes(di)   = bytes
@@ -285,39 +369,6 @@ object Runtime:
           dataBytes(di)   = bytes
           dataDropped(di) = false
       di += 1
-
-    // === globals ============================================================
-    // Module-defined globals only; imported globals will join the head of
-    // these arrays once Phase 5 surfaces them. Init values were folded at
-    // parse time (no `global.get` over imports yet), so we just shuttle them
-    // into the live arrays. The mutability bit is stored next to the value
-    // so the interpreter's `global.set` guard is an O(1) lookup.
-    val gN            = module.globals.size
-    val globals       = new Array[Value](gN)
-    val globalMutable = new Array[Boolean](gN)
-    var gi = 0
-    while gi < gN do
-      val g = module.globals(gi)
-      // Defensive: a wrong-type init slipped past the parser would be a bug,
-      // but a misclassified `Value` here would otherwise show up as a runtime
-      // TypeMismatch much later. Check up front.
-      val ok = (g.valueType, g.initialValue) match
-        case (ValueType.I32Type, _: I32) => true
-        case (ValueType.I64Type, _: I64) => true
-        case (ValueType.F32Type, _: F32) => true
-        case (ValueType.F64Type, _: F64) => true
-        case (ValueType.V128Type, _: V128) => true
-        case (ValueType.FuncRefType,   RefNull(RefType.FuncRef))   => true
-        case (ValueType.FuncRefType,   RefFunc(_))                 => true
-        case (ValueType.ExternRefType, RefNull(RefType.ExternRef)) => true
-        case (ValueType.ExternRefType, RefExtern(_))               => true
-        case (ValueType.ExnRefType,    RefNull(RefType.ExnRef))    => true
-        case (ValueType.ExnRefType,    RefExn(_))                  => true
-        case _                                                     => false
-      if !ok then fail(WasmError.InvalidModule(s"global $gi: init value doesn't match declared type"))
-      globals(gi)       = g.initialValue
-      globalMutable(gi) = g.mutable
-      gi += 1
 
     // === tables =============================================================
     // One [[RuntimeTable]] per defined table. Each slot starts as a typed
@@ -364,14 +415,17 @@ object Runtime:
           case _ => ()
         k += 1
       seg match
-        case ElementSegment.Active(tableIdx, offset, segRT, refs) =>
+        case ElementSegment.Active(tableIdx, offsetInit, segRT, refs) =>
           if tableIdx < 0 || tableIdx >= tables.length then
             fail(WasmError.InvalidModule(s"element segment $ei references invalid table $tableIdx"))
           val tab = tables(tableIdx)
           if tab.refType != segRT then
             fail(WasmError.InvalidModule(
               s"element segment $ei reftype $segRT doesn't match table $tableIdx reftype ${tab.refType}"))
-          val end = offset.toLong + refs.length
+          val offset = evalConstInit(s"element segment $ei offset", offsetInit, ValueType.I32Type, maxGlobalIdx = gN) match
+            case I32(v) => v
+            case other  => fail(WasmError.InvalidModule(s"element segment $ei offset: expected i32, got $other"))
+          val end = (offset.toLong & 0xffffffffL) + refs.length
           if offset < 0 || end > tab.size then
             fail(WasmError.InvalidModule(
               s"element segment $ei overflows table $tableIdx (offset=$offset, len=${refs.length}, size=${tab.size})"))

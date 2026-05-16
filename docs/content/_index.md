@@ -3,7 +3,7 @@ title: wasm
 splash: true
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select and exnref), multi-memory (with a multi-memory host-function surface), the complete SIMD proposal AND relaxed-SIMD (all 20 sub-opcodes), both forms of exception handling (legacy try/catch/throw/rethrow/delegate AND the modern try_table with throw_ref), tail calls (return_call / return_call_indirect), and the threads / atomics proposal (66 atomic ops + shared memory + wait/notify) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select and exnref), multi-memory (with a multi-memory host-function surface), imported globals with extended-const initializers (i32/i64 add/sub/mul plus global.get of any earlier immutable global), the complete SIMD proposal AND relaxed-SIMD (all 20 sub-opcodes), both forms of exception handling (legacy try/catch/throw/rethrow/delegate AND the modern try_table with throw_ref), tail calls (return_call / return_call_indirect), and the threads / atomics proposal (66 atomic ops + shared memory + wait/notify) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
@@ -42,7 +42,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**862 tests** on the JVM (640 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **129 manifests fully green** and 13 pinned (function-references / imported-globals / cross-module register gaps). See [Spec compliance](/reference/spec-compliance/) for the table.
+**870 tests** on the JVM (648 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **129 manifests fully green** and 13 pinned (function-references / compact-imports / cross-module register gaps). See [Spec compliance](/reference/spec-compliance/) for the table.
 
 ## Try it
 

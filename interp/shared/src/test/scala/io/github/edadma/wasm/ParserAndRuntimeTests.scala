@@ -32,9 +32,21 @@ object ParserAndRuntimeTests:
       val inst = instantiate(Fixtures.mem_import)
       check(callI32(inst, "f") == 2, "function after a skipped memory import still works")
     }
-    test("parser: global import is silently skipped") {
-      val inst = instantiate(Fixtures.global_import)
-      check(callI32(inst, "f") == 3, "function after a skipped global import still works")
+    test("parser: global import is resolved from the host module") {
+      // The `global_import` fixture declares `(import "env" "g" (global i32))`;
+      // we provide the binding via a HostModule with `globals`. The function
+      // body returns the constant 3 (independent of the import), so the
+      // instantiation succeeds and `f` returns 3.
+      val host = new HostModule:
+        val name: String = "env"
+        override val functions: Map[String, HostFunc] = Map(
+          "putchar" -> { (_, _) => Seq.empty }
+        )
+        override val globals: Map[String, HostGlobal] = Map(
+          "g" -> HostGlobal(ValueType.I32Type, mutable = false, I32(0))
+        )
+      val inst = runRight(Runtime.instantiate(Fixtures.global_import, Seq(host)))
+      check(callI32(inst, "f") == 3, "function after a resolved global import still works")
     }
     test("parser: memory export silently ignored; global export surfaced") {
       val inst = instantiate(Fixtures.mem_export)
@@ -177,12 +189,17 @@ object ParserAndRuntimeTests:
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("data"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(data flag), got $other")
     }
-    test("parser: data segment with non-i32.const offset expr returns InvalidModule") {
+    test("validator: data segment with non-i32 offset expr is rejected at instantiation") {
+      // The parser now accepts the const-expr structurally (it's a small
+      // expression tree of any types); the validator catches the data
+      // offset's required i32 type mismatch.
       val dataSec = b(0x01, 0x00, 0x42, 0x00, 0x0b, 0x00)  // flag 0, i64.const 0, end, 0 bytes
       val bad = Header ++ b(0x0b, dataSec.length) ++ dataSec
-      Parser.parse(bad) match
-        case Left(WasmError.InvalidModule(msg)) => check(msg.contains("i32.const"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(i32.const), got $other")
+      Runtime.instantiate(bad, Seq.empty) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("data segment 0 offset") && msg.contains("I32Type"),
+            s"expected type-mismatch on data offset, got: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
     }
     test("parser: data segment missing `end` after i32.const returns InvalidModule") {
       val dataSec = b(0x01, 0x00, 0x41, 0x00, 0x00, 0x00)  // flag 0, i32.const 0, NO end
@@ -411,15 +428,14 @@ object ParserAndRuntimeTests:
         i += 1
       check(marker > 0, "section-6 first-global marker not found")
       // Swap the valtype byte from 0x7f (i32) to 0x7e (i64). The init-expr
-      // op is still 0x41 (i32.const), so readConstExpr should reject the
-      // mismatch with a clear diagnostic.
+      // op is still 0x41 (i32.const), so the validator should reject the
+      // mismatch (declared I64, init produces I32).
       val bad = patchByte(src, marker, 0x7e)
       Runtime.instantiate(bad, Seq(EnvModule.default)) match
         case Left(WasmError.InvalidModule(msg)) =>
-          // Declared type was bumped to i64, init op left as 0x41 (i32.const) —
-          // the message should name the expected mnemonic (i64.const).
-          check(msg.contains("i64.const"), s"message: $msg")
-        case other => check(false, s"expected InvalidModule(i64.const …), got $other")
+          check(msg.contains("I64Type") && msg.contains("I32Type"),
+            s"expected diagnostic naming I64Type and I32Type, got: $msg")
+        case other => check(false, s"expected InvalidModule(...), got $other")
     }
 
     test("ModuleInstance.invoke with valid args returns Seq() for an empty function") {
@@ -886,6 +902,155 @@ object ParserAndRuntimeTests:
       val captured = new String(baos.toByteArray, "UTF-8")
       check(captured == "Hi!" || captured.isEmpty,
         s"expected 'Hi!' or '' (platform-dependent), got '${captured}'")
+    }
+
+    // === Imported globals + extended-const proposal =======================
+
+    test("imported global: resolved from host module, readable via global.get") {
+      // Module: imports `env.g` as `(global i32 const)` and exports a
+      // function `f` returning `global.get 0` (the imported global).
+      val typeS   = b(0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f)               // type 0: () -> i32
+      val importS = b(0x02, 0x0a, 0x01,
+        0x03, 'e', 'n', 'v', 0x01, 'g', 0x03, 0x7f, 0x00)                     // import env.g (global i32 const)
+      val funcS   = b(0x03, 0x02, 0x01, 0x00)                                 // 1 function, type 0
+      val exportS = b(0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00)                // export f -> func 0
+      val codeS   = b(0x0a, 0x06, 0x01,
+        0x04, 0x00,                                                           // body 0: 4 bytes, 0 locals
+        0x23, 0x00, 0x0b)                                                     // global.get 0; end
+      val host = new HostModule:
+        val name: String = "env"
+        override val globals: Map[String, HostGlobal] = Map(
+          "g" -> HostGlobal(ValueType.I32Type, mutable = false, I32(0xdead)),
+        )
+      val inst = runRight(Runtime.instantiate(Header ++ typeS ++ importS ++ funcS ++ exportS ++ codeS, Seq(host)))
+      check(callI32(inst, "f") == 0xdead, s"expected 0xdead, got ${callI32(inst, "f")}")
+    }
+
+    test("imported global: type mismatch is rejected at instantiation") {
+      val typeS   = b(0x01, 0x04, 0x01, 0x60, 0x00, 0x00)                     // type 0: () -> nil
+      val importS = b(0x02, 0x0a, 0x01,
+        0x03, 'e', 'n', 'v', 0x01, 'g', 0x03, 0x7f, 0x00)                     // module imports i32 const
+      val host = new HostModule:
+        val name: String = "env"
+        override val globals: Map[String, HostGlobal] = Map(
+          "g" -> HostGlobal(ValueType.I64Type, mutable = false, I64(0)),      // host provides i64 — mismatch
+        )
+      Runtime.instantiate(Header ++ typeS ++ importS, Seq(host)) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("type mismatch") && msg.contains("I64Type") && msg.contains("I32Type"),
+            s"expected type mismatch diagnostic, got: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("imported global: missing host binding returns UnknownImport") {
+      val typeS   = b(0x01, 0x04, 0x01, 0x60, 0x00, 0x00)
+      val importS = b(0x02, 0x0a, 0x01,
+        0x03, 'e', 'n', 'v', 0x01, 'g', 0x03, 0x7f, 0x00)
+      val host = new HostModule:
+        val name: String = "env"                                              // intentionally empty globals
+      Runtime.instantiate(Header ++ typeS ++ importS, Seq(host)) match
+        case Left(WasmError.UnknownImport("env", "g")) => ()
+        case other => check(false, s"expected UnknownImport(env, g), got $other")
+    }
+
+    test("defined global: init via global.get of an imported global") {
+      // Imports env.base : (global i32 const), defines global 1 = global.get 0,
+      // exports a function returning global 1.
+      val typeS   = b(0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f)
+      val importS = b(0x02, 0x0d, 0x01,
+        0x03, 'e', 'n', 'v', 0x04, 'b', 'a', 's', 'e', 0x03, 0x7f, 0x00)      // env.base global i32 const
+      val funcS   = b(0x03, 0x02, 0x01, 0x00)
+      val globalS = b(0x06, 0x06, 0x01,
+        0x7f, 0x00,                                                           // global i32 const
+        0x23, 0x00, 0x0b)                                                     // init = global.get 0; end
+      val exportS = b(0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00)
+      val codeS   = b(0x0a, 0x06, 0x01,
+        0x04, 0x00,
+        0x23, 0x01, 0x0b)                                                     // global.get 1
+      val host = new HostModule:
+        val name: String = "env"
+        override val globals: Map[String, HostGlobal] = Map(
+          "base" -> HostGlobal(ValueType.I32Type, mutable = false, I32(42))
+        )
+      val inst = runRight(Runtime.instantiate(Header ++ typeS ++ importS ++ funcS ++ globalS ++ exportS ++ codeS, Seq(host)))
+      check(callI32(inst, "f") == 42, s"expected 42, got ${callI32(inst, "f")}")
+    }
+
+    test("defined global: extended-const i32.add over two imported globals") {
+      // Imports env.a and env.b (i32 const), defines global 2 = a + b,
+      // exports f returning global 2.
+      val typeS   = b(0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f)
+      val importS = b(0x02, 0x13, 0x02,
+        0x03, 'e', 'n', 'v', 0x01, 'a', 0x03, 0x7f, 0x00,                     // env.a i32 const
+        0x03, 'e', 'n', 'v', 0x01, 'b', 0x03, 0x7f, 0x00)                     // env.b i32 const
+      val funcS   = b(0x03, 0x02, 0x01, 0x00)
+      val globalS = b(0x06, 0x09, 0x01,
+        0x7f, 0x00,
+        0x23, 0x00,                                                           // global.get 0
+        0x23, 0x01,                                                           // global.get 1
+        0x6a, 0x0b)                                                           // i32.add; end
+      val exportS = b(0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00)
+      val codeS   = b(0x0a, 0x06, 0x01,
+        0x04, 0x00,
+        0x23, 0x02, 0x0b)                                                     // global.get 2
+      val host = new HostModule:
+        val name: String = "env"
+        override val globals: Map[String, HostGlobal] = Map(
+          "a" -> HostGlobal(ValueType.I32Type, mutable = false, I32(100)),
+          "b" -> HostGlobal(ValueType.I32Type, mutable = false, I32(23)),
+        )
+      val inst = runRight(Runtime.instantiate(Header ++ typeS ++ importS ++ funcS ++ globalS ++ exportS ++ codeS, Seq(host)))
+      check(callI32(inst, "f") == 123, s"expected 123 (=100+23), got ${callI32(inst, "f")}")
+    }
+
+    test("extended-const: i64.mul + i64.sub produce correct nested arithmetic") {
+      // Define global 0 = (5 * 3) - 4 = 11 as i64. Verifies the parser's
+      // expression-tree stack builds the right operator nesting and the
+      // runtime evaluates it.
+      val typeS   = b(0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7e)               // () -> i64
+      val funcS   = b(0x03, 0x02, 0x01, 0x00)
+      val globalS = b(0x06, 0x0c, 0x01,
+        0x7e, 0x00,                                                           // i64 const
+        0x42, 0x05,                                                           // i64.const 5
+        0x42, 0x03,                                                           // i64.const 3
+        0x7e,                                                                 // i64.mul -> 15
+        0x42, 0x04,                                                           // i64.const 4
+        0x7d, 0x0b)                                                           // i64.sub -> 11
+      val exportS = b(0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00)
+      val codeS   = b(0x0a, 0x06, 0x01,
+        0x04, 0x00,
+        0x23, 0x00, 0x0b)
+      val inst = runRight(Runtime.instantiate(Header ++ typeS ++ funcS ++ globalS ++ exportS ++ codeS, Seq.empty))
+      runRight(inst.invoke("f")) match
+        case Seq(I64(v)) => check(v == 11L, s"expected 11, got $v")
+        case other       => check(false, s"expected Seq(I64(11)), got $other")
+    }
+
+    test("validator: const expr global.get on mutable global is rejected") {
+      // Defines global 0 as (mut i32) and global 1 with init = global.get 0.
+      // Spec requires the referenced global to be immutable.
+      val globalS = b(0x06, 0x0b, 0x02,
+        0x7f, 0x01, 0x41, 0x00, 0x0b,                                         // global 0: (mut i32) = 0
+        0x7f, 0x00,                                                           // global 1 (const i32)
+        0x23, 0x00, 0x0b)                                                     // init = global.get 0
+      Runtime.instantiate(Header ++ globalS, Seq.empty) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("mutable global"),
+            s"expected mutability diagnostic, got: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
+    }
+
+    test("validator: const expr global.get of forward global rejected") {
+      // global 0 init = global.get 1. The referenced global doesn't exist yet
+      // at the point global 0 is being initialised — validator must reject.
+      val globalS = b(0x06, 0x0b, 0x02,
+        0x7f, 0x00, 0x23, 0x01, 0x0b,                                         // global 0 init = global.get 1 (forward)
+        0x7f, 0x00, 0x41, 0x00, 0x0b)                                         // global 1 (const i32) = 0
+      Runtime.instantiate(Header ++ globalS, Seq.empty) match
+        case Left(WasmError.InvalidModule(msg)) =>
+          check(msg.contains("global.get 1") && msg.contains("not yet defined"),
+            s"expected forward-reference diagnostic, got: $msg")
+        case other => check(false, s"expected InvalidModule, got $other")
     }
 
   // === Bug-fix regression tests ===========================================
