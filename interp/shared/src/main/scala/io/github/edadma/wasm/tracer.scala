@@ -1,6 +1,6 @@
 package io.github.edadma.wasm
 
-/** Instrumentation hook for [[ModuleInstance.invoke]] / [[Wasi.run]] /
+/** Instrumentation hook for [[ModuleInstance.invoke]] / `Wasi.run` /
   * any direct [[Interpreter]] construction. Implementors receive callbacks
   * at well-defined points in the interpreter loop without paying any
   * per-instruction allocation cost — the callbacks default to no-ops, the
