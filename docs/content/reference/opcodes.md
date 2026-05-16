@@ -403,6 +403,21 @@ Nine ops: one pairwise multiply-add at i32 precision, and eight partial memory a
 | `v128.store32_lane` | `0x5A` | Write 4 LE bytes of lane (< 4) to memory. |
 | `v128.store64_lane` | `0x5B` | Write 8 LE bytes of lane (< 2) to memory. |
 
+## Relaxed SIMD
+
+The relaxed-SIMD proposal adds 20 sub-opcodes (`0x100..0x113`) under the existing `0xFD` SIMD prefix. The "relaxed" name reflects that the spec lets each op pick between two or more valid implementations per edge case (NaN handling, out-of-range conversion, sign-extension of partly-used operands); this interpreter pins one deterministic choice each, documented in `simd_dispatch.scala` and the SimdRelaxedTests fixtures.
+
+| Sub-opcode | Op | Shape | Pinned semantics |
+|---|---|---|---|
+| `0x100` | `i8x16.relaxed_swizzle`              | `v128, v128 → v128` | Identical to non-relaxed `i8x16.swizzle`. |
+| `0x101..0x104` | `i32x4.relaxed_trunc_*`         | `v128 → v128`       | Identical to `i32x4.trunc_sat_*` (NaN → 0, overflow saturates). |
+| `0x105..0x108` | `f*x*.relaxed_(n)madd`          | `v128, v128, v128 → v128` | Unfused: `(±a*b) + c` per lane. Portable across JVM / Scala.js / Native. |
+| `0x109..0x10C` | `*.relaxed_laneselect`          | `v128, v128, v128 → v128` | Per lane: high bit of `mask`'s lane picks `a` (set) or `b` (clear). |
+| `0x10D..0x110` | `f*x*.relaxed_min` / `_max`     | `v128, v128 → v128` | `java.lang.Math.min` / `max` per lane — NaN propagates either way. |
+| `0x111` | `i16x8.relaxed_q15mulr_s`             | `v128, v128 → v128` | Saturating signed Q15 multiply: `sat_i16((a*b + 0x4000) >> 15)`. |
+| `0x112` | `i16x8.relaxed_dot_i8x16_i7x16_s`     | `v128, v128 → v128` | Pair-sum of (signed-`a` × unsigned-`b`) byte products per i16 lane. |
+| `0x113` | `i32x4.relaxed_dot_i8x16_i7x16_add_s` | `v128, v128, v128 → v128` | 4-byte (signed × unsigned) sums per i32 lane plus an i32 accumulator. |
+
 ## Multi-memory
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:

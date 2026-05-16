@@ -1485,6 +1485,13 @@ private[wasm] trait SimdDispatch:
       case 0x5A => storeLane(f, p1, width = 4)                                            // v128.store32_lane
       case 0x5B => storeLane(f, p1, width = 8)                                            // v128.store64_lane
 
+      // === Chunk J — Relaxed SIMD (extracted) =================================
+      //
+      // 20 sub-opcodes (0x100..0x113); extracted into [[stepFdRelaxed]] to
+      // keep stepFd under the JVM's 64KB method-size ceiling.
+      case s if s >= 0x100 && s <= 0x113 =>
+        stepFdRelaxed(f, sub, p1)
+
       case _ =>
         fail(WasmError.UnknownOpcode(0xfd))
 
@@ -2284,6 +2291,248 @@ private[wasm] trait SimdDispatch:
     boundsCheck(mem, addr, width)
     System.arraycopy(src, lane * width, mem.data, addr.toInt, width)
 
+  /** Dispatch for the 20 Relaxed-SIMD sub-opcodes (0x100..0x113). Extracted
+    * from [[stepFd]] because adding these inline pushed the JVM bytecode
+    * past the 64KB per-method ceiling — same reason `stepFc` lives in its
+    * own method. The proposal's specs allow more than one valid
+    * implementation per op; we pick one deterministic interpretation for
+    * each — the same one V8 / wasmtime ship on x86_64. Where a strict-SIMD
+    * analogue exists we reuse it directly (relaxed_swizzle ≡ swizzle,
+    * relaxed_trunc_* ≡ trunc_sat_*). */
+  private def stepFdRelaxed(f: Frame, sub: Int, p1: Int): Unit =
+    sub match
+      case 0x100 =>                                                                       // i8x16.relaxed_swizzle
+        val s = popV128(); val v = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          val si = s(i) & 0xff
+          r(i) = if si < 16 then v(si) else 0
+          i += 1
+        valueStack += V128(r)
+
+      case 0x101 =>                                                                       // i32x4.relaxed_trunc_f32x4_s
+        val a = popV128(); f.pc = p1; valueStack += V128(i32x4TruncSatF32x4S(a))
+      case 0x102 =>                                                                       // i32x4.relaxed_trunc_f32x4_u
+        val a = popV128(); f.pc = p1; valueStack += V128(i32x4TruncSatF32x4U(a))
+      case 0x103 =>                                                                       // i32x4.relaxed_trunc_f64x2_s_zero
+        val a = popV128(); f.pc = p1; valueStack += V128(i32x4TruncSatF64x2SZero(a))
+      case 0x104 =>                                                                       // i32x4.relaxed_trunc_f64x2_u_zero
+        val a = popV128(); f.pc = p1; valueStack += V128(i32x4TruncSatF64x2UZero(a))
+
+      case 0x105 =>                                                                       // f32x4.relaxed_madd : (a, b, c) → a*b + c
+        val c = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Madd(a, b, c, neg = false))
+      case 0x106 =>                                                                       // f32x4.relaxed_nmadd : (a, b, c) → -(a*b) + c
+        val c = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f32x4Madd(a, b, c, neg = true))
+      case 0x107 =>                                                                       // f64x2.relaxed_madd
+        val c = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Madd(a, b, c, neg = false))
+      case 0x108 =>                                                                       // f64x2.relaxed_nmadd
+        val c = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(f64x2Madd(a, b, c, neg = true))
+
+      case 0x109 =>                                                                       // i8x16.relaxed_laneselect (bit 7 of mask)
+        val mask = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        val r = new Array[Byte](16); var i = 0
+        while i < 16 do
+          r(i) = if (mask(i) & 0x80) != 0 then a(i) else b(i)
+          i += 1
+        valueStack += V128(r)
+      case 0x10A =>                                                                       // i16x8.relaxed_laneselect (bit 15)
+        val mask = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(laneSelectN(a, b, mask, width = 2))
+      case 0x10B =>                                                                       // i32x4.relaxed_laneselect (bit 31)
+        val mask = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(laneSelectN(a, b, mask, width = 4))
+      case 0x10C =>                                                                       // i64x2.relaxed_laneselect (bit 63)
+        val mask = popV128(); val b = popV128(); val a = popV128()
+        f.pc = p1
+        valueStack += V128(laneSelectN(a, b, mask, width = 8))
+
+      case 0x10D =>                                                                       // f32x4.relaxed_min
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => jl.Math.min(x, y)))
+      case 0x10E =>                                                                       // f32x4.relaxed_max
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(f32x4BinOp(a, b, (x, y) => jl.Math.max(x, y)))
+      case 0x10F =>                                                                       // f64x2.relaxed_min
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => jl.Math.min(x, y)))
+      case 0x110 =>                                                                       // f64x2.relaxed_max
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(f64x2BinOp(a, b, (x, y) => jl.Math.max(x, y)))
+
+      case 0x111 =>                                                                       // i16x8.relaxed_q15mulr_s
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(i16x8Q15MulrS(a, b))
+
+      case 0x112 =>                                                                       // i16x8.relaxed_dot_i8x16_i7x16_s
+        val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(i16x8DotI8x16I7x16S(a, b))
+
+      case 0x113 =>                                                                       // i32x4.relaxed_dot_i8x16_i7x16_add_s
+        val c = popV128(); val b = popV128(); val a = popV128(); f.pc = p1
+        valueStack += V128(i32x4DotI8x16I7x16AddS(a, b, c))
+
+      case _ =>
+        fail(WasmError.UnknownOpcode(0xfd))
+
+  // === Chunk J — Relaxed SIMD helpers =======================================
+
+  /** Lane-select on N-byte lanes for the relaxed_laneselect family
+    * (i16 / i32 / i64). For each lane, the high bit of `mask`'s
+    * corresponding lane selects between `a` and `b` (high bit set → a;
+    * clear → b). `width` is the lane size in bytes (2 / 4 / 8); the
+    * single-byte case is handled inline since it doesn't need a loop. */
+  private def laneSelectN(a: Array[Byte], b: Array[Byte], mask: Array[Byte], width: Int): Array[Byte] =
+    val r       = new Array[Byte](16)
+    val nLanes  = 16 / width
+    var i       = 0
+    while i < nLanes do
+      val high = mask(i * width + width - 1) & 0x80
+      val src  = if high != 0 then a else b
+      System.arraycopy(src, i * width, r, i * width, width)
+      i += 1
+    r
+
+  /** `f32x4.relaxed_madd` and `f32x4.relaxed_nmadd`. Unfused multiply-add
+    * — `(a*b) + c` for madd, `(-(a*b)) + c` for nmadd. The proposal
+    * permits either fused (FMA) or unfused; unfused is portable across
+    * JVM / Scala.js / Scala Native. */
+  private def f32x4Madd(a: Array[Byte], b: Array[Byte], c: Array[Byte], neg: Boolean): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 4 do
+      val ai = jl.Float.intBitsToFloat(le32(a, i * 4))
+      val bi = jl.Float.intBitsToFloat(le32(b, i * 4))
+      val ci = jl.Float.intBitsToFloat(le32(c, i * 4))
+      val prod = ai * bi
+      val out  = (if neg then -prod else prod) + ci
+      writeLe32(r, i * 4, jl.Float.floatToRawIntBits(out))
+      i += 1
+    r
+
+  /** `f64x2.relaxed_madd` / `f64x2.relaxed_nmadd`. Same shape as
+    * [[f32x4Madd]] at double width. */
+  private def f64x2Madd(a: Array[Byte], b: Array[Byte], c: Array[Byte], neg: Boolean): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 2 do
+      val ai = jl.Double.longBitsToDouble(le64(a, i * 8))
+      val bi = jl.Double.longBitsToDouble(le64(b, i * 8))
+      val ci = jl.Double.longBitsToDouble(le64(c, i * 8))
+      val prod = ai * bi
+      val out  = (if neg then -prod else prod) + ci
+      writeLe64(r, i * 8, jl.Double.doubleToRawLongBits(out))
+      i += 1
+    r
+
+  /** `i16x8.relaxed_q15mulr_s` — saturating signed Q15 fixed-point
+    * multiply with rounding: `sat((a*b + 0x4000) >> 15)` per lane. */
+  private def i16x8Q15MulrS(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 8 do
+      val ai = le16Signed(a, i * 2)
+      val bi = le16Signed(b, i * 2)
+      val prod = ai.toLong * bi.toLong
+      val rounded = ((prod + 0x4000L) >> 15).toInt
+      val sat =
+        if rounded >  0x7FFF then  0x7FFF
+        else if rounded < -0x8000 then -0x8000
+        else rounded
+      writeLe16(r, i * 2, sat)
+      i += 1
+    r
+
+  /** `i16x8.relaxed_dot_i8x16_i7x16_s` — for each of 8 i16 lanes, the
+    * pair-sum of two `(signed i8 × unsigned i8)` products from adjacent
+    * bytes of `a` and `b`. The "i7" in the name means the second
+    * operand's high bit is permitted to be either sign-extended or
+    * zero-extended (relaxed); we pick zero-extension (treat `b` as
+    * unsigned), which matches V8/wasmtime on x86_64. */
+  private def i16x8DotI8x16I7x16S(a: Array[Byte], b: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 8 do
+      val a0 = a(i * 2).toInt                  // sign-extended
+      val a1 = a(i * 2 + 1).toInt
+      val b0 = b(i * 2)     & 0xff             // zero-extended
+      val b1 = b(i * 2 + 1) & 0xff
+      val sum = a0 * b0 + a1 * b1              // fits in i32; cast back to i16 below
+      writeLe16(r, i * 2, sum)
+      i += 1
+    r
+
+  /** `i32x4.relaxed_dot_i8x16_i7x16_add_s` — for each i32 lane, the
+    * pair-sum of FOUR `(signed i8 × unsigned i8)` products from
+    * consecutive bytes of `a` and `b`, plus the matching lane of `c`. */
+  private def i32x4DotI8x16I7x16AddS(a: Array[Byte], b: Array[Byte], c: Array[Byte]): Array[Byte] =
+    val r = new Array[Byte](16)
+    var i = 0
+    while i < 4 do
+      var sum = 0
+      var j   = 0
+      while j < 4 do
+        val ai = a(i * 4 + j).toInt
+        val bi = b(i * 4 + j) & 0xff
+        sum += ai * bi
+        j += 1
+      val ci = le32(c, i * 4)
+      writeLe32(r, i * 4, sum + ci)
+      i += 1
+    r
+
+  // --- little-endian byte helpers used by the relaxed-SIMD helpers above ---
+
+  private inline def le16Signed(buf: Array[Byte], pos: Int): Int =
+    ((buf(pos) & 0xff) | (buf(pos + 1) << 8))
+
+  private inline def le32(buf: Array[Byte], pos: Int): Int =
+    (buf(pos)     & 0xff)        |
+    ((buf(pos+1)  & 0xff) <<  8) |
+    ((buf(pos+2)  & 0xff) << 16) |
+    ((buf(pos+3)  & 0xff) << 24)
+
+  private inline def le64(buf: Array[Byte], pos: Int): Long =
+    (buf(pos)     & 0xffL)        |
+    ((buf(pos+1)  & 0xffL) <<  8) |
+    ((buf(pos+2)  & 0xffL) << 16) |
+    ((buf(pos+3)  & 0xffL) << 24) |
+    ((buf(pos+4)  & 0xffL) << 32) |
+    ((buf(pos+5)  & 0xffL) << 40) |
+    ((buf(pos+6)  & 0xffL) << 48) |
+    ((buf(pos+7)  & 0xffL) << 56)
+
+  private inline def writeLe16(buf: Array[Byte], pos: Int, v: Int): Unit =
+    buf(pos)     = v.toByte
+    buf(pos + 1) = (v >> 8).toByte
+
+  private inline def writeLe32(buf: Array[Byte], pos: Int, v: Int): Unit =
+    buf(pos)     = v.toByte
+    buf(pos + 1) = (v >>  8).toByte
+    buf(pos + 2) = (v >> 16).toByte
+    buf(pos + 3) = (v >> 24).toByte
+
+  private inline def writeLe64(buf: Array[Byte], pos: Int, v: Long): Unit =
+    buf(pos)     = v.toByte
+    buf(pos + 1) = (v >>  8).toByte
+    buf(pos + 2) = (v >> 16).toByte
+    buf(pos + 3) = (v >> 24).toByte
+    buf(pos + 4) = (v >> 32).toByte
+    buf(pos + 5) = (v >> 40).toByte
+    buf(pos + 6) = (v >> 48).toByte
+    buf(pos + 7) = (v >> 56).toByte
+
 
 /** Static helper called by [[Interpreter.skipImmediates]] for the `0xFD`
   * arm. Returns the byte position right after the 0xFD opcode's
@@ -2432,5 +2681,22 @@ private[wasm] object SimdDispatch:
             if pAfter + 1 > body.length then
               Left(WasmError.InvalidModule(s"truncated lane immediate at $pc"))
             else Right(pAfter + 1)
+
+      // Relaxed SIMD proposal — 20 sub-opcodes 0x100..0x113, all with no
+      // additional immediate past the multi-byte LEB sub-opcode itself.
+      //   0x100        i8x16.relaxed_swizzle
+      //   0x101..0x104 *.relaxed_trunc_*  (4 forms)
+      //   0x105..0x108 f*.relaxed_madd / relaxed_nmadd (4 forms)
+      //   0x109..0x10C *.relaxed_laneselect (4 widths)
+      //   0x10D..0x110 f*.relaxed_min / relaxed_max (4 forms)
+      //   0x111        i16x8.relaxed_q15mulr_s
+      //   0x112        i16x8.relaxed_dot_i8x16_i7x16_s
+      //   0x113        i32x4.relaxed_dot_i8x16_i7x16_add_s  (ternary)
+      case 0x100 | 0x101 | 0x102 | 0x103 | 0x104 |
+           0x105 | 0x106 | 0x107 | 0x108 |
+           0x109 | 0x10A | 0x10B | 0x10C |
+           0x10D | 0x10E | 0x10F | 0x110 |
+           0x111 | 0x112 | 0x113 =>
+        Right(p1)
 
       case _ => Left(WasmError.UnknownOpcode(0xfd))

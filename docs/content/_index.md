@@ -2,7 +2,7 @@
 title: wasm
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select and exnref), multi-memory (with a multi-memory host-function surface), the complete SIMD proposal, both forms of exception handling (legacy try/catch/throw/rethrow/delegate AND the modern try_table with throw_ref), and tail calls (return_call / return_call_indirect) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select and exnref), multi-memory (with a multi-memory host-function surface), the complete SIMD proposal AND relaxed-SIMD (all 20 sub-opcodes), both forms of exception handling (legacy try/catch/throw/rethrow/delegate AND the modern try_table with throw_ref), and tail calls (return_call / return_call_indirect) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**791 tests** on the JVM (569 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
+**806 tests** on the JVM (584 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
 
 ## Try it
 
