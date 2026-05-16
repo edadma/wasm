@@ -313,45 +313,89 @@ object Parser:
 
   // === Import section ===
 
+  /** Parse Section 2. Each import is `mod_name field_name kind desc` in the
+    * regular shape; the wasm-3.0 compact-imports proposal additionally
+    * groups multiple imports under a shared `mod_name` to save bytes.
+    *
+    * The compact form is signalled by reading what looks like the start
+    * of a regular import where `field_name == ""` and the kind byte is
+    * `0x7F` or `0x7E` (neither is a valid kind in the regular form —
+    * legal kinds are 0..4). Two compact variants:
+    *
+    *   - `0x7E` shared-kind: `kind sub_count (field_name desc)*` — the
+    *     descriptor structure is the same for every sub-import.
+    *   - `0x7F` per-import-kind: `sub_count (field_name kind desc)*` —
+    *     sub-imports can mix kinds within a single shared-mod group.
+    *
+    * In both variants the `i` loop counter advances by the group's
+    * `sub_count` so the outer `num_imports` total is the COUNT OF
+    * IMPORTS (across all forms), not the count of groups. */
   private def parseImportSection(c: Cursor): (Vector[FuncImport], Vector[TagImport], Vector[GlobalImport]) =
     val n     = c.readU32()
     val out   = ArrayBuffer.empty[FuncImport]
     val tags  = ArrayBuffer.empty[TagImport]
     val globs = ArrayBuffer.empty[GlobalImport]
-    var i     = 0
+
+    def readDesc(mod: String, name: String, kind: Int): Unit = kind match
+      case 0x00 =>                                     // func
+        out += FuncImport(mod, name, c.readU32())
+      case 0x01 =>                                     // table — silently skipped.
+        // NOTE: when imported tables are eventually surfaced (Phase 5),
+        // they will occupy table indices 0..k-1 in the wasm namespace
+        // ahead of any defined tables. Until then, a module that mixes
+        // imported and defined tables would see its `call_indirect`
+        // tableidx immediates misalign against our `tables` array. The
+        // Core spec allows at most one table per module, so single-
+        // defined-table modules remain correct.
+        val _ = c.readByte()                           // elem reftype
+        skipLimits(c)
+      case 0x02 =>                                     // memory — skip
+        skipLimits(c)
+      case 0x03 =>                                     // global
+        val vt  = readValType(c)
+        val mut = c.readByte()
+        if mut != 0x00 && mut != 0x01 then
+          fail(WasmError.InvalidModule(s"global import ${mod}.${name}: invalid mutability byte 0x${mut.toHexString}"))
+        globs += GlobalImport(mod, name, vt, mut == 0x01)
+      case 0x04 =>                                     // tag (EH proposal)
+        // Wire shape: attribute byte (must be 0x00 = exception) + typeidx u32.
+        val attr = c.readByte()
+        if attr != 0x00 then
+          fail(WasmError.InvalidModule(s"tag import ${mod}.${name}: unknown attribute 0x${attr.toHexString}"))
+        tags += TagImport(mod, name, c.readU32())
+      case other =>
+        fail(WasmError.InvalidModule(s"unknown import kind 0x${other.toHexString}"))
+
+    var i = 0
     while i < n do
-      val mod  = c.readName()
-      val name = c.readName()
-      c.readByte() match
-        case 0x00 =>                                     // func
-          out += FuncImport(mod, name, c.readU32())
-        case 0x01 =>                                     // table — silently skipped.
-          // NOTE: when imported tables are eventually surfaced (Phase 5),
-          // they will occupy table indices 0..k-1 in the wasm namespace
-          // ahead of any defined tables. Until then, a module that mixes
-          // imported and defined tables would see its `call_indirect`
-          // tableidx immediates misalign against our `tables` array. The
-          // Core spec allows at most one table per module, so single-
-          // defined-table modules remain correct.
-          val _ = c.readByte()                           // elem reftype
-          skipLimits(c)
-        case 0x02 =>                                     // memory — skip
-          skipLimits(c)
-        case 0x03 =>                                     // global
-          val vt  = readValType(c)
-          val mut = c.readByte()
-          if mut != 0x00 && mut != 0x01 then
-            fail(WasmError.InvalidModule(s"global import ${mod}.${name}: invalid mutability byte 0x${mut.toHexString}"))
-          globs += GlobalImport(mod, name, vt, mut == 0x01)
-        case 0x04 =>                                     // tag (EH proposal)
-          // Wire shape: attribute byte (must be 0x00 = exception) + typeidx u32.
-          val attr = c.readByte()
-          if attr != 0x00 then
-            fail(WasmError.InvalidModule(s"tag import ${mod}.${name}: unknown attribute 0x${attr.toHexString}"))
-          tags += TagImport(mod, name, c.readU32())
-        case other =>
-          fail(WasmError.InvalidModule(s"unknown import kind 0x${other.toHexString}"))
-      i += 1
+      val mod      = c.readName()
+      val name     = c.readName()
+      val kindByte = c.readByte()
+      if name.isEmpty && (kindByte == 0x7f || kindByte == 0x7e) then
+        // Compact-imports group sharing `mod`. The outer `i` counter
+        // advances by `subCount` (NOT 1) so the total `n` covers every
+        // sub-import emitted, matching wabt's reader semantics.
+        if kindByte == 0x7e then
+          val sharedKind = c.readByte()
+          val subCount   = c.readU32()
+          var j = 0
+          while j < subCount do
+            val fieldName = c.readName()
+            readDesc(mod, fieldName, sharedKind)
+            j += 1
+          i += subCount
+        else                                           // 0x7F
+          val subCount = c.readU32()
+          var j = 0
+          while j < subCount do
+            val fieldName = c.readName()
+            val k         = c.readByte()
+            readDesc(mod, fieldName, k)
+            j += 1
+          i += subCount
+      else
+        readDesc(mod, name, kindByte)
+        i += 1
     (out.toVector, tags.toVector, globs.toVector)
 
   private def skipLimits(c: Cursor): Unit =
