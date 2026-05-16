@@ -701,6 +701,75 @@ object ParserAndRuntimeTests:
         case Left(err) => check(false, s"distinct names should validate, got $err")
     }
 
+    test("parser: stray UTF-8 continuation byte (0xBF) in export name is rejected") {
+      // Minimal module with one export whose 1-byte name is 0xBF — a
+      // continuation byte with no lead. Per RFC 3629 this is invalid.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x07, 0x05, 0x01, 0x01, 0xbf, 0x00, 0x00,                    // export <0xBF> func 0
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) => msg.contains("utf8")
+      }
+    }
+
+    test("parser: 4-byte UTF-8 sequence past U+10FFFF (0xF4 0x90 …) is rejected") {
+      // 0xF4 0x90 0x80 0x80 encodes U+110000 which is past the spec max.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x08, 0x01, 0x04, 0xf4, 0x90, 0x80, 0x80, 0x00, 0x00,  // export <4-byte > U+10FFFF> func 0
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) => msg.contains("utf8")
+      }
+    }
+
+    test("parser: surrogate codepoint in UTF-8 (0xED 0xA0 0x80) in import module name rejected") {
+      // 0xED 0xA0 0x80 encodes U+D800, a UTF-16 surrogate — invalid in UTF-8.
+      // Place it as an import module name to confirm the validator fires there too.
+      val mod = Header ++ b(
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,                    // type (i32) -> ()
+        0x02, 0x09, 0x01,                                            // import sec: 9-byte content, 1 entry
+                  0x03, 0xed, 0xa0, 0x80,                            //   module name: 3 bytes (surrogate)
+                  0x01, 0x66,                                        //   field name: "f"
+                  0x00, 0x00,                                        //   kind func, typeidx 0
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) => msg.contains("utf8")
+      }
+    }
+
+    test("parser: invalid UTF-8 in custom-section name is rejected (not silently skipped)") {
+      // A section 0 (custom) whose name is `0xBF` (stray continuation).
+      // Per spec the whole module is malformed; we used to skip silently.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                          // type ()->()
+        0x03, 0x02, 0x01, 0x00,                                      // func[0]: type 0
+        0x00, 0x02, 0x01, 0xbf,                                      // section 0: size 2, namelen 1, byte 0xBF
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,                          // code: empty body
+      )
+      expectInstantiateError(mod) {
+        case WasmError.InvalidModule(msg) => msg.contains("utf8")
+      }
+    }
+
+    test("parser: valid 4-byte UTF-8 (U+1F600 grinning face) accepted as export name") {
+      // 0xF0 0x9F 0x98 0x80 — emoji at U+1F600, valid 4-byte sequence.
+      val mod = Header ++ b(
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x08, 0x01, 0x04, 0xf0, 0x9f, 0x98, 0x80, 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+      )
+      Runtime.instantiate(mod, Seq(EnvModule.default)) match
+        case Right(_)  => ()
+        case Left(err) => check(false, s"valid UTF-8 emoji should round-trip, got $err")
+    }
+
   // === EnvModule.default smoke test =======================================
 
   private def envModule(): Unit =

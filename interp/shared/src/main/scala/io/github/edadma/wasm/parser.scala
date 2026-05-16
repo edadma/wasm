@@ -65,9 +65,74 @@ object Parser:
       out
 
     def readName(): String =
-      val n = readU32()
-      // WebAssembly names are UTF-8; new String(bytes, "UTF-8") works on all three backends.
-      new String(readBytes(n), "UTF-8")
+      val n     = readU32()
+      val bs    = readBytes(n)
+      // Spec: every byte sequence in a `name` (import module/field, export
+      // name, custom section id, etc.) is the UTF-8 encoding of a sequence
+      // of code points. Java's `new String(bytes, "UTF-8")` silently maps
+      // invalid bytes to U+FFFD; we have to walk the bytes ourselves to
+      // surface RFC 3629 violations as `InvalidModule`. After validation
+      // the String construction round-trips byte-for-byte.
+      validateUtf8(bs) match
+        case Some(err) => fail(WasmError.InvalidModule(err))
+        case None      => new String(bs, "UTF-8")
+
+  /** RFC 3629 strict UTF-8 walker. Returns `None` if the byte sequence is
+    * valid UTF-8, or `Some(diagnostic)` naming the offending byte and the
+    * rule it violated. Rejects: stray continuation bytes, lead bytes
+    * 0xC0/0xC1 (overlong 2-byte forms), surrogate codepoints (U+D800..
+    * U+DFFF, lead 0xED with continuation >= 0xA0), values past U+10FFFF
+    * (lead 0xF4 with continuation >= 0x90, or any lead 0xF5..0xFF), and
+    * truncated multi-byte sequences. */
+  private def validateUtf8(bs: Array[Byte]): Option[String] =
+    var i = 0
+    while i < bs.length do
+      val b0 = bs(i) & 0xff
+      if b0 < 0x80 then
+        i += 1
+      else if b0 < 0xC2 then
+        return Some(s"name: invalid utf8 lead byte 0x${b0.toHexString} at offset $i")
+      else if b0 < 0xE0 then
+        if i + 1 >= bs.length then
+          return Some(s"name: truncated utf8 sequence at offset $i")
+        val b1 = bs(i + 1) & 0xff
+        if (b1 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b1.toHexString} at offset ${i + 1}")
+        i += 2
+      else if b0 < 0xF0 then
+        if i + 2 >= bs.length then
+          return Some(s"name: truncated utf8 sequence at offset $i")
+        val b1 = bs(i + 1) & 0xff
+        val b2 = bs(i + 2) & 0xff
+        if b0 == 0xE0 && b1 < 0xA0 then
+          return Some(s"name: overlong utf8 3-byte sequence at offset $i")
+        if b0 == 0xED && b1 >= 0xA0 then
+          return Some(s"name: surrogate codepoint in utf8 at offset $i")
+        if (b1 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b1.toHexString} at offset ${i + 1}")
+        if (b2 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b2.toHexString} at offset ${i + 2}")
+        i += 3
+      else if b0 < 0xF5 then
+        if i + 3 >= bs.length then
+          return Some(s"name: truncated utf8 sequence at offset $i")
+        val b1 = bs(i + 1) & 0xff
+        val b2 = bs(i + 2) & 0xff
+        val b3 = bs(i + 3) & 0xff
+        if b0 == 0xF0 && b1 < 0x90 then
+          return Some(s"name: overlong utf8 4-byte sequence at offset $i")
+        if b0 == 0xF4 && b1 >= 0x90 then
+          return Some(s"name: utf8 codepoint past U+10FFFF at offset $i")
+        if (b1 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b1.toHexString} at offset ${i + 1}")
+        if (b2 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b2.toHexString} at offset ${i + 2}")
+        if (b3 & 0xC0) != 0x80 then
+          return Some(s"name: invalid utf8 continuation 0x${b3.toHexString} at offset ${i + 3}")
+        i += 4
+      else
+        return Some(s"name: invalid utf8 lead byte 0x${b0.toHexString} at offset $i")
+    None
 
   private def parseInternal(bytes: Array[Byte]): WasmModule =
     if bytes.length < 8 then fail(WasmError.InvalidMagic)
@@ -374,9 +439,12 @@ object Parser:
     * matches wasmtime / wabt behaviour — `name` is debug info, and a
     * busted debug section shouldn't prevent the program from running. */
   private def parseCustomSection(c: Cursor, secEnd: Int, current: Map[Int, String]): Map[Int, String] =
-    val sectionName =
-      try c.readName()
-      catch case _: Throwable => return current
+    // Per the spec, a custom section's name is a `name` field — must be
+    // valid UTF-8. We let `readName`'s UTF-8 / truncation diagnostics
+    // propagate as `InvalidModule` so utf8-custom-section-id rejects.
+    // The inner subsection-1 parse below remains best-effort (truncated
+    // debug info shouldn't take down a binary that's otherwise fine).
+    val sectionName = c.readName()
     if sectionName != "name" then return current
     var out = current
     while c.pos < secEnd do
