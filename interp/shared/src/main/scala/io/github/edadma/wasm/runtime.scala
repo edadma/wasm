@@ -44,6 +44,10 @@ final class ModuleInstance private[wasm] (
     private val dataDropped: Array[Boolean],
     private val elemRefs:    Array[Vector[Value]],
     private val elemDropped: Array[Boolean],
+    /** EH proposal: payload params per tag (imports first, then defs).
+      * Empty if the module declared no tags. Threaded through to every
+      * fresh interpreter so `throw tagidx` knows how many values to pop. */
+    private val tagParams:   Array[Vector[ValueType]],
 ):
 
   /** Public access to memory 0. Most callers only have one memory and
@@ -62,7 +66,7 @@ final class ModuleInstance private[wasm] (
       case None      => Left(WasmError.ExportNotFound(name))
       case Some(idx) => new Interpreter(
         funcs, memories, globals, globalMutable, tables, types,
-        dataBytes, dataDropped, elemRefs, elemDropped,
+        dataBytes, dataDropped, elemRefs, elemDropped, tagParams,
       ).invoke(idx, args)
 
   /** Direct access to the imports table — useful for tests that want to
@@ -409,6 +413,27 @@ object Runtime:
       case _ => ()
     }
 
+    // === tags (EH proposal) ================================================
+    // Build the per-tag payload-types vector — imports first, then defs —
+    // indexed by the unified tagidx. The validator already checked that
+    // each tag's referenced functype has empty results; here we just lift
+    // the params into a plain Array[Vector[ValueType]] so the interpreter
+    // can do a quick arity lookup at `throw tagidx`.
+    val tagParams: Array[Vector[ValueType]] = {
+      val n   = module.tagImports.length + module.tags.length
+      val arr = new Array[Vector[ValueType]](n)
+      var k   = 0
+      module.tagImports.foreach { ti =>
+        arr(k) = module.types(ti.typeIdx).params
+        k += 1
+      }
+      module.tags.foreach { t =>
+        arr(k) = module.types(t.typeIdx).params
+        k += 1
+      }
+      arr
+    }
+
     // === Start (Section 8) =================================================
     // Spec semantics: invoked AFTER imports + memory + data + globals +
     // tables are in place — i.e. right here, just before the
@@ -431,7 +456,7 @@ object Runtime:
           s"start: function $startIdx has signature $sig, expected () -> ()"))
       val interp = new Interpreter(
         funcs.toIndexedSeq, memories, globals, globalMutable, tables, module.types,
-        dataBytes, dataDropped, elemRefs, elemDropped,
+        dataBytes, dataDropped, elemRefs, elemDropped, tagParams,
       )
       interp.invoke(startIdx, Seq.empty) match
         case Right(_) => ()
@@ -452,4 +477,5 @@ object Runtime:
       dataDropped,
       elemRefs,
       elemDropped,
+      tagParams,
     )

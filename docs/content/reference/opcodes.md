@@ -43,6 +43,23 @@ Where `trunc_f32_s` of NaN or out-of-range traps, `trunc_sat_f32_s` returns 0 fo
 
 Multi-value blocks, loops, and ifs are supported — block parameters get re-fed on `br` to a loop, `br_if` carries multi-result values, etc.
 
+## Exception handling
+
+The legacy ("phase 3") exception-handling proposal — what wasmtime, V8, SpiderMonkey, and `wat2wasm`'s `--enable-exceptions` all ship — is supported end-to-end:
+
+- **`try blocktype`** (`0x06`) — open a block-shaped region whose body can be guarded by one or more `catch` clauses, a single `catch_all`, or a single `delegate`.
+- **`catch tagidx`** (`0x07`) — handle an exception whose tag matches `tagidx`; the tag's payload params are pushed onto the operand stack at handler entry.
+- **`catch_all`** (`0x19`) — handle any exception regardless of tag; no payload is pushed.
+- **`delegate labelidx`** (`0x18`) — terminator that replaces `end`; on a throw out of the try body, re-fire the exception at the named outer label (must be a try or the function frame).
+- **`throw tagidx`** (`0x08`) — pop the tag's payload params off the operand stack and raise the matching exception.
+- **`rethrow labelidx`** (`0x09`) — re-raise the exception caught by the named outer catch handler. Only valid inside a `catch` / `catch_all` clause.
+
+A `catch` / `catch_all` arrived at by normal fall-through (i.e. the try body completed without throwing) is dead code; control jumps past the entire try/catch chain.
+
+Tags are declared in [Section 13](#binary-sections) or imported from a host module under import-kind `0x04`. Each tag references a functype in section 1 whose `results` must be empty — the params are the tag's payload shape. A `throw` whose tag has params `(i32, i64)` pops two values (top of stack = last param). The validator rejects tagidxs out of range, rethrows outside any catch frame, delegates whose target is not an enclosing try or the function frame, and tag functypes with non-empty results.
+
+An uncaught exception that propagates past the outermost `_start`/`invoke` call surfaces through the public API as `Left(WasmError.UncaughtException(tagIdx, args))`. The host can pattern-match against the tagidx and re-throw as a native exception.
+
 ## Memory
 
 - **Load/store** — every width variant: `i32.load`, `i32.load8_s`/`_u`, `i32.load16_s`/`_u`, `i64.load`, `i64.load8_s`/…/`load32_s`/`_u`, `f32.load`, `f64.load`, plus all matching stores.
@@ -375,7 +392,6 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 | Group | Sub-opcodes | Status |
 |---|---|---|
 | Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
-| Exception handling | `try` / `catch` / `throw` / `rethrow` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
 | Component model | the packaging proposal | out of scope |
 
@@ -401,5 +417,6 @@ Every imported module runs through a separate validator before any code executes
 | Code     | 10 | Function bodies |
 | Data     | 11 | Linear-memory initializers (active + passive) |
 | DataCount | 12 | u32 = number of data segments; required when a function uses `memory.init` or `data.drop` |
+| Tag      | 13 | Exception tag declarations (attribute byte + typeidx) |
 
 Custom sections are skipped harmlessly.

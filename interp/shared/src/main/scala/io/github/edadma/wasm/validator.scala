@@ -64,6 +64,12 @@ object Validator:
 
   enum CtrlKind:
     case Function, Block, Loop, If, Else
+    /** EH proposal frames. `Try` is opened by `0x06`; `Catch` and `CatchAll`
+      * are opened by `0x07 tagidx` / `0x19` respectively (each replaces the
+      * previous Try/Catch/CatchAll on the control stack but inherits the
+      * try's `endTypes`). `rethrow N` is only legal when the label-frame at
+      * depth N is a `Catch` or `CatchAll`. */
+    case Try, Catch, CatchAll
 
   // === Public API =========================================================
 
@@ -91,6 +97,7 @@ object Validator:
       val globalSigs     = module.globals.map(g => (g.valueType, g.mutable))
       val tableRefTypes  = module.tables.map(_.refType)
       val elemRefTypes   = module.elements.map(_.refType)
+      val tagTypes       = collectTagTypes(module)
       // Phase 8.C: build the set of "declared" funcidxs — those that may
       // appear as a ref.func operand. Per the wasm-3.0 spec these are
       // funcidxs that appear anywhere structural in the module (exports,
@@ -134,12 +141,44 @@ object Validator:
           elemRefTypes     = elemRefTypes,
           declaredFuncs    = declaredFuncs.toSet,
           dataCountPresent = module.dataCount.isDefined,
+          tagTypes         = tagTypes,
         )
         i += 1
       Right(())
     catch case e: ValFail => Left(e.err)
 
   // === Per-module helpers =================================================
+
+  /** Build the unified tag-payload table — imports first, then defs. The
+    * EH proposal requires every tag's functype to have empty results; this
+    * pre-pass surfaces a violation as `InvalidModule` before any function
+    * body sees a `throw tagidx`. Each entry is the tag's payload param
+    * vector — what `throw tagidx` pops in order and what `catch tagidx`
+    * pushes onto the operand stack. */
+  private def collectTagTypes(module: WasmModule): Vector[Vector[ValueType]] =
+    val out = ArrayBuffer.empty[Vector[ValueType]]
+    module.tagImports.foreach { ti =>
+      if ti.typeIdx < 0 || ti.typeIdx >= module.types.length then
+        throw new ValFail(WasmError.InvalidModule(
+          s"tag import ${ti.module}.${ti.name}: type index ${ti.typeIdx} out of range"))
+      val ft = module.types(ti.typeIdx)
+      if ft.results.nonEmpty then
+        throw new ValFail(WasmError.InvalidModule(
+          s"tag import ${ti.module}.${ti.name}: tag functype must have empty results"))
+      out += ft.params
+    }
+    module.tags.zipWithIndex.foreach { case (t, i) =>
+      val tagIdx = module.tagImports.length + i
+      if t.typeIdx < 0 || t.typeIdx >= module.types.length then
+        throw new ValFail(WasmError.InvalidModule(
+          s"tag $tagIdx: type index ${t.typeIdx} out of range"))
+      val ft = module.types(t.typeIdx)
+      if ft.results.nonEmpty then
+        throw new ValFail(WasmError.InvalidModule(
+          s"tag $tagIdx: tag functype must have empty results"))
+      out += ft.params
+    }
+    out.toVector
 
   /** Build the unified function-signature index — imports first, then
     * defined functions. Same order the interpreter uses internally so
@@ -186,6 +225,7 @@ object Validator:
       elemRefTypes:     Vector[RefType],
       declaredFuncs:    Set[Int],
       dataCountPresent: Boolean,
+      tagTypes:         Vector[Vector[ValueType]],
   ): Unit =
     val state = new State(
       funcIdx          = funcIdx,
@@ -203,6 +243,7 @@ object Validator:
       elemRefTypes     = elemRefTypes,
       declaredFuncs    = declaredFuncs,
       dataCountPresent = dataCountPresent,
+      tagTypes         = tagTypes,
       body             = body,
     )
     state.pushCtrl(CtrlKind.Function, Vector.empty, sig.results)
@@ -242,6 +283,10 @@ object Validator:
       val elemRefTypes:     Vector[RefType],
       val declaredFuncs:    Set[Int],
       val dataCountPresent: Boolean,
+      // EH proposal: indexed by tagidx (imports first, then defs); the entry
+      // is the tag's payload param vector. `throw tagidx` pops these in order,
+      // `catch tagidx` pushes them at handler entry.
+      val tagTypes:         Vector[Vector[ValueType]],
       val body:        Array[Byte],
   ):
     val operandStack: ArrayBuffer[AbsValue]  = ArrayBuffer.empty
@@ -457,7 +502,7 @@ object Validator:
 
       case 0x00 => unreachable()                                                // unreachable
       case 0x01 => ()                                                           // nop
-      case 0x02 | 0x03 | 0x04 =>                                                // block / loop / if
+      case 0x02 | 0x03 | 0x04 | 0x06 =>                                         // block / loop / if / try
         val (_, np) = Interpreter.readBlocktype(body, pc, types) match
           case Right(t) => t
           case Left(e)  => throw new ValFail(e)
@@ -470,15 +515,61 @@ object Validator:
           case 0x03 =>
             popVals(ft.params)
             pushCtrl(CtrlKind.Loop, ft.params, ft.results)
-          case _ =>
+          case 0x04 =>
             popVal(ValueType.I32Type)
             popVals(ft.params)
             pushCtrl(CtrlKind.If, ft.params, ft.results)
+          case _ =>                                                             // 0x06 try
+            popVals(ft.params)
+            pushCtrl(CtrlKind.Try, ft.params, ft.results)
       case 0x05 =>                                                              // else
         val frame = popCtrl()
         if frame.kind != CtrlKind.If then
           fail(s"else matched a non-if frame: ${frame.kind}")
         pushCtrl(CtrlKind.Else, frame.startTypes, frame.endTypes)
+      case 0x07 =>                                                              // catch tagidx
+        val tagIdx = readU32()
+        if tagIdx < 0 || tagIdx >= tagTypes.length then
+          fail(s"catch: tag index $tagIdx out of range (have ${tagTypes.length} tags)")
+        val frame = popCtrl()
+        // Catch ends the previous try/catch region and starts a new one.
+        if frame.kind != CtrlKind.Try && frame.kind != CtrlKind.Catch then
+          fail(s"catch matched a non-try/catch frame: ${frame.kind}")
+        pushCtrl(CtrlKind.Catch, tagTypes(tagIdx), frame.endTypes)
+      case 0x19 =>                                                              // catch_all
+        val frame = popCtrl()
+        if frame.kind != CtrlKind.Try && frame.kind != CtrlKind.Catch then
+          fail(s"catch_all matched a non-try/catch frame: ${frame.kind}")
+        pushCtrl(CtrlKind.CatchAll, Vector.empty, frame.endTypes)
+      case 0x18 =>                                                              // delegate labelidx
+        val labelIdx = readU32()
+        val frame = popCtrl()
+        if frame.kind != CtrlKind.Try then
+          fail(s"delegate matched a non-try frame: ${frame.kind}")
+        // The label-frame depth here is computed *after* popCtrl, so labelidx
+        // 0 names the immediately-enclosing frame (the one that was below the
+        // try on the ctrl stack). The target must be a Try or the Function
+        // frame — anything else has no exception-handler semantics.
+        if labelIdx < 0 || labelIdx >= ctrlStack.length then
+          fail(s"delegate: label index $labelIdx out of range (have ${ctrlStack.length} labels)")
+        val target = ctrlStack(ctrlStack.length - 1 - labelIdx)
+        if target.kind != CtrlKind.Try && target.kind != CtrlKind.Function then
+          fail(s"delegate target must be try or function frame, got ${target.kind}")
+        pushVals(frame.endTypes)
+      case 0x08 =>                                                              // throw tagidx
+        val tagIdx = readU32()
+        if tagIdx < 0 || tagIdx >= tagTypes.length then
+          fail(s"throw: tag index $tagIdx out of range (have ${tagTypes.length} tags)")
+        popVals(tagTypes(tagIdx))
+        unreachable()
+      case 0x09 =>                                                              // rethrow labelidx
+        val labelIdx = readU32()
+        if labelIdx < 0 || labelIdx >= ctrlStack.length then
+          fail(s"rethrow: label index $labelIdx out of range (have ${ctrlStack.length} labels)")
+        val target = ctrlStack(ctrlStack.length - 1 - labelIdx)
+        if target.kind != CtrlKind.Catch && target.kind != CtrlKind.CatchAll then
+          fail(s"rethrow target must be a catch/catch_all frame, got ${target.kind}")
+        unreachable()
       case 0x0b =>                                                              // end
         val frame = popCtrl()
         pushVals(frame.endTypes)

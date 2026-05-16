@@ -16,6 +16,7 @@ object WasmError:
   final case class UnknownImport(module: String, name: String)      extends WasmError
   final case class ExportNotFound(name: String)                     extends WasmError
   final case class InvalidModule(message: String)                   extends WasmError
+  final case class UncaughtException(tagIdx: Int, args: Seq[Value]) extends WasmError
 ```
 
 ## Lookup
@@ -30,6 +31,7 @@ object WasmError:
 | `UnknownImport(m, n)`    | instantiate        | Module imports `m.n`, but no `HostModule` provides it. |
 | `ExportNotFound(name)`   | runtime            | `inst.invoke(name, …)` or `Wasi.run(inst, name)` looked up a non-existent export. |
 | `InvalidModule(message)` | validator + runtime traps | Static type-check failure, **or** a runtime trap that isn't a memory bound — divide-by-zero, signed-`div` overflow, `trunc` of NaN, `call_indirect` signature mismatch, branch index out of range, etc. The message names the operation. |
+| `UncaughtException(tag, args)` | runtime | A `throw` propagated past the outermost call without a matching `catch tagidx` / `catch_all`. `tag` is the unified tagidx (imports first, then defs); `args` is the payload, top-of-stack at throw site = last element. |
 
 ## InvalidModule prefixes
 
@@ -71,6 +73,7 @@ result match
   case Left(UnreachableExecuted)        => println("guest hit unreachable")
   case Left(MemoryOutOfBounds)          => println("guest read/wrote out of bounds")
   case Left(ExportNotFound(name))       => println(s"no such export: $name")
+  case Left(UncaughtException(t, args)) => println(s"uncaught wasm exception: tag=$t payload=$args")
 
   // -- host or interpreter bug --
   case Left(TypeMismatch)                => println("internal type tag mismatch (bug)")
