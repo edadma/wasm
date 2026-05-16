@@ -1282,6 +1282,28 @@ object Validator:
           case 0x5A => simdStoreLane("v128.store32_lane",  4)
           case 0x5B => simdStoreLane("v128.store64_lane",  2)
 
+          // --- Relaxed SIMD (20 ops) ---------------------------------------
+          //
+          // The proposal's "relaxed" flavour leaves a handful of edge cases
+          // (NaN handling on min/max, out-of-range trunc, swizzle indices
+          // ≥ 16) implementation-defined; the typing rules are conventional.
+          // 0x100 swizzle, 0x10D..0x110 min/max, 0x111 q15mulr, 0x112 dot_s,
+          // and the four trunc/laneselect families pop two v128s; the four
+          // *_madd / *_nmadd ops and 0x113 dot_add are ternary.
+
+          case 0x101 | 0x102 | 0x103 | 0x104 =>                                // *.relaxed_trunc_*
+            unop(ValueType.V128Type, ValueType.V128Type)
+
+          case 0x100 |                                                          // i8x16.relaxed_swizzle
+               0x10D | 0x10E | 0x10F | 0x110 |                                  // f*.relaxed_min / relaxed_max
+               0x111 | 0x112 =>                                                 // q15mulr_s, dot_i8x16_i7x16_s
+            binop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
+          case 0x105 | 0x106 | 0x107 | 0x108 |                                  // f*.relaxed_madd / relaxed_nmadd
+               0x109 | 0x10A | 0x10B | 0x10C |                                  // *.relaxed_laneselect (bitselect-shaped: a, b, mask)
+               0x113 =>                                                          // i32x4.relaxed_dot_i8x16_i7x16_add_s
+            ternop(ValueType.V128Type, ValueType.V128Type, ValueType.V128Type, ValueType.V128Type)
+
           case _ =>
             throw new ValFail(WasmError.UnknownOpcode(0xfd))
 
