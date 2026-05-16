@@ -4,7 +4,7 @@ summary: The configuration passed to `Wasi.preview1` — args, envs, stdio sinks
 weight: 10
 ---
 
-`WasiContext` is the configuration record `Wasi.preview1(ctx)` accepts. It's a plain case class with eight fields, all of which have sensible defaults:
+`WasiContext` is the configuration record `Wasi.preview1(ctx)` accepts. It's a plain case class with nine fields, all of which have sensible defaults:
 
 ```scala
 final case class WasiContext(
@@ -12,12 +12,15 @@ final case class WasiContext(
     envs:     Seq[(String, String)]             = Seq.empty,                   // KEY=VALUE pairs
     stdout:   Int => Unit                       = WasiContext.defaultStdout,   // per-byte sink for fd 1
     stderr:   Int => Unit                       = WasiContext.defaultStderr,   // per-byte sink for fd 2
+    stdin:    (Array[Byte], Int, Int) => Int    = WasiContext.defaultStdin,    // reader for fd 0
     clock:    WasiContext.Clock                 = WasiContext.systemClock,     // realtime + monotonic
     random:   Int => Array[Byte]                = WasiContext.defaultRandom,   // random_get source
     preopens: Seq[WasiContext.Preopen]          = Seq.empty,                   // fd 3 .. 3+P-1
     sockets:  Seq[WasiContext.ServerSocket]     = Seq.empty,                   // fd 3+P .. 3+P+S-1
 )
 ```
+
+The `stdin` reader has the POSIX `read` shape: fill `dst[off .. off + len)` with up to `len` bytes from the current stream position, return the number of bytes written (0 = EOF, never negative). The default returns 0 immediately, so a program that reads stdin without one being supplied sees a clean empty input rather than `EBADF`. `WasiContext.stdinFromBytes(bytes)` builds a cursor-tracking reader from an `Array[Byte]`; the CLI's `--stdin <path>` uses it to stream a file through fd 0.
 
 Every wasi syscall that needs host state reads from this record — `args_get` walks `args`, `clock_time_get` calls `clock.realtimeNanos()`, `random_get` calls `random(n)`, and so on. Copy-and-modify (`ctx.copy(args = …)`) is the only way to construct one; there is no mutation.
 

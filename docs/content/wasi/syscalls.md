@@ -38,7 +38,7 @@ Twenty-nine host functions are exposed under the module name `wasi_snapshot_prev
 | Syscall | Behaviour |
 |---|---|
 | `path_open(dirfd, …, path_ptr, path_len, oflags, …, *out_fd)`  | Resolves `path` against the preopen at `dirfd`, opens it according to `oflags` (`CREAT` / `EXCL` / `TRUNC` / `DIRECTORY`), and returns a new fd. Sandboxed against `..`-escape and absolute paths. |
-| `fd_read(fd, iovs, iovs_len, *n)`            | Reads into iovecs, advancing the file position. |
+| `fd_read(fd, iovs, iovs_len, *n)`            | Reads into iovecs, advancing the file position. `fd 0` (stdin) dispatches through `WasiContext.stdin` — the default returns 0 bytes (EOF). `fd 1` / `fd 2` / preopen dirs / unopened fds all reject with `EBADF`. |
 | `fd_seek(fd, offset, whence, *new_pos)`      | `SEEK_SET=0`, `SEEK_CUR=1`, `SEEK_END=2`. |
 | `fd_close(fd)`                               | Releases the slot in the fd table. |
 | `fd_filestat_get(fd, *stat)`                 | Fills the wasi-preview1 `filestat` struct (filetype, inode placeholder, size, atim/mtim/ctim placeholders). |

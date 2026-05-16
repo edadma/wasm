@@ -42,7 +42,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**881 tests** on the JVM (653 interpreter + 209 WASI + 19 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **133 manifests fully green** and 9 pinned (function-references reftype short forms / residual niche cases / mutable-global cross-module sharing). See [Spec compliance](/reference/spec-compliance/) for the table.
+**881 tests** on the JVM (653 interpreter + 209 WASI + 19 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **133 manifests fully green** and 9 pinned (mostly wasm-3.0 GC-proposal reftype short forms and a handful of niche residuals). See [Spec compliance](/reference/spec-compliance/) for the table.
 
 ## Try it
 
@@ -69,5 +69,5 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 - [Getting Started](/getting-started/) — install the artifacts, run your first module.
 - [Concepts](/concepts/) — the validator, host imports, traps and errors.
 - [WASI](/wasi/) — the 29 syscalls implemented, the three preopen flavours, and the BSD-inetd socket model.
-- [CLI](/cli/) — `--preopen`, `--invoke`, `--args`, and the dispatch rules.
+- [CLI](/cli/) — `--preopen`, `--invoke`, `--args`, `--stdin`, `--trace`, `--validate-only`, and the dispatch rules.
 - [Reference](/reference/) — supported opcodes, binary sections, error variants.

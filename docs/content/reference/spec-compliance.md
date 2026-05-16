@@ -80,15 +80,7 @@ Skipped commands count toward the totals line but don't affect pass / fail statu
 | `elem`    | Mostly wasm-3.0 GC reftype short form `0x40` in table sections (15 fails); 6 result-value mismatches on elem-segment edge cases |
 | `global`  | One wasm-3.0 GC reftype short form in a table section, plus 5 cascading "no current module" |
 | `imports` | Niche import-shape mismatches                                                           |
-| `linking` | `(ref heaptype)` short forms `0x63`/`0x64` in element segments; cascade from earlier-failed modules (function-references proposal needed)                                                                |
-
-**Cross-module `register`** (runner-side):
-
-The wast2json command stream includes `register` commands that bind a module instance to an external name for subsequent imports; our runner doesn't implement that dispatch.
-
-| Manifest  |
-|-----------|
-| `linking` |
+| `linking` | `(ref heaptype)` short forms `0x63`/`0x64` in element segments; cascade from earlier-failed modules (function-references proposal needed) |
 
 Fixing any of these will trip an "UNEXPECTED PASSES" warning until the manifest is removed from `KnownFailures.names`.
 

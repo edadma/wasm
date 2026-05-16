@@ -1,10 +1,10 @@
 ---
 title: Host imports
-summary: How guest modules call back into Scala — the `HostModule` and `HostFunc` shape.
+summary: How guest modules reach into Scala — the `HostModule` surface for functions, globals, memories, and tables.
 weight: 20
 ---
 
-WebAssembly modules can declare imports — functions provided by the host. The `interp` library exposes these through the `HostModule` trait:
+WebAssembly modules can declare imports of four kinds: functions, globals, memories, and tables. The `interp` library exposes all four through the `HostModule` trait — guest declarations like `(import "env" "foo" (func ...))`, `(import "env" "bar" (global ...))`, `(import "env" "mem" (memory ...))`, and `(import "env" "tab" (table ...))` all resolve against the host modules you hand to `Runtime.instantiate`.
 
 ```scala
 trait HostModule:
