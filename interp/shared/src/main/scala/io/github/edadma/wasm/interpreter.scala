@@ -19,7 +19,15 @@ import java.lang as jl  // for Long.divideUnsigned / rotateLeft / numberOfLeadin
   * `Int.MaxValue` bytes (≈ 32767 pages). On failure it returns `-1`
   * verbatim — that's the spec's signal for "grow failed", *not* a trap.
   */
-final class Memory(initialPages: Int, val maxPages: Option[Int] = None):
+/** A linear memory.
+  *
+  * `shared` is the threads-proposal flag (limits bit 0x02). A single-
+  * threaded interpreter does not synchronise reads/writes — atomic ops
+  * are implemented as plain reads/writes with alignment checks — but the
+  * flag is still observable: `memory.atomic.wait{32,64}` traps when run
+  * against a non-shared memory, so the runtime needs to know.
+  */
+final class Memory(initialPages: Int, val maxPages: Option[Int] = None, val shared: Boolean = false):
   var data: Array[Byte] = new Array[Byte](initialPages * Memory.PageSize)
   var currentPages: Int = initialPages
   def size: Int = data.length
@@ -630,8 +638,40 @@ object Interpreter:
         Leb128.readU32(body, pc + 1) match
           case Left(e)          => Left(e)
           case Right((sub, p1)) => SimdDispatch.skipSimdImmediates(body, pc, sub, p1)
+      case 0xfe =>
+        // Threads proposal. Sub-opcode is a LEB u32. Every recognised sub
+        // (0x00..0x4E except 0x47) takes a memarg, *except* atomic.fence
+        // (0x03) which takes a single reserved byte. memarg may itself
+        // carry a memidx via bit 6 of the alignment LEB (the multi-memory
+        // extension), so we route through `readMemArg`.
+        Leb128.readU32(body, pc + 1) match
+          case Left(e)          => Left(e)
+          case Right((sub, p1)) =>
+            if sub == 0x03 then
+              // atomic.fence: one reserved byte (current encoding mandates 0x00).
+              if p1 >= body.length then Left(WasmError.InvalidModule("truncated atomic.fence immediate"))
+              else Right(p1 + 1)
+            else if isKnownAtomic(sub) then
+              readMemArg(body, p1).map(_._2)
+            else Left(WasmError.UnknownOpcode(0xfe))
       case other =>
         Left(WasmError.UnknownOpcode(other))
+
+  /** Recogniser for atomic-prefix (0xFE) sub-opcodes that take a memarg.
+    * Used by skipImmediates and (mirror in) the validator so an unknown
+    * sub fails fast with `UnknownOpcode(0xFE)` rather than misparsing
+    * the rest of the function body as memarg bytes. The 0x03 fence sub
+    * is handled separately by the caller (it takes a reserved byte, not
+    * a memarg). Coverage:
+    *
+    *   0x00..0x02 — notify, wait32, wait64
+    *   0x10..0x1d — load / store family
+    *   0x1e..0x47 — rmw add/sub/and/or/xor/xchg (7 widths × 6 ops, contiguous)
+    *   0x48..0x4e — cmpxchg (7 widths)
+    */
+  private[wasm] def isKnownAtomic(sub: Int): Boolean =
+    (sub >= 0x00 && sub <= 0x02) ||                                         // notify / wait32 / wait64
+    (sub >= 0x10 && sub <= 0x4e)                                            // load/store/rmw/cmpxchg
 
   // === Runtime state =======================================================
 
@@ -731,7 +771,7 @@ final class Interpreter private[wasm] (
       * callbacks. Defaults to `Tracer.NoOp`; the JIT inlines the empty
       * methods so untraced invocations pay no per-op cost. */
     private val tracer: Tracer = Tracer.NoOp,
-) extends SimdDispatch:
+) extends SimdDispatch, AtomicDispatch:
   import Interpreter.*
 
   /** Immutable view over [[memories]] passed to multi-memory host
@@ -1930,6 +1970,19 @@ final class Interpreter private[wasm] (
       case 0xfd =>
         stepFd(f)
 
+      // === Threads / atomics prefix ======================================
+      //
+      // 0xFE introduces the threads proposal's atomic opcode family
+      // (~66 sub-opcodes). Single-threaded interpreter: atomic load/store
+      // are plain load/store with an alignment trap; rmw is read-modify-
+      // write, returning the OLD value; cmpxchg conditionally swaps. The
+      // wait/notify family treats `notify` as "always 0 waiters" and
+      // `wait*` as "trap if memory unshared, return 1 (not-equal) when
+      // initial value mismatches expected, else trap (would block forever
+      // with no other thread to wake)". `atomic.fence` is a no-op.
+      case 0xfe =>
+        stepFe(f)
+
       // === unsupported ===================================================
 
       case other => fail(WasmError.UnknownOpcode(other))
@@ -2343,24 +2396,24 @@ final class Interpreter private[wasm] (
   private[wasm] inline def boundsCheck(mem: Memory, addr: Long, n: Int): Unit =
     if addr < 0 || addr + n > mem.data.length then fail(WasmError.MemoryOutOfBounds)
 
-  private def loadByte(mem: Memory, addr: Long): Int =
+  private[wasm] def loadByte(mem: Memory, addr: Long): Int =
     boundsCheck(mem, addr, 1)
     mem.data(addr.toInt) & 0xff
 
-  private def storeByte(mem: Memory, addr: Long, v: Int): Unit =
+  private[wasm] def storeByte(mem: Memory, addr: Long, v: Int): Unit =
     boundsCheck(mem, addr, 1)
     mem.data(addr.toInt) = v.toByte
 
   /** Little-endian 16-bit load — returns a sign-extended Int. Callers that
     * want the zero-extended form mask with `0xffff` themselves. */
-  private def loadI16(mem: Memory, addr: Long): Int =
+  private[wasm] def loadI16(mem: Memory, addr: Long): Int =
     boundsCheck(mem, addr, 2)
     val a = addr.toInt
     val d = mem.data
     val raw = (d(a) & 0xff) | ((d(a + 1) & 0xff) << 8)
     (raw << 16) >> 16 // sign-extend the 16-bit value into an Int
 
-  private def storeI16(mem: Memory, addr: Long, v: Int): Unit =
+  private[wasm] def storeI16(mem: Memory, addr: Long, v: Int): Unit =
     boundsCheck(mem, addr, 2)
     val a = addr.toInt
     val d = mem.data
@@ -2368,13 +2421,13 @@ final class Interpreter private[wasm] (
     d(a + 1) = ((v >>> 8) & 0xff).toByte
 
   /** Little-endian 32-bit load. */
-  private def loadI32(mem: Memory, addr: Long): Int =
+  private[wasm] def loadI32(mem: Memory, addr: Long): Int =
     boundsCheck(mem, addr, 4)
     val a = addr.toInt
     val d = mem.data
     (d(a) & 0xff) | ((d(a + 1) & 0xff) << 8) | ((d(a + 2) & 0xff) << 16) | ((d(a + 3) & 0xff) << 24)
 
-  private def storeI32(mem: Memory, addr: Long, v: Int): Unit =
+  private[wasm] def storeI32(mem: Memory, addr: Long, v: Int): Unit =
     boundsCheck(mem, addr, 4)
     val a = addr.toInt
     val d = mem.data
@@ -2384,7 +2437,7 @@ final class Interpreter private[wasm] (
     d(a + 3) = ((v >>> 24) & 0xff).toByte
 
   /** Little-endian 64-bit load. */
-  private def loadI64(mem: Memory, addr: Long): Long =
+  private[wasm] def loadI64(mem: Memory, addr: Long): Long =
     boundsCheck(mem, addr, 8)
     val a = addr.toInt
     val d = mem.data
@@ -2397,7 +2450,7 @@ final class Interpreter private[wasm] (
     ((d(a + 6) & 0xffL) << 48) |
     ((d(a + 7) & 0xffL) << 56)
 
-  private def storeI64(mem: Memory, addr: Long, v: Long): Unit =
+  private[wasm] def storeI64(mem: Memory, addr: Long, v: Long): Unit =
     boundsCheck(mem, addr, 8)
     val a = addr.toInt
     val d = mem.data

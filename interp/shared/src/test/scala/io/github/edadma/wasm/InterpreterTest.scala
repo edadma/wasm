@@ -66,6 +66,7 @@ object InterpreterTest:
     TailCallTests.run()
     TracerTests.run()
     SimdRelaxedTests.run()
+    AtomicTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

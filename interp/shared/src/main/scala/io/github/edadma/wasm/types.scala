@@ -136,7 +136,13 @@ final case class TableExport(name: String, tableIdx: Int)   extends Export
 final case class MemoryExport(name: String, memIdx: Int)    extends Export
 final case class TagExport(name: String, tagIdx: Int)       extends Export
 
-final case class MemoryLimits(min: Int, max: Option[Int])
+/** Memory limits — initial / max page counts plus the threads-proposal
+  * `shared` flag (limits flag bit 0x02). A shared memory is the only kind
+  * on which `memory.atomic.wait32` / `memory.atomic.wait64` may execute;
+  * the proposal also requires a shared memory to declare a maximum so the
+  * implementation can size its bookkeeping up front. Both invariants are
+  * enforced in the parser. */
+final case class MemoryLimits(min: Int, max: Option[Int], shared: Boolean = false)
 
 /** A module-defined table. Phase 8.C surfaces externref tables (`0x6F`)
   * alongside funcref (`0x70`); the [[RefType]] carries the distinction.
@@ -287,3 +293,13 @@ object WasmError:
     * values that were on the stack at the throw site, so a host can
     * pattern-match and re-surface as a host-native exception. */
   final case class UncaughtException(tagIdx: Int, args: Seq[Value]) extends WasmError
+
+  /** Threads proposal: an atomic memory op's effective address was not
+    * naturally aligned to its access width. The spec mandates a trap; we
+    * surface it as a distinct variant so a host can distinguish it from
+    * a plain out-of-bounds. */
+  case object UnalignedAtomicAccess extends WasmError
+
+  /** Threads proposal: `memory.atomic.wait32` / `wait64` were attempted on
+    * a memory that wasn't declared `shared`. The spec mandates a trap. */
+  case object ExpectedSharedMemory extends WasmError

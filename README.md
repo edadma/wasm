@@ -55,7 +55,9 @@ An uncaught throw surfaces as `Left(WasmError.UncaughtException(tagIdx, args))` 
 
 **Profile / trace hooks** — `Tracer` interface with `onOp` / `onCall` / `onHostCall` / `onReturn` / `onThrow` / `onTrap` callbacks. Pass any implementation through the optional `tracer` parameter on `ModuleInstance.invoke` and `Wasi.run`; the bundled `Tracer.Counting` totals ops, calls, host calls, throws, traps, and max wasm-frame depth.
 
-**Not yet implemented (Phase 9+):** threads/atomics; GC proposal; component model. Each is independently scoped.
+**Threads + atomics proposal** — 66 atomic sub-opcodes under the `0xFE` prefix (load / store at four widths, RMW add/sub/and/or/xor/xchg, cmpxchg, wait32/wait64, notify, fence), the shared-memory limits-flag bit (`0x02`), and the validator's strict-natural-alignment rule for atomic memargs. The interpreter is single-threaded, so `notify` always returns 0 (no waiters), `wait*` with a matching expected value traps "would-block", `wait*` on a non-shared memory traps with `ExpectedSharedMemory`, and `atomic.fence` is a no-op. Misaligned effective addresses trap with `UnalignedAtomicAccess`.
+
+**Not yet implemented (Phase 9+):** GC proposal; component model. Each is independently scoped.
 
 ## WASI Preview 1
 
@@ -239,7 +241,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 584 interpreter tests
+sbt 'interpJVM/Test/run'    # 612 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -250,7 +252,7 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **806 tests** on JVM (584 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **834 tests** on JVM (612 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ## Regenerating fixtures
 

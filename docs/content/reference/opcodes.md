@@ -418,6 +418,38 @@ The relaxed-SIMD proposal adds 20 sub-opcodes (`0x100..0x113`) under the existin
 | `0x112` | `i16x8.relaxed_dot_i8x16_i7x16_s`     | `v128, v128 → v128` | Pair-sum of (signed-`a` × unsigned-`b`) byte products per i16 lane. |
 | `0x113` | `i32x4.relaxed_dot_i8x16_i7x16_add_s` | `v128, v128, v128 → v128` | 4-byte (signed × unsigned) sums per i32 lane plus an i32 accumulator. |
 
+## Threads + atomics
+
+The threads proposal adds the `0xFE` opcode prefix for atomic memory operations and a `shared` flag on memory limits. This interpreter is single-threaded, but the structural guarantees the proposal makes — alignment-checked load/store, single-step read-modify-write, compare-and-swap — all hold by construction. What's covered:
+
+| Sub-opcode | Op | Shape | Notes |
+|---|---|---|---|
+| `0x00` | `memory.atomic.notify`               | `i32 addr, i32 count → i32` | Always returns 0 (no peer threads). |
+| `0x01` | `memory.atomic.wait32`               | `i32 addr, i32 expected, i64 timeout → i32` | Trap if memory unshared; trap "would-block" if value matches expected; else return 1 (not-equal). |
+| `0x02` | `memory.atomic.wait64`               | `i32 addr, i64 expected, i64 timeout → i32` | Same as wait32 at 64-bit. |
+| `0x03` | `atomic.fence`                       | `→` | No-op (single-threaded host). |
+| `0x10..0x16` | `i32/i64.atomic.load[8_u/16_u/32_u]` | `i32 → i32` or `i32 → i64` | Plain load + alignment check. |
+| `0x17..0x1D` | `i32/i64.atomic.store[8/16/32]`      | `… → ` | Plain store + alignment check. |
+| `0x1E..0x47` | `i32/i64.atomic.rmw{,8,16,32}.{add,sub,and,or,xor,xchg}[_u]` | `i32 addr, T v → T old` | Returns OLD value, leaves `op(old, v)` in memory. |
+| `0x48..0x4E` | `i32/i64.atomic.rmw{,8,16,32}.cmpxchg[_u]`             | `i32 addr, T expected, T replacement → T old` | Writes replacement iff old == expected. |
+
+Limits-flag encoding:
+
+- `flag & 0x01` — has-max (unchanged).
+- `flag & 0x02` — shared memory. Validator enforces `shared ⇒ has-max`. Other bits are rejected with a clear diagnostic.
+
+**Validator rules unique to atomics:**
+
+- The memarg's `align` immediate must equal `log2(accessWidth)`. Unlike regular load/store (where alignment is advisory), atomic ops require strict natural alignment — and the validator surfaces a mismatch as `InvalidModule` at instantiation, not at run time.
+- Unknown 0xFE sub-opcodes surface as `UnknownOpcode(0xFE)`.
+
+**Runtime traps unique to atomics:**
+
+- `UnalignedAtomicAccess` — the effective address (base + offset) was not naturally aligned to the access width.
+- `ExpectedSharedMemory` — `memory.atomic.wait{32,64}` ran against a non-shared memory.
+
+The "would-block" case for `wait*` (the operand value matches expected, so a real implementation would suspend the thread) traps with `InvalidModule("…would block forever on a single-threaded host")` rather than spinning. The not-equal early-return path is the only observable non-trap result on this interpreter.
+
 ## Multi-memory
 
 Modules may declare any number of linear memories. Each memory opcode threads a `memidx` through its immediate:
@@ -433,7 +465,6 @@ Modules may declare any number of linear memories. Each memory opcode threads a 
 
 | Group | Sub-opcodes | Status |
 |---|---|---|
-| Threads + atomics | every `*.atomic.*` opcode, `memory.atomic.*` | not planned |
 | GC proposal | `struct.*`, `array.*`, `ref.cast`, etc. | not planned |
 | Component model | the packaging proposal | out of scope |
 
