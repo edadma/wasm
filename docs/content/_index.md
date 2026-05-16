@@ -1,5 +1,6 @@
 ---
 title: wasm
+splash: true
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
 summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select and exnref), multi-memory (with a multi-memory host-function surface), the complete SIMD proposal AND relaxed-SIMD (all 20 sub-opcodes), both forms of exception handling (legacy try/catch/throw/rethrow/delegate AND the modern try_table with throw_ref), tail calls (return_call / return_call_indirect), and the threads / atomics proposal (66 atomic ops + shared memory + wait/notify) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
