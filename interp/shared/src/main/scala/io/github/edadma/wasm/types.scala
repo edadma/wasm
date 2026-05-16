@@ -97,11 +97,22 @@ final case class FuncType(params: Vector[ValueType], results: Vector[ValueType])
   * (Phase 5); if the module needs them it will fail at instantiation or use. */
 final case class FuncImport(module: String, name: String, typeIdx: Int)
 
+/** An imported exception tag (Exception Handling proposal). `typeIdx` names a
+  * functype in section 1 whose `results` must be empty — the params are the
+  * tag's payload shape (every `throw tagidx` pops them in order). */
+final case class TagImport(module: String, name: String, typeIdx: Int)
+
+/** A module-defined exception tag. Only `attribute = 0x00` (exception) is
+  * defined by the proposal; we surface the typeidx and validate the empty-
+  * results invariant at validation time. */
+final case class Tag(typeIdx: Int)
+
 sealed trait Export { def name: String }
 final case class FuncExport(name: String, funcIdx: Int)     extends Export
 final case class GlobalExport(name: String, globalIdx: Int) extends Export
 final case class TableExport(name: String, tableIdx: Int)   extends Export
 final case class MemoryExport(name: String, memIdx: Int)    extends Export
+final case class TagExport(name: String, tagIdx: Int)       extends Export
 
 final case class MemoryLimits(min: Int, max: Option[Int])
 
@@ -220,6 +231,11 @@ final case class WasmModule(
     // `name` section is ignored and this is an empty map. Surfaces in
     // diagnostic messages as `function <N> (myFunc): ...` when present.
     funcNames: Map[Int, String] = Map.empty,
+    // Exception Handling proposal (legacy form): imported and defined tags.
+    // Tag indices are unified — imports first, then defined — so a `throw N`
+    // immediate and an exported tagidx resolve against the same vector.
+    tagImports: Vector[TagImport] = Vector.empty,
+    tags:       Vector[Tag]       = Vector.empty,
 )
 
 /** All failure modes surfaced by the public API.
@@ -242,3 +258,10 @@ object WasmError:
   final case class UnknownImport(module: String, name: String) extends WasmError
   final case class ExportNotFound(name: String)             extends WasmError
   final case class InvalidModule(message: String)           extends WasmError
+
+  /** Exception Handling proposal: a `throw` reached the top of the call stack
+    * without finding a matching `catch tagidx` / `catch_all`. Carries the
+    * tag's wasm-side index (imports first, then defined) and the payload
+    * values that were on the stack at the throw site, so a host can
+    * pattern-match and re-surface as a host-native exception. */
+  final case class UncaughtException(tagIdx: Int, args: Seq[Value]) extends WasmError

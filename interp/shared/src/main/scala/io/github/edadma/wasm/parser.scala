@@ -96,8 +96,10 @@ object Parser:
     // Section 12 (Data Count). Required by spec for any module that uses
     // `memory.init` / `data.drop`. We capture it on parse; the validator
     // gates those ops on its presence + agreement with `data.length`.
-    var dataCount = Option.empty[Int]
-    var funcNames = Map.empty[Int, String]
+    var dataCount  = Option.empty[Int]
+    var funcNames  = Map.empty[Int, String]
+    var tagImports = Vector.empty[TagImport]
+    var tags       = Vector.empty[Tag]
 
     while c.hasMore do
       val id      = c.readByte()
@@ -108,7 +110,10 @@ object Parser:
       id match
         case 0  => funcNames = parseCustomSection(c, secEnd, funcNames)       // section 0 is "custom" — `name` is one of these
         case 1  => types     = parseTypeSection(c)
-        case 2  => imports   = parseImportSection(c)
+        case 2  =>
+          val (funcImps, tagImps) = parseImportSection(c)
+          imports    = funcImps
+          tagImports = tagImps
         case 3  => functions = parseFunctionSection(c)
         case 4  => tables    = parseTableSection(c)
         case 5  => memories  = parseMemorySection(c)
@@ -119,6 +124,7 @@ object Parser:
         case 10 => codes     = parseCodeSection(c)
         case 11 => data      = parseDataSection(c)
         case 12 => dataCount = Some(c.readU32())                              // Section 12 (Data Count)
+        case 13 => tags      = parseTagSection(c)                             // Section 13 (Tag) — EH proposal
         case _  => () // ignore any future / unknown id
       c.pos = secEnd
 
@@ -135,7 +141,23 @@ object Parser:
           s"DataCount section value $n disagrees with data section size ${data.size}"))
     }
 
-    WasmModule(types, imports, functions, tables, memories, globals, exports, elements, codes, data, start, dataCount, funcNames)
+    WasmModule(
+      types       = types,
+      imports     = imports,
+      functions   = functions,
+      tables      = tables,
+      memories    = memories,
+      globals     = globals,
+      exports     = exports,
+      elements    = elements,
+      codes       = codes,
+      data        = data,
+      startFunction = start,
+      dataCount   = dataCount,
+      funcNames   = funcNames,
+      tagImports  = tagImports,
+      tags        = tags,
+    )
 
   // === Type section ===
 
@@ -179,10 +201,11 @@ object Parser:
 
   // === Import section ===
 
-  private def parseImportSection(c: Cursor): Vector[FuncImport] =
-    val n   = c.readU32()
-    val out = ArrayBuffer.empty[FuncImport]
-    var i   = 0
+  private def parseImportSection(c: Cursor): (Vector[FuncImport], Vector[TagImport]) =
+    val n    = c.readU32()
+    val out  = ArrayBuffer.empty[FuncImport]
+    val tags = ArrayBuffer.empty[TagImport]
+    var i    = 0
     while i < n do
       val mod  = c.readName()
       val name = c.readName()
@@ -204,10 +227,16 @@ object Parser:
         case 0x03 =>                                     // global — skip (Phase 5)
           val _ = c.readByte()                           // valtype
           val _ = c.readByte()                           // mut
+        case 0x04 =>                                     // tag (EH proposal)
+          // Wire shape: attribute byte (must be 0x00 = exception) + typeidx u32.
+          val attr = c.readByte()
+          if attr != 0x00 then
+            fail(WasmError.InvalidModule(s"tag import ${mod}.${name}: unknown attribute 0x${attr.toHexString}"))
+          tags += TagImport(mod, name, c.readU32())
         case other =>
           fail(WasmError.InvalidModule(s"unknown import kind 0x${other.toHexString}"))
       i += 1
-    out.toVector
+    (out.toVector, tags.toVector)
 
   private def skipLimits(c: Cursor): Unit =
     val flag = c.readByte()
@@ -282,6 +311,7 @@ object Parser:
         case 0x01 => out += TableExport(name, idx)
         case 0x02 => out += MemoryExport(name, idx)
         case 0x03 => out += GlobalExport(name, idx)
+        case 0x04 => out += TagExport(name, idx)           // EH proposal
         case other => fail(WasmError.InvalidModule(s"unknown export kind 0x${other.toHexString}"))
       i += 1
     out.toVector
@@ -488,6 +518,22 @@ object Parser:
       if bodyLen < 0 then fail(WasmError.InvalidModule("negative function body length"))
       val raw = c.readBytes(bodyLen)
       FuncBody(locals.toVector, raw)
+    }
+
+  // === Tag section ===
+  //
+  // Exception Handling proposal (legacy form), Section 13. Each tag is one
+  // `attribute` byte (must be 0x00 = exception) followed by a `typeidx` u32
+  // that names a functype in section 1. The validator enforces the
+  // empty-results invariant on the named functype; here we just parse the
+  // wire shape.
+  private def parseTagSection(c: Cursor): Vector[Tag] =
+    val n = c.readU32()
+    Vector.tabulate(n) { _ =>
+      val attr = c.readByte()
+      if attr != 0x00 then
+        fail(WasmError.InvalidModule(s"tag section: unknown attribute 0x${attr.toHexString}"))
+      Tag(c.readU32())
     }
 
   // === Data section ===

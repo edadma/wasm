@@ -119,21 +119,25 @@ object ParserAndRuntimeTests:
         case other => check(false, s"expected InvalidModule(valtype), got $other")
     }
     test("parser: unknown import kind byte returns InvalidModule") {
+      // 0x05 is unassigned — 0x00..0x03 are func/table/memory/global,
+      // 0x04 is the EH proposal's tag-import kind.
       val importContent =
         b(0x01) ++                                          // 1 import
         b(0x03, 'e'.toInt, 'n'.toInt, 'v'.toInt) ++         // module name "env"
         b(0x01, 'x'.toInt) ++                                // import name "x"
-        b(0x04, 0x00)                                        // unknown kind + dummy idx
+        b(0x05, 0x00)                                        // unknown kind + dummy idx
       val bad = Header ++ b(0x02, importContent.length) ++ importContent
       Parser.parse(bad) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("import"), s"message: $msg")
         case other => check(false, s"expected InvalidModule(import kind), got $other")
     }
     test("parser: unknown export kind byte returns InvalidModule") {
+      // 0x05 is unassigned — 0x00..0x03 are func/table/memory/global,
+      // 0x04 is the EH proposal's tag-export kind.
       val exportContent =
         b(0x01) ++                                          // 1 export
         b(0x01, 'x'.toInt) ++                                // name "x"
-        b(0x04, 0x00)                                        // unknown kind + dummy idx
+        b(0x05, 0x00)                                        // unknown kind + dummy idx
       val bad = Header ++ b(0x07, exportContent.length) ++ exportContent
       Parser.parse(bad) match
         case Left(WasmError.InvalidModule(msg)) => check(msg.contains("export"), s"message: $msg")
@@ -271,16 +275,12 @@ object ParserAndRuntimeTests:
     test("interpreter: 0xC5 (unassigned) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xc5), 0xc5, "0xC5 (reserved)")
     }
-    // Retargeted from 0x3F / 0x40 (formerly memory.size / memory.grow,
-    // now supported in Phase 4) to 0x06 and 0x07 — both belong to the
-    // exception-handling proposal (try / catch), which the interpreter
-    // doesn't implement. Same code path through `skipImmediates`'s
-    // default branch.
-    test("interpreter: 0x06 (try, unimplemented) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x06), 0x06, "0x06 (try)")
-    }
-    test("interpreter: 0x07 (catch, unimplemented) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x07), 0x07, "0x07 (catch)")
+    // 0x0A is unassigned in the spec opcode space (sits between `rethrow`
+    // 0x09 and `end` 0x0B). Same code path through `skipImmediates`'s
+    // default branch — was previously checked via 0x06 / 0x07 (try/catch)
+    // before the EH proposal landed.
+    test("interpreter: 0x0A (unassigned) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x0a), 0x0a, "0x0A (unassigned)")
     }
     test("interpreter: completely unused opcode (0xFF) reported as UnknownOpcode") {
       assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0xff), 0xff, "0xFF")

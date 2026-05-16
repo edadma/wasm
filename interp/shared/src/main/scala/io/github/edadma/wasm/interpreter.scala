@@ -64,7 +64,12 @@ object Interpreter:
   // === Per-function pre-computed control-flow metadata =====================
 
   enum BlockKind:
-    case Block, Loop, If
+    case Block, Loop, If, Try
+
+  /** One catch handler within a `try` block (Exception Handling proposal).
+    * `pc` is the byte after the `catch tagidx` opcode + immediate — i.e.
+    * where the handler body starts. */
+  final case class TryHandler(tagIdx: Int, pc: Int)
 
   /** Branch target / fall-through information for one structured block.
     *
@@ -76,6 +81,11 @@ object Interpreter:
     *                    inline blocktypes — only the multi-value typeidx form has > 0)
     *   - `resultArity` = number of values produced at block end / fall-through; carried across
     *                     `br` for Block/If (loops use `paramArity` as the branch arity instead)
+    *   - `catches` = (Try only) ordered list of `(tagidx, handlerPC)` for each `catch` clause.
+    *   - `catchAllPC` = (Try only) byte after `catch_all`, or -1 if absent.
+    *   - `delegateTarget` = (Try only) labelidx if the try ends with `delegate N`, else -1.
+    *     A `delegate`-terminated try has no catch clauses; `endPC` is the byte after the
+    *     `delegate` immediate (delegate replaces the matching `end`).
     */
   final case class BlockInfo(
       kind: BlockKind,
@@ -84,6 +94,9 @@ object Interpreter:
       elsePC: Int,
       paramArity:  Int,
       resultArity: Int,
+      catches:        Vector[TryHandler] = Vector.empty,
+      catchAllPC:     Int                = -1,
+      delegateTarget: Int                = -1,
   )
 
   /** Lookup table keyed by the PC of the `block`/`loop`/`if` opcode itself. */
@@ -159,41 +172,116 @@ object Interpreter:
     * be resolved during pre-scan — the param/result arities are baked into
     * each `BlockInfo` once and the runtime never has to decode them again.
     */
+  /** One entry on the pre-scan's open-block stack. Mutable because `try`
+    * accumulates catch clauses one at a time, and the `If` branch records
+    * its `elsePC` after seeing the matching `else`. */
+  private final class OpenBlock(
+      val opcodePos:    Int,
+      val kind:         BlockKind,
+      val bodyStartPC:  Int,
+      val paramArity:   Int,
+      val resultArity:  Int,
+      var elsePC:       Int                       = -1,
+      val catches:      ArrayBuffer[TryHandler]   = ArrayBuffer.empty,
+      var catchAllPC:   Int                       = -1,
+  )
+
   def computeBodyMeta(body: Array[Byte], types: Vector[FuncType]): Either[WasmError, BodyMeta] =
-    val out = scala.collection.mutable.HashMap.empty[Int, BlockInfo]
-    // Open block stack: (opcodePos, kind, bodyStartPC, paramArity, resultArity, elsePC)
-    val stack = ArrayBuffer.empty[(Int, BlockKind, Int, Int, Int, Int)]
+    val out   = scala.collection.mutable.HashMap.empty[Int, BlockInfo]
+    val stack = ArrayBuffer.empty[OpenBlock]
     var pc    = 0
     try
       while pc < body.length do
         val op = body(pc) & 0xff
         op match
-          case 0x02 | 0x03 | 0x04 =>
+          case 0x02 | 0x03 | 0x04 | 0x06 =>
+            // 0x02 block / 0x03 loop / 0x04 if / 0x06 try — all share the
+            // same blocktype-immediate shape and the same nesting rules.
             val kind = op match
               case 0x02 => BlockKind.Block
               case 0x03 => BlockKind.Loop
-              case _    => BlockKind.If
+              case 0x04 => BlockKind.If
+              case _    => BlockKind.Try
             val startPC = pc
             readBlocktype(body, pc + 1, types) match
               case Left(e) => return Left(e)
               case Right((BlockSig(params, results), afterBT)) =>
-                stack += ((startPC, kind, afterBT, params, results, -1))
+                stack += new OpenBlock(startPC, kind, afterBT, params, results)
                 pc = afterBT
           case 0x05 =>
             // `else` belongs to the topmost open If
             if stack.isEmpty then return Left(WasmError.InvalidModule("`else` outside any block"))
-            val (sPC, kind, sBody, params, results, _) = stack.last
-            if kind != BlockKind.If then
+            val top = stack.last
+            if top.kind != BlockKind.If then
               return Left(WasmError.InvalidModule("`else` matched a non-If block"))
-            stack(stack.size - 1) = (sPC, kind, sBody, params, results, pc + 1)
+            top.elsePC = pc + 1
             pc += 1
+          case 0x07 =>
+            // `catch tagidx` — sub-clause of the topmost open Try.
+            if stack.isEmpty then return Left(WasmError.InvalidModule("`catch` outside any block"))
+            val top = stack.last
+            if top.kind != BlockKind.Try then
+              return Left(WasmError.InvalidModule("`catch` matched a non-Try block"))
+            if top.catchAllPC >= 0 then
+              return Left(WasmError.InvalidModule("`catch` after `catch_all` in same try"))
+            Leb128.readU32(body, pc + 1) match
+              case Left(e) => return Left(e)
+              case Right((tagIdx, np)) =>
+                top.catches += TryHandler(tagIdx, np)
+                pc = np
+          case 0x19 =>
+            // `catch_all` — sub-clause of the topmost open Try, must be last.
+            if stack.isEmpty then return Left(WasmError.InvalidModule("`catch_all` outside any block"))
+            val top = stack.last
+            if top.kind != BlockKind.Try then
+              return Left(WasmError.InvalidModule("`catch_all` matched a non-Try block"))
+            if top.catchAllPC >= 0 then
+              return Left(WasmError.InvalidModule("duplicate `catch_all` in same try"))
+            top.catchAllPC = pc + 1
+            pc += 1
+          case 0x18 =>
+            // `delegate N` — terminator for the topmost open Try. Replaces the
+            // matching `end`. Must come before any catch / catch_all clauses;
+            // EH semantics is that delegate-terminated try has no handlers.
+            if stack.isEmpty then return Left(WasmError.InvalidModule("`delegate` outside any block"))
+            val top = stack.last
+            if top.kind != BlockKind.Try then
+              return Left(WasmError.InvalidModule("`delegate` matched a non-Try block"))
+            if top.catches.nonEmpty || top.catchAllPC >= 0 then
+              return Left(WasmError.InvalidModule("`delegate` mixed with catch clauses in same try"))
+            Leb128.readU32(body, pc + 1) match
+              case Left(e) => return Left(e)
+              case Right((labelIdx, np)) =>
+                val _ = stack.remove(stack.size - 1)
+                out(top.opcodePos) = BlockInfo(
+                  kind           = top.kind,
+                  bodyStartPC    = top.bodyStartPC,
+                  endPC          = np,
+                  elsePC         = top.elsePC,
+                  paramArity     = top.paramArity,
+                  resultArity    = top.resultArity,
+                  catches        = top.catches.toVector,
+                  catchAllPC     = top.catchAllPC,
+                  delegateTarget = labelIdx,
+                )
+                pc = np
           case 0x0b =>
             if stack.isEmpty then
               // outermost end — function body terminator
               pc += 1
             else
-              val (sPC, kind, sBody, params, results, ePC) = stack.remove(stack.size - 1)
-              out(sPC) = BlockInfo(kind, sBody, pc + 1, ePC, params, results)
+              val top = stack.remove(stack.size - 1)
+              out(top.opcodePos) = BlockInfo(
+                kind           = top.kind,
+                bodyStartPC    = top.bodyStartPC,
+                endPC          = pc + 1,
+                elsePC         = top.elsePC,
+                paramArity     = top.paramArity,
+                resultArity    = top.resultArity,
+                catches        = top.catches.toVector,
+                catchAllPC     = top.catchAllPC,
+                delegateTarget = -1,
+              )
               pc += 1
           case other =>
             pc = skipImmediates(body, pc, other) match
@@ -281,7 +369,8 @@ object Interpreter:
       case 0x0c | 0x0d | 0x10 |                            // br, br_if, call
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
            0x23 | 0x24 |                                   // global.{get,set}
-           0x25 | 0x26 =>                                  // table.get, table.set (Phase 8.C)
+           0x25 | 0x26 |                                   // table.get, table.set (Phase 8.C)
+           0x08 | 0x09 =>                                  // throw tagidx, rethrow labelidx (EH)
         Leb128.readU32(body, pc + 1).map(_._2)
       // Phase 8.C: reference-typed ops.
       //   0xD0 ref.null    — single reftype byte (0x70 / 0x6F).
@@ -460,13 +549,32 @@ object Interpreter:
     * loop's params are what's re-fed into the next iteration). `stackHeight`
     * is the value-stack height *below* the block's params — so on entry,
     * the params are above `stackHeight` and a `br` correctly trims past
-    * them before re-pushing the carry. */
+    * them before re-pushing the carry.
+    *
+    * EH proposal: `tryInfo` is non-null when `kind == Try` — it carries the
+    * catch / catch_all / delegate metadata so a throw can scan the right
+    * handler set. `caught` is non-null while the label is the active catch
+    * handler (i.e. we entered via `throw`-unwind, not normal fall-through);
+    * `rethrow N` reads it back to re-raise the same exception. */
   private[wasm] final case class Label(
       kind: BlockKind,
       targetPC: Int,
       branchArity: Int,
       stackHeight: Int,
+      tryInfo: BlockInfo       = null,
+      caught:  WasmException   = null,
   )
+
+  /** An in-flight wasm exception. `tagIdx` is the unified tagidx (imports
+    * first, then defs). `args` is the payload — the tag's typed params,
+    * captured in order, top-of-stack at throw site = last in `args`. */
+  private[wasm] final case class WasmException(tagIdx: Int, args: Array[Value])
+
+  /** Thrown by `0x08 throw tagidx`; caught at the per-step boundary in
+    * `invoke` so the exception walks the frame/label stacks to find the
+    * matching catch handler. Never escapes the interpreter. */
+  private[wasm] final class ThrowFail(val exc: WasmException)
+      extends RuntimeException(null, null, false, false)
 
 end Interpreter
 
@@ -509,6 +617,12 @@ final class Interpreter private[wasm] (
     private val dataDropped: Array[Boolean],
     private val elemRefs:    Array[Vector[Value]],
     private val elemDropped: Array[Boolean],
+    /** EH proposal: payload param-types per tag (imports first, then defs).
+      * The interpreter only needs the arity (how many values to pop on
+      * `throw tagidx`), but we keep the full vector so future host-bridge
+      * surfaces can re-type the payload. Empty array if the module has no
+      * tags. */
+    private val tagParams: Array[Vector[ValueType]] = Array.empty,
 ) extends SimdDispatch:
   import Interpreter.*
 
@@ -538,7 +652,13 @@ final class Interpreter private[wasm] (
       // the top-level entry and intra-module `call` instructions.
       args.foreach(valueStack += _)
       callFunction(funcIdx)
-      while frames.nonEmpty do step()
+      while frames.nonEmpty do
+        try step()
+        catch case t: ThrowFail =>
+          if !deliverException(t.exc) then
+            valueStack.clear()
+            frames.clear()
+            return Left(WasmError.UncaughtException(t.exc.tagIdx, t.exc.args.toSeq))
       val resultArity = funcs(funcIdx).signature.results.size
       val results     = valueStack.takeRight(resultArity).toSeq
       // Drain whatever's left so a reused interpreter would start clean (defensive).
@@ -547,6 +667,66 @@ final class Interpreter private[wasm] (
     catch
       case e: ExecFail                       => Left(e.err)
       case _: ArrayIndexOutOfBoundsException => Left(WasmError.InvalidModule("VM ran off end of body"))
+
+  /** Walk frame/label stacks to find a matching `catch tagidx` or `catch_all`
+    * for `exc`. On match: trim the operand stack to the try label's base
+    * height, push the exception payload, replace the try label with a
+    * "caught" marker (so `rethrow N` can find it), and set the frame's PC
+    * to the handler. Returns true on delivery, false if no handler was
+    * found anywhere in the call stack (in which case the caller surfaces
+    * `UncaughtException`). */
+  private def deliverException(exc: WasmException): Boolean =
+    var skipLabels = 0
+    while frames.nonEmpty do
+      val f = frames.last
+      while f.labels.nonEmpty do
+        if skipLabels > 0 then
+          val _ = f.labels.remove(f.labels.size - 1)
+          skipLabels -= 1
+        else
+          val lbl = f.labels.last
+          // An active-catch label (one whose `caught` field is set because
+          // we already entered its handler via a previous throw delivery)
+          // must NOT be considered as a handler again — otherwise a fresh
+          // throw or a `rethrow N` inside the catch body would loop back
+          // onto the same handler. Pop it and continue searching outward.
+          if lbl.kind == BlockKind.Try && lbl.tryInfo != null && lbl.caught == null then
+            val info    = lbl.tryInfo
+            val handler = info.catches.find(_.tagIdx == exc.tagIdx)
+            if handler.isDefined then
+              while valueStack.size > lbl.stackHeight do
+                val _ = valueStack.remove(valueStack.size - 1)
+              var k = 0
+              while k < exc.args.length do { valueStack += exc.args(k); k += 1 }
+              f.pc = handler.get.pc
+              f.labels(f.labels.size - 1) = lbl.copy(caught = exc)
+              return true
+            else if info.catchAllPC >= 0 then
+              while valueStack.size > lbl.stackHeight do
+                val _ = valueStack.remove(valueStack.size - 1)
+              f.pc = info.catchAllPC
+              f.labels(f.labels.size - 1) = lbl.copy(caught = exc)
+              return true
+            else if info.delegateTarget >= 0 then
+              // Try-delegate: pop this try and skip `delegateTarget` more
+              // labels before resuming the search. If the delegate's target
+              // is the enclosing function frame, skipLabels will exhaust
+              // f.labels and we'll fall out into the frame-pop path below.
+              val _ = f.labels.remove(f.labels.size - 1)
+              skipLabels = info.delegateTarget
+            else
+              // Try with no catches and no delegate — a plain block-shaped try.
+              val _ = f.labels.remove(f.labels.size - 1)
+          else
+            val _ = f.labels.remove(f.labels.size - 1)
+      // Inner loop drained this frame's labels without a hit (skipLabels may
+      // still be > 0; either way the throw escapes this frame). Trim the
+      // value stack to the frame's base and pop the frame.
+      skipLabels = 0
+      while valueStack.size > f.stackBase do
+        val _ = valueStack.remove(valueStack.size - 1)
+      val _ = frames.remove(frames.size - 1)
+    false
 
   // --- helpers -------------------------------------------------------------
 
@@ -617,7 +797,7 @@ final class Interpreter private[wasm] (
       case 0x00 => fail(WasmError.UnreachableExecuted)
       case 0x01 => f.pc += 1                                                              // nop
 
-      case 0x02 | 0x03 | 0x04 =>
+      case 0x02 | 0x03 | 0x04 | 0x06 =>
         val startPC = f.pc
         val info    = f.func.meta.blocks.getOrElse(startPC, fail(WasmError.InvalidModule(s"no block meta at PC $startPC")))
         // `baseHeight` is the value-stack height below the block's params.
@@ -632,7 +812,7 @@ final class Interpreter private[wasm] (
           case 0x03 => // loop — branch target is body start; carry params on br
             f.labels += Label(BlockKind.Loop, info.bodyStartPC, info.paramArity, baseHeight)
             f.pc = info.bodyStartPC
-          case _    => // if
+          case 0x04 => // if
             val cond = popI32()
             // The if's condition was popped above, so `baseHeight` computed
             // before that pop is now stale by 1 — but we recompute against
@@ -650,6 +830,48 @@ final class Interpreter private[wasm] (
               f.pc = info.elsePC
             else
               f.pc = info.endPC
+          case _    => // try — branch target is after end (block-like); carries info for throw walks.
+            f.labels += Label(BlockKind.Try, info.endPC, info.resultArity, baseHeight, tryInfo = info)
+            f.pc = info.bodyStartPC
+
+      case 0x07 | 0x19 | 0x18 =>
+        // Normal-path arrival at `catch tagidx` / `catch_all` / `delegate N`.
+        // The try body just fell through without throwing; the handler
+        // clauses are dead code along this path, so we treat all three as
+        // an "end" — pop the label, jump to the try's endPC. (A throw that
+        // *did* land in a handler arrives via `deliverException` instead,
+        // which sets `pc` directly to the handler body and never executes
+        // the catch/catch_all/delegate opcode itself.)
+        if f.labels.isEmpty then fail(WasmError.InvalidModule("catch/catch_all/delegate without matching try"))
+        val lbl = f.labels.remove(f.labels.size - 1)
+        if lbl.kind != BlockKind.Try then
+          fail(WasmError.InvalidModule(s"catch/catch_all/delegate matched a non-Try label: ${lbl.kind}"))
+        f.pc = lbl.targetPC
+
+      case 0x08 =>                                                                        // throw tagidx
+        val (tagIdx, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        if tagIdx < 0 || tagIdx >= tagParams.length then
+          fail(WasmError.InvalidModule(s"throw: tag index $tagIdx out of range (have ${tagParams.length} tags)"))
+        val arity   = tagParams(tagIdx).length
+        val payload = new Array[Value](arity)
+        // Pop args off the stack in reverse (top = last argument).
+        var k = arity - 1
+        while k >= 0 do
+          if valueStack.isEmpty then fail(WasmError.TypeMismatch)
+          payload(k) = valueStack.remove(valueStack.size - 1)
+          k -= 1
+        throw new ThrowFail(WasmException(tagIdx, payload))
+
+      case 0x09 =>                                                                        // rethrow labelidx
+        val (labelIdx, p) = readU32At(f, f.pc + 1)
+        f.pc = p
+        if labelIdx < 0 || labelIdx >= f.labels.size then
+          fail(WasmError.InvalidModule(s"rethrow: label index $labelIdx out of range (have ${f.labels.size} labels)"))
+        val target = f.labels(f.labels.size - 1 - labelIdx)
+        if target.caught == null then
+          fail(WasmError.InvalidModule(s"rethrow: label $labelIdx is not an active catch handler"))
+        throw new ThrowFail(target.caught)
 
       case 0x05 =>
         // We reached `else` by falling through the true-branch — the if-label

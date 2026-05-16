@@ -42,9 +42,11 @@ Enough to run real `wasm32-wasip1` binaries produced by rustc end-to-end. Three 
 
 **Validation pass:** every imported module runs through a separate validator before any code executes — abstract operand-stack tracking, control-frame depth, opcode-by-opcode signature check. Bad binaries fail at `Runtime.instantiate` with `InvalidModule("function <N>: byte offset 0x<hex>: <details>")` rather than at run time.
 
-Binary sections recognised: Type (1), Import (2), Function (3), Table (4), Memory (5), Global (6), Export (7), Start (8), Element (9), Code (10), Data (11). LEB128 (signed and unsigned, up to 64 bits) is implemented from scratch.
+Binary sections recognised: Type (1), Import (2), Function (3), Table (4), Memory (5), Global (6), Export (7), Start (8), Element (9), Code (10), Data (11), DataCount (12), Tag (13). LEB128 (signed and unsigned, up to 64 bits) is implemented from scratch.
 
-**Not yet implemented (Phase 8+):** bulk-memory remainder (`memory.init`, `data.drop`, `table.copy`, `table.init`, `elem.drop`); non-trapping float-to-int (`trunc_sat_*`); reference types (`externref`, `ref.is_null`, `ref.func`); SIMD; threads/atomics; exception handling; GC proposal; multi-memory; component model. Each is independently scoped and can be added without touching the others.
+**Exception handling** — the legacy ("phase 3") proposal: `try` / `catch tagidx` / `catch_all` / `throw` / `rethrow` / `delegate` plus Section 13 (Tag) and the `0x04` tag import/export kind. An uncaught throw surfaces as `Left(WasmError.UncaughtException(tagIdx, args))` so a host can pattern-match and re-throw natively.
+
+**Not yet implemented (Phase 9+):** threads/atomics; GC proposal; component model. Each is independently scoped.
 
 ## WASI Preview 1
 
@@ -228,7 +230,7 @@ examples/
 The interpreter has no test framework — tests are `@main`-style objects with a hand-rolled PASS/FAIL runner. The same code runs on all three backends:
 
 ```bash
-sbt 'interpJVM/Test/run'    # 527 interpreter tests
+sbt 'interpJVM/Test/run'    # 542 interpreter tests
 sbt 'interpJS/Test/run'
 sbt 'interpNative/Test/run'
 
@@ -239,7 +241,7 @@ sbt 'wasiNative/Test/run'
 sbt 'cliJVM/Test/run'       # 14 CLI tests (JVM-only)
 ```
 
-Total: **749 tests** on JVM (527 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
+Total: **764 tests** on JVM (542 interp + 208 wasi + 14 cli) — all three backends green for `interp` and `wasi`. Three of those are end-to-end integration tests against real rustc-built `wasm32-wasip1` binaries.
 
 ## Regenerating fixtures
 

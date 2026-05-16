@@ -2,7 +2,7 @@
 title: wasm
 heroTitle: A Scala 3
 heroHighlight: WebAssembly interpreter
-summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select), multi-memory (with a multi-memory host-function surface), and the complete SIMD proposal — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
+summary: Every WebAssembly Core opcode plus sign-extension, full bulk-memory, non-trapping float-to-int, reference types (including typed select), multi-memory (with a multi-memory host-function surface), the complete SIMD proposal, and the legacy exception-handling proposal (try / catch / throw / rethrow / delegate) — runs real rustc-built wasm32-wasip1 binaries end-to-end through a 29-syscall WASI Preview 1 shim. Zero runtime dependencies across JVM, Scala.js, and Scala Native.
 ---
 
 ## What it is
@@ -27,7 +27,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 
 ## Why this one?
 
-- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.1.1` / `wasm-wasi:0.1.1`) without dragging in a third-party transitive surface.
+- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.2.0` / `wasm-wasi:0.2.0`) without dragging in a third-party transitive surface.
 - **One codebase, three platforms.** JVM, Scala.js, and Scala Native all share the same `shared/` interpreter and WASI shim. Platform-specific code is limited to the `HostPreopen.fromDir` implementation (`java.nio.file` on JVM/Native, `fs.*Sync` on JS).
 - **Deterministic numerics.** Every `i32` / `i64` / `f32` / `f64` opcode produces bit-identical results across all three platforms, including IEEE-754 edge cases.
 - **Validation up front.** Every imported module runs through a separate validator before any code executes. Bad binaries fail at `Runtime.instantiate` with a `function <N>: byte offset 0x<hex>: <details>` error, not at run time.
@@ -41,7 +41,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**687 tests** on the JVM (521 interpreter + 157 WASI + 9 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
+**764 tests** on the JVM (542 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native.
 
 ## Try it
 
