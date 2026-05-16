@@ -43,6 +43,10 @@ Where `trunc_f32_s` of NaN or out-of-range traps, `trunc_sat_f32_s` returns 0 fo
 
 Multi-value blocks, loops, and ifs are supported — block parameters get re-fed on `br` to a loop, `br_if` carries multi-result values, etc.
 
+## Tail calls
+
+The tail-call proposal is supported: `return_call funcidx` (`0x12`) and `return_call_indirect typeidx tableidx` (`0x13`) replace the current call frame instead of growing the call stack. The callee's `results` must equal the current function's `results` — the validator enforces this. Frame-reuse is observable: deeply recursive tail calls (the test suite exercises 100k iterations) run in constant `frames` memory.
+
 ## Exception handling
 
 Both forms of the exception-handling proposal are supported end-to-end — the **legacy "phase 3"** form (`try` / `catch` / `catch_all` / `delegate` / `rethrow`, what wasmtime + V8 + SpiderMonkey + `wat2wasm`'s `--enable-exceptions` emit today) **and** the **modern `try_table`** form (`0x1F` plus an `exnref` value type and `throw_ref`, the phase-4 redesign that's standardising now).

@@ -474,7 +474,8 @@ object Interpreter:
            0x20 | 0x21 | 0x22 |                            // local.{get,set,tee}
            0x23 | 0x24 |                                   // global.{get,set}
            0x25 | 0x26 |                                   // table.get, table.set (Phase 8.C)
-           0x08 | 0x09 =>                                  // throw tagidx, rethrow labelidx (EH)
+           0x08 | 0x09 |                                   // throw tagidx, rethrow labelidx (EH)
+           0x12 =>                                         // return_call funcidx (tail-call proposal)
         Leb128.readU32(body, pc + 1).map(_._2)
       // Phase 8.C: reference-typed ops.
       //   0xD0 ref.null    — single reftype byte (0x70 / 0x6F).
@@ -507,7 +508,7 @@ object Interpreter:
                 i += 1
               if er != null then Left(er)
               else Leb128.readU32(body, p).map(_._2)            // default labelidx
-      case 0x11 =>                                         // call_indirect — typeidx, tableidx
+      case 0x11 | 0x13 =>                                  // call_indirect / return_call_indirect — typeidx, tableidx
         for
           (_, p1) <- Leb128.readU32(body, pc + 1)
           (_, p2) <- Leb128.readU32(body, p1)
@@ -1084,6 +1085,37 @@ final class Interpreter private[wasm] (
         val (idx, p) = readU32At(f, f.pc + 1)
         f.pc = p
         callFunction(idx)
+
+      case 0x12 =>                                                                        // return_call funcidx (tail-call)
+        val (idx, _) = readU32At(f, f.pc + 1)
+        if idx < 0 || idx >= funcs.length then
+          fail(WasmError.InvalidModule(s"return_call: invalid function index $idx"))
+        // No need to update f.pc — the caller frame is about to be popped.
+        tailCallFunction(idx)
+
+      case 0x13 =>                                                                        // return_call_indirect typeidx tableidx
+        val (typeIdx, p1)  = readU32At(f, f.pc + 1)
+        val (tableIdx, _)  = readU32At(f, p1)
+        if typeIdx < 0 || typeIdx >= types.length then
+          fail(WasmError.InvalidModule(s"return_call_indirect: invalid type index $typeIdx"))
+        if tableIdx < 0 || tableIdx >= tables.length then
+          fail(WasmError.InvalidModule(s"return_call_indirect: invalid table index $tableIdx"))
+        val tab  = tables(tableIdx)
+        val slot = popI32()
+        if slot < 0 || slot >= tab.size then
+          fail(WasmError.InvalidModule(s"return_call_indirect: index $slot out of table bounds (size ${tab.size})"))
+        tab.slots(slot) match
+          case RefFunc(fi) =>
+            val expected = types(typeIdx)
+            val actual   = funcs(fi).signature
+            if expected != actual then
+              fail(WasmError.InvalidModule(
+                s"return_call_indirect: signature mismatch at index $slot (expected $expected, got $actual)"))
+            tailCallFunction(fi)
+          case RefNull(_) =>
+            fail(WasmError.InvalidModule(s"return_call_indirect: null funcref at index $slot"))
+          case _ =>
+            fail(WasmError.InvalidModule(s"return_call_indirect: non-funcref slot at index $slot"))
 
       case 0x11 =>                                                                        // call_indirect typeidx tableidx
         // Two LEB u32 immediates: the declared function type and the table
@@ -2243,6 +2275,41 @@ final class Interpreter private[wasm] (
             case ValueType.ExnRefType    => RefNull(RefType.ExnRef)
           j += 1
         frames += new Frame(wf, locals, stackBase = valueStack.size)
+
+  /** Tail-call dispatch — implements `return_call` / `return_call_indirect`
+    * from the tail-call proposal. The callee replaces the current frame on
+    * the call stack: its results become the current function's return
+    * values (the validator already enforced matching result arities).
+    *
+    * Sequence:
+    *   1. Pop the callee's args off the operand stack into a temp.
+    *   2. Pop the current frame from `frames`.
+    *   3. Trim the operand stack to the popped frame's `stackBase` — any
+    *      values the caller had pending above the args are dead (the
+    *      validator marked the tail-call site unreachable, so this is a
+    *      defensive cleanup more than a strict need).
+    *   4. Push the args back onto the operand stack.
+    *   5. Dispatch into `callFunction(funcIdx)` — it'll pop the args back
+    *      into locals and either run a host function in-place or push a
+    *      fresh frame at the same `stackBase` the caller occupied.
+    *
+    * Frame-reuse is semantic, not literal — the JVM stack isn't the wasm
+    * call stack — but the observable effect (no unbounded growth on
+    * recursive tail calls) is preserved.
+    */
+  private def tailCallFunction(funcIdx: Int): Unit =
+    val sig = funcs(funcIdx).signature
+    val n   = sig.params.size
+    if valueStack.size < n then fail(WasmError.TypeMismatch)
+    val args = new Array[Value](n)
+    var k    = n - 1
+    while k >= 0 do { args(k) = valueStack.remove(valueStack.size - 1); k -= 1 }
+    val caller = frames.remove(frames.size - 1)
+    while valueStack.size > caller.stackBase do
+      val _ = valueStack.remove(valueStack.size - 1)
+    var j = 0
+    while j < n do { valueStack += args(j); j += 1 }
+    callFunction(funcIdx)
 
   // === memory access ======================================================
   //

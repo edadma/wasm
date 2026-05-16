@@ -261,12 +261,12 @@ object ParserAndRuntimeTests:
           check(b == opcode, s"$label: expected opcode 0x${opcode.toHexString}, got 0x${b.toHexString}")
         case other => check(false, s"$label: expected UnknownOpcode(0x${opcode.toHexString}), got $other")
 
-    // Retargeted from 0x11 (formerly call_indirect, now supported in Phase 3)
-    // to 0x12 — a reserved byte immediately after call_indirect with no
-    // spec-assigned meaning. Same code path through `skipImmediates`'s
-    // default branch.
-    test("interpreter: 0x12 (reserved, post-call_indirect) reported as UnknownOpcode") {
-      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x12), 0x12, "0x12 (reserved)")
+    // Retargeted from 0x12 (now `return_call` in the tail-call proposal)
+    // to 0x14 — still unassigned (between `return_call_indirect` 0x13 and
+    // the function-references proposal's `call_ref` family at 0x15+).
+    // Same code path through `skipImmediates`'s default branch.
+    test("interpreter: 0x14 (unassigned) reported as UnknownOpcode") {
+      assertUnknownOpcode(patchFirst(Fixtures.arith, 0x41, 0x14), 0x14, "0x14 (unassigned)")
     }
     // Retargeted from 0xC4 (now i64.extend32_s in the sign-extension proposal,
     // Phase 7.D) to 0xC5 — also reserved, no spec-assigned meaning, and not

@@ -63,6 +63,7 @@ object InterpreterTest:
     NameSectionTests.run()
     ExceptionHandlingTests.run()
     TryTableTests.run()
+    TailCallTests.run()
 
     println()
     val total = TestSupport.passed + TestSupport.failures.size

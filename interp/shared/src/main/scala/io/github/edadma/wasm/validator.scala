@@ -686,6 +686,33 @@ object Validator:
         popVal(ValueType.I32Type)                                               // slot index
         popVals(sig.params)
         pushVals(sig.results)
+      case 0x12 =>                                                              // return_call funcidx
+        // Tail-call proposal: the callee replaces the current frame. Its
+        // results become the current function's return values, so the
+        // callee's `results` must exactly match `funcResults`.
+        val idx = readU32()
+        if idx < 0 || idx >= funcSigs.length then
+          fail(s"return_call: function index $idx out of range (have ${funcSigs.length})")
+        val sig = funcSigs(idx)
+        if sig.results != funcResults then
+          fail(s"return_call: callee results ${sig.results.map(typeName).mkString("[", ",", "]")} must equal current function's results ${funcResults.map(typeName).mkString("[", ",", "]")}")
+        popVals(sig.params)
+        unreachable()
+      case 0x13 =>                                                              // return_call_indirect typeidx tableidx
+        val typeIdx  = readU32()
+        val tableIdx = readU32()
+        if typeIdx < 0 || typeIdx >= types.length then
+          fail(s"return_call_indirect: type index $typeIdx out of range")
+        if tableIdx < 0 || tableIdx >= tableCount then
+          fail(s"return_call_indirect: table index $tableIdx out of range (have $tableCount tables)")
+        if tableRefTypes(tableIdx) != RefType.FuncRef then
+          fail(s"return_call_indirect: table $tableIdx is externref (must be funcref)")
+        val sig = types(typeIdx)
+        if sig.results != funcResults then
+          fail(s"return_call_indirect: callee results ${sig.results.map(typeName).mkString("[", ",", "]")} must equal current function's results ${funcResults.map(typeName).mkString("[", ",", "]")}")
+        popVal(ValueType.I32Type)                                               // slot index
+        popVals(sig.params)
+        unreachable()
 
       // === parametric ==================================================
 
