@@ -28,7 +28,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 
 ## Why this one?
 
-- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.3.0` / `wasm-wasi:0.3.0`) without dragging in a third-party transitive surface.
+- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.4.0` / `wasm-wasi:0.4.0`) without dragging in a third-party transitive surface.
 - **One codebase, three platforms.** JVM, Scala.js, and Scala Native all share the same `shared/` interpreter and WASI shim. Platform-specific code is limited to the `HostPreopen.fromDir` implementation (`java.nio.file` on JVM/Native, `fs.*Sync` on JS).
 - **Deterministic numerics.** Every `i32` / `i64` / `f32` / `f64` opcode produces bit-identical results across all three platforms, including IEEE-754 edge cases.
 - **Validation up front.** Every imported module runs through a separate validator before any code executes. Bad binaries fail at `Runtime.instantiate` with a `function <N>: byte offset 0x<hex>: <details>` error, not at run time.

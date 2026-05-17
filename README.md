@@ -17,8 +17,8 @@ Full reference at **<https://edadma.github.io/wasm/>** — installation, quickst
 
 ```scala
 libraryDependencies ++= Seq(
-  "io.github.edadma" %%% "wasm"      % "0.3.0",
-  "io.github.edadma" %%% "wasm-wasi" % "0.3.0",  // optional — only if you want the WASI shim
+  "io.github.edadma" %%% "wasm"      % "0.4.0",
+  "io.github.edadma" %%% "wasm-wasi" % "0.4.0",  // optional — only if you want the WASI shim
 )
 ```
 

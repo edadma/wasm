@@ -1,6 +1,6 @@
 ---
 title: Installation
-summary: Add `io.github.edadma:wasm:0.3.0` (and optionally `wasm-wasi`) to your sbt build, or work from a local checkout for development.
+summary: Add `io.github.edadma:wasm:0.4.0` (and optionally `wasm-wasi`) to your sbt build, or work from a local checkout for development.
 weight: 10
 ---
 
@@ -10,8 +10,8 @@ Released artifacts (Scala 3, cross-built on JVM / Scala.js / Scala Native):
 
 ```scala
 libraryDependencies ++= Seq(
-  "io.github.edadma" %%% "wasm"      % "0.3.0",
-  "io.github.edadma" %%% "wasm-wasi" % "0.3.0",  // optional — only if you want the WASI shim
+  "io.github.edadma" %%% "wasm"      % "0.4.0",
+  "io.github.edadma" %%% "wasm-wasi" % "0.4.0",  // optional — only if you want the WASI shim
 )
 ```
 
@@ -19,8 +19,8 @@ libraryDependencies ++= Seq(
 
 | Coordinate                                | What you get                                              |
 |-------------------------------------------|-----------------------------------------------------------|
-| `io.github.edadma:wasm:0.3.0`             | The interpreter — `Runtime.instantiate`, `ModuleInstance`. |
-| `io.github.edadma:wasm-wasi:0.3.0`        | The WASI Preview 1 host shim — depends on `wasm`.         |
+| `io.github.edadma:wasm:0.4.0`             | The interpreter — `Runtime.instantiate`, `ModuleInstance`. |
+| `io.github.edadma:wasm-wasi:0.4.0`        | The WASI Preview 1 host shim — depends on `wasm`.         |
 
 The `wasm` artifact has zero external runtime dependencies; the `wasm-wasi` artifact depends only on `wasm`.
 

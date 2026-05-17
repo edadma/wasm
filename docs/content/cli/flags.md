@@ -118,7 +118,7 @@ Exit code is 0 if the binary parses and the validator accepts every function bod
 
 ## `--help` / `--version`
 
-Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.3.0` and exits.
+Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.4.0` and exits.
 
 ## Dispatch rules
 
