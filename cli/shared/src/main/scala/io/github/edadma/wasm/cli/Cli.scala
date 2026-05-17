@@ -60,6 +60,17 @@ object Cli:
       listExports:  Boolean                 = false,
       preopens:     Seq[(String, String)]   = Nil,
       envs:         Seq[(String, String)]   = Nil,
+      /** When set, install a `Tracer.Counting` and print the totals to
+        * stderr after the run. */
+      trace:        Boolean                 = false,
+      /** When set, parse + validate the module and exit without running
+        * any code. Exits 0 if the binary parses and validates, exits 1
+        * with the diagnostic otherwise. Useful for CI lint of generated
+        * wasm without paying the start-function cost. */
+      validateOnly: Boolean                 = false,
+      /** Path to a file whose contents the program sees on fd 0. When
+        * `None`, fd 0 reads return 0 (EOF). */
+      stdinFile:    Option[String]          = None,
   )
 
   private val builder = OParser.builder[Config]
@@ -127,6 +138,16 @@ object Cli:
           c.copy(envs = c.envs :+ ((s.take(i), s.drop(i + 1))))
         }
         .text("environment variable for the WASI program (repeatable)"),
+      opt[Unit]("trace")
+        .action((_, c) => c.copy(trace = true))
+        .text("install a counting Tracer; print opcode/call/throw/trap totals to stderr after the run"),
+      opt[Unit]("validate-only")
+        .action((_, c) => c.copy(validateOnly = true))
+        .text("parse + validate the module and exit; don't instantiate or run code"),
+      opt[String]("stdin")
+        .valueName("<path>")
+        .action((p, c) => c.copy(stdinFile = Some(p)))
+        .text("redirect fd 0 from <path>; if omitted, fd 0 reads return EOF"),
       help("help").text("print this help message"),
       version("version").text("print version and exit"),
     )
@@ -144,6 +165,21 @@ object Cli:
       catch case e: Throwable =>
         System.err.println(s"failed to read ${cfg.file}: ${e.getMessage}")
         platform.exit(1)
+
+    // --validate-only short-circuits before any instantiation. Useful as
+    // a CI lint step on generated wasm without paying the start-function
+    // cost or having to mock out host imports.
+    if cfg.validateOnly then
+      (for
+        m <- Parser.parse(bytes)
+        _ <- Validator.validate(m)
+      yield ()) match
+        case Right(_) =>
+          System.err.println(s"${cfg.file}: ok")
+          platform.exit(0)
+        case Left(err) =>
+          System.err.println(s"${cfg.file}: $err")
+          platform.exit(1)
 
     // Open each --preopen up front so a bad host path fails BEFORE we
     // start instantiating the module. The factory throws
@@ -169,9 +205,19 @@ object Cli:
     // argv[1..]. Non-WASI modules never read this — `args_get` /
     // `args_sizes_get` are only called by WASI programs.
     val argv0 = basenameWithoutWasmSuffix(cfg.file)
+    val stdinReader: (Array[Byte], Int, Int) => Int = cfg.stdinFile match
+      case None => WasiContext.defaultStdin
+      case Some(path) =>
+        val payload =
+          try platform.readFile(path)
+          catch case e: Throwable =>
+            System.err.println(s"--stdin $path failed: ${e.getMessage}")
+            platform.exit(1)
+        WasiContext.stdinFromBytes(payload)
     val ctx = WasiContext.default.copy(
       args     = Seq(argv0) ++ cfg.wasiArgs,
       envs     = cfg.envs,
+      stdin    = stdinReader,
       preopens = preopens,
     )
     val hostModules = Seq(EnvModule.default, Wasi.preview1(ctx))
@@ -201,18 +247,30 @@ object Cli:
     *     fall back to `main` with the supplied `--args`.
     */
   private def dispatch(inst: ModuleInstance, cfg: Config, platform: Platform): Unit =
+    val tracer = if cfg.trace then new Tracer.Counting else Tracer.NoOp
     cfg.invoke match
-      case Some(name) => invokeNamed(inst, name, cfg.args, platform)
+      case Some(name) => invokeNamed(inst, name, cfg.args, tracer, platform)
       case None       =>
         if inst.exportedFunctionNames.contains("_start") then
-          runWasiStart(inst, platform)
+          runWasiStart(inst, tracer, platform)
         else
-          invokeNamed(inst, "main", cfg.args, platform)
+          invokeNamed(inst, "main", cfg.args, tracer, platform)
+
+  /** Print a `Tracer.Counting` summary to stderr after a run. No-op when
+    * the user didn't pass `--trace`. */
+  private def reportTrace(tracer: Tracer): Unit = tracer match
+    case c: Tracer.Counting =>
+      System.err.println(s"[trace] ops=${c.ops} calls=${c.calls} " +
+        s"hostCalls=${c.hostCalls} throws=${c.throws} traps=${c.traps} " +
+        s"maxDepth=${c.maxDepth}")
+    case _ => ()
 
   /** WASI command-mode entry. `proc_exit(N)` becomes the process exit
     * code; a clean return is exit 0; an interpreter error is exit 1. */
-  private def runWasiStart(inst: ModuleInstance, platform: Platform): Unit =
-    Wasi.run(inst, "_start") match
+  private def runWasiStart(inst: ModuleInstance, tracer: Tracer, platform: Platform): Unit =
+    val result = Wasi.run(inst, "_start", tracer)
+    reportTrace(tracer)
+    result match
       case Right(code) => platform.exit(code)
       case Left(err)   =>
         System.err.println(s"runtime error in _start: $err")
@@ -221,9 +279,11 @@ object Cli:
   /** Explicit-export entry. Prints any returned values; a void export is
     * exit 0 with no output; an interpreter error is exit 1. */
   private def invokeNamed(inst: ModuleInstance, name: String, args: Seq[Int],
-                          platform: Platform): Unit =
+                          tracer: Tracer, platform: Platform): Unit =
     val argVals = args.map(I32(_))
-    inst.invoke(name, argVals) match
+    val result  = inst.invoke(name, argVals, tracer)
+    reportTrace(tracer)
+    result match
       case Left(err)      =>
         System.err.println(s"runtime error in $name: $err")
         platform.exit(1)

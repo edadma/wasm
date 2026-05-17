@@ -27,7 +27,7 @@ htmlDir         = ""
 [juicerdocs]
 # Hero version pill — matches `ThisBuild / version` in build.sbt.
 # Bump when cutting a new release.
-version         = "v0.3.0"
+version         = "v0.4.0"
 
 # Renders the "Get started" CTA in the landing-page hero, linking to
 # /getting-started/. Without this flag the juicerdocs template skips

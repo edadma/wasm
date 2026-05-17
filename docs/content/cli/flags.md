@@ -75,9 +75,50 @@ sbt 'cliJVM/run -p /tmp/sandbox:/sandbox -p /var/log:/logs my-program.wasm'
 
 If a `--preopen`'s host path doesn't exist or isn't a directory, the CLI exits with an error before instantiating the module.
 
+## `--stdin <path>`
+
+Redirects the guest's fd 0 (stdin) to read from a host file. The file is read once at startup and streamed byte-for-byte through `fd_read` until exhausted (subsequent reads return 0 = EOF).
+
+```bash
+echo "hello" > /tmp/in.txt
+sbt 'cliJVM/run --stdin /tmp/in.txt examples/wc.wasm'
+```
+
+When omitted, fd 0 reads return 0 (EOF) immediately — wasi programs that probe stdin without writing prerequisites still terminate cleanly. A non-existent `--stdin` path is rejected with a clear diagnostic before instantiation.
+
+Non-WASI modules never call `fd_read`, so this flag is inert for them.
+
+## `--trace`
+
+Installs a counting [`Tracer`](/concepts/tracer/) on the run and prints the totals to stderr after `_start` / `main` / `--invoke` returns:
+
+```bash
+$ sbt 'cliJVM/run --trace examples/hello.wasm'
+Hello, world!
+[trace] ops=53 calls=2 hostCalls=14 throws=0 traps=0 maxDepth=2
+```
+
+Counts are: opcode dispatches (`ops`), wasm-defined function calls (`calls`), host-function calls (`hostCalls`), `throw` opcodes (`throws`), traps surfaced as `WasmError` (`traps`), and the maximum wasm-frame depth observed at any point.
+
+Use this for quick performance / instrumentation triage. For finer-grained tracing (per-block, per-branch), write your own `Tracer` implementation and wire it through the library API — the CLI's `--trace` deliberately picks the minimal default.
+
+## `--validate-only`
+
+Parse and validate the module, then exit. No instantiation, no start function, no host imports needed. Useful as a CI lint step on generated wasm:
+
+```bash
+$ wasm-cli --validate-only build/output.wasm
+build/output.wasm: ok
+
+$ wasm-cli --validate-only build/broken.wasm
+build/broken.wasm: InvalidModule(function 0: byte offset 0x12: expected i32, got i64)
+```
+
+Exit code is 0 if the binary parses and the validator accepts every function body; 1 with the diagnostic otherwise. Any other CLI flags (`--preopen`, `--invoke`, etc.) are ignored when `--validate-only` is set.
+
 ## `--help` / `--version`
 
-Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.3.0` and exits.
+Standard. `--help` prints the synopsis above; `--version` prints `wasm 0.4.0` and exits.
 
 ## Dispatch rules
 

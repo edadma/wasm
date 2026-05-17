@@ -38,6 +38,33 @@ final class ModuleInstance:
   /** Resolve an exported memory by name. For single-memory modules
     * that export memory 0, this is equivalent to `Right(memory)`. */
   def exportedMemory(name: String): Either[WasmError, Memory]
+
+  /** Resolve an exported table by name. */
+  def exportedTable(name: String): Either[WasmError, RuntimeTable]
+
+  /** Live cell backing an exported global. Sharing this cell with
+    * another module's import preserves the wasm-spec rule that
+    * imported mutable globals alias the exporter's storage. */
+  def exportedGlobalCell(name: String): Either[WasmError, GlobalCell]
+
+  /** Mutability flag of an exported global — needed by hosts
+    * forwarding one module's globals as another module's imports
+    * (the wasm mutability-matching rule rejects the import if the
+    * advertised flavour is wrong). */
+  def exportedGlobalMutability(name: String): Either[WasmError, Boolean]
+
+  /** Declared signature of an exported function. Needed when
+    * re-exporting a function as another module's host import — the
+    * importer needs the callee's actual `FuncType` to type-check the
+    * call site. */
+  def exportedFunctionType(name: String): Either[WasmError, FuncType]
+
+  /** Enumerated export-name lists, sorted. Sibling to
+    * `exportedFunctionNames`; used by hosts that want to walk every
+    * exposed binding. */
+  def exportedMemoryNames: Seq[String]
+  def exportedTableNames:  Seq[String]
+  def exportedGlobalNames: Seq[String]
 ```
 
 Everything else on the class is `private[wasm]` and exists for the interpreter's eval loop.

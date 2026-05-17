@@ -30,16 +30,19 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 
 ```text
 $ wasm --help
-wasm 0.3.0
+wasm 0.4.0
 Usage: wasm [options] <file> [<wasi-args>...]
 
   <file>                                       path to a .wasm module
-  <wasi-args>...                               arguments passed to a WASI program's `_start` as argv[1..]; use `--` to separate from CLI flags
+  <wasi-args>...                               arguments passed to a WASI program's `_start` as argv[1..]
   -i, --invoke <export>                        name of the export to invoke (default: _start if exported, else main)
   -a, --args n1,n2,...                         comma-separated decimal i32 arguments to the export
   --list-exports                               print exported function names and exit (no invocation)
   -p, --preopen <host-path>:<virtual-name>     mount a host directory as a wasi preopen (repeatable)
   -e, --env <key>=<value>                      environment variable for the WASI program (repeatable)
+  --stdin <path>                               redirect fd 0 from <path>
+  --trace                                      install a counting Tracer; print totals to stderr after the run
+  --validate-only                              parse + validate the module and exit; don't instantiate
   --help                                       print this help message
   --version                                    print version and exit
 ```

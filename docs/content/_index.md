@@ -28,7 +28,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 
 ## Why this one?
 
-- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.3.0` / `wasm-wasi:0.3.0`) without dragging in a third-party transitive surface.
+- **Zero runtime dependencies.** `interp` uses only the Scala stdlib. `wasi` depends only on `interp`. Both ship to Maven Central (`io.github.edadma:wasm:0.4.0` / `wasm-wasi:0.4.0`) without dragging in a third-party transitive surface.
 - **One codebase, three platforms.** JVM, Scala.js, and Scala Native all share the same `shared/` interpreter and WASI shim. Platform-specific code is limited to the `HostPreopen.fromDir` implementation (`java.nio.file` on JVM/Native, `fs.*Sync` on JS).
 - **Deterministic numerics.** Every `i32` / `i64` / `f32` / `f64` opcode produces bit-identical results across all three platforms, including IEEE-754 edge cases.
 - **Validation up front.** Every imported module runs through a separate validator before any code executes. Bad binaries fail at `Runtime.instantiate` with a `function <N>: byte offset 0x<hex>: <details>` error, not at run time.
@@ -42,7 +42,7 @@ Three rustc-built `wasm32-wasip1` fixtures are committed and pass in CI — a `p
 | Scala.js 1.21.0 (Node 20+)          | ✓      |
 | Scala Native 0.5.11                 | ✓      |
 
-**870 tests** on the JVM (648 interpreter + 208 WASI + 14 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **129 manifests fully green** and 13 pinned (function-references / imported-memories-and-tables / cross-module register gaps). See [Spec compliance](/reference/spec-compliance/) for the table.
+**881 tests** on the JVM (653 interpreter + 209 WASI + 19 CLI), all green; the interpreter and WASI test suites also pass on Scala.js and Scala Native. The official [W3C testsuite](https://github.com/WebAssembly/testsuite) runs through an integrated runner — **142 manifests / ~53,000 assertions** in the current slice (the full SIMD proposal, bulk memory + tables + element segments, EH and tail-call proposals, plus binary-format and UTF-8 edge cases), **133 manifests fully green** and 9 pinned (mostly wasm-3.0 GC-proposal reftype short forms and a handful of niche residuals). See [Spec compliance](/reference/spec-compliance/) for the table.
 
 ## Try it
 
@@ -69,5 +69,5 @@ sbt 'cliJVM/run --preopen /tmp/sandbox:/sandbox \
 - [Getting Started](/getting-started/) — install the artifacts, run your first module.
 - [Concepts](/concepts/) — the validator, host imports, traps and errors.
 - [WASI](/wasi/) — the 29 syscalls implemented, the three preopen flavours, and the BSD-inetd socket model.
-- [CLI](/cli/) — `--preopen`, `--invoke`, `--args`, and the dispatch rules.
+- [CLI](/cli/) — `--preopen`, `--invoke`, `--args`, `--stdin`, `--trace`, `--validate-only`, and the dispatch rules.
 - [Reference](/reference/) — supported opcodes, binary sections, error variants.

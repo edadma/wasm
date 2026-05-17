@@ -28,17 +28,43 @@ type HostFunc = (Memory, Seq[Value]) => Seq[Value]
 type HostFuncMulti = (IndexedSeq[Memory], Seq[Value]) => Seq[Value]
 
 /** An exported global from a host module. Imported by a wasm module's
-  * import section (kind 0x03). The runtime copies the value into the
-  * importing module's globalidx slot at instantiation. The declared
-  * `valueType` and `mutable` flag must match the importing module's
-  * `(import "..." "..." (global <type> <mut>))` exactly.
+  * import section (kind 0x03). The declared `valueType` and `mutable`
+  * flag must match the importing module's `(import "..." "..." (global
+  * <type> <mut>))` exactly.
   *
-  * Mutability: currently the runtime treats the import as a snapshot
-  * taken at instantiation — `global.set` from inside the wasm module
-  * updates the wasm-side slot only. Sharing live mutable state across
-  * module boundaries isn't surfaced yet; pin imports as `mutable=false`
-  * to match the W3C spec-test convention. */
-final case class HostGlobal(valueType: ValueType, mutable: Boolean, value: Value)
+  * Backed internally by a [[GlobalCell]]. The `apply(vt, mut, value)`
+  * factory wraps a literal in a fresh cell — fine for immutable
+  * globals and for mutable globals the host doesn't need to observe.
+  * For sharing live state across module boundaries (the wasm spec's
+  * required semantics for cross-module mutable globals), use
+  * [[HostGlobal.live]] with a `GlobalCell` the host can also read /
+  * write outside the wasm module. */
+final class HostGlobal private[wasm] (
+    val valueType: ValueType,
+    val mutable:   Boolean,
+    val cell:      GlobalCell,
+):
+  /** Current value of the underlying cell. Equivalent to `cell.value`. */
+  def value: Value = cell.value
+
+  override def toString: String =
+    s"HostGlobal($valueType, mutable=$mutable, value=$value)"
+
+object HostGlobal:
+  /** Wrap a literal value in a fresh cell. Use this when the host has
+    * no need to share live state with the wasm module — the common
+    * case for immutable globals and for one-shot configuration. */
+  def apply(valueType: ValueType, mutable: Boolean, value: Value): HostGlobal =
+    new HostGlobal(valueType, mutable, new GlobalCell(value))
+
+  /** Build a HostGlobal backed by an externally-owned cell. The host
+    * keeps a reference to `cell`; writes by the wasm module via
+    * `global.set` mutate the same storage, so the host sees them
+    * immediately. The spec runner uses this to forward one module's
+    * exported globals as another module's imports without losing the
+    * shared-storage semantics the wasm-3.0 spec requires. */
+  def live(valueType: ValueType, mutable: Boolean, cell: GlobalCell): HostGlobal =
+    new HostGlobal(valueType, mutable, cell)
 
 trait HostModule:
   def name: String
@@ -55,6 +81,20 @@ trait HostModule:
     * (kind 0x03). Defaults to empty — most host modules don't expose
     * globals. */
   def globals: Map[String, HostGlobal] = Map.empty
+
+  /** Host-provided linear memories. Imported by a wasm module's import
+    * section (kind 0x02). The host supplies a live [[Memory]] instance;
+    * the runtime checks the host's `currentPages` / `maxPages` against
+    * the importing module's declared limits and uses the live instance
+    * directly so guest writes are observable to the host. Defaults to
+    * empty. */
+  def memories: Map[String, Memory] = Map.empty
+
+  /** Host-provided tables. Imported by a wasm module's import section
+    * (kind 0x01). The host supplies a live [[RuntimeTable]]; the runtime
+    * checks the table's `refType`, current `size`, and `max` against the
+    * importing module's declared shape. Defaults to empty. */
+  def tables: Map[String, RuntimeTable] = Map.empty
 
 /** The single host module the interpreter ships with.
   *

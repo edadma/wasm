@@ -59,6 +59,10 @@ println(s"distinct opcodes: ${ops.toSet}")
 
 The hooks fire in execution order. `onOp` runs just before the opcode dispatches; `onCall` runs after the new frame is pushed; `onReturn` runs after the frame is popped. Tail calls fire `onReturn(caller)` followed by `onCall(callee)` — the depth net change is zero, which is what `Tracer.Counting.maxDepth` observes.
 
+## From the CLI
+
+`wasm --trace <file>` installs `Tracer.counting` and prints the totals to stderr after the run. See [CLI → Flags](/cli/flags/#--trace) for the exact output shape. Useful for quick profiling without writing any Scala.
+
 ## What the tracer does NOT see
 
 - **Sub-opcodes of `0xFC` / `0xFD`** — `onOp` surfaces the prefix byte (`0xFC` / `0xFD`), not the sub-opcode. If you want per-sub-op visibility, read the next byte off the function body yourself or maintain a side counter.

@@ -120,26 +120,22 @@ private[spec] object KnownFailures:
     *   - `local_init`    — `(ref func)` non-null short form (0x64)
     *   - `unreached-valid` — function-references + typed reftype lookup
     *
-    * --- Residual gaps after compact-imports (8 manifests) ---
-    * Compact-imports (0x7E/0x7F trigger when field_name == "") landed
-    * — `names` is now fully green. The remaining 8 manifests have
-    * other residual causes: imported memories / tables aren't
-    * surfaced in the model (kind 0x01 and 0x02 are silently skipped
-    * by the parser); certain fault-injection corners around
-    * `assert_malformed` modules behave differently from the spec; and
-    * particular bulk-op edge cases on `table_copy` / `table_grow`
-    * still differ from the reference. Each manifest has shrunk
-    * substantially since compact-imports landed; the next round of
-    * triage is per-manifest investigation.
-    *   - `data`, `elem`, `exports`, `global`, `imports`,
-    *     `memory_grow`, `table_copy`, `table_grow`
-    *
-    * --- Cross-module `register` (runner-side) ---
-    * The wast2json command stream includes `register` commands that bind
-    * a module instance to an external name for subsequent imports; our
-    * runner doesn't implement that dispatch yet.
-    *   - `linking`
-    *
+    * --- Residual gaps after compact-imports, imported mem/tables, and
+    *     cross-module register all landed (5 manifests) ---
+    * Each remaining manifest's residual cause is niche:
+    *   - `data` (2 fails) — `assert_invalid` corners the validator
+    *     should catch but currently lets through
+    *   - `elem` (22 fails) — mostly GC reftype short form `0x40` in
+    *     table sections (15 fails) plus 6 specific result-value
+    *     mismatches on elem-segment edge cases
+    *   - `global` (6 fails) — one GC reftype short form in a table
+    *     section, plus 5 cascading "no current module"
+    *   - `imports` (2 fails) — niche import-shape mismatches
+    *   - `linking` (20 fails) — mutable-global cross-module sharing
+    *     (snapshot model in `wrapAsHostModule` doesn't propagate guest
+    *     `global.set` back to the exporting module), `(ref heaptype)`
+    *     short forms `0x63`/`0x64` in element segments, and cascade
+    *     from earlier-failed modules
     */
   private val names: Set[String] = Set(
     // Function-references / GC proposals
@@ -147,19 +143,14 @@ private[spec] object KnownFailures:
     "table-sub",
     "local_init",
     "unreached-valid",
-    // Remaining gaps after compact-imports landed: 9 manifests still
-    // pinned but no longer gated on compact-imports parsing — each has
-    // its own residual cause (imported memories/tables not surfaced,
-    // particular fault-injection corners, etc.).
+    // Residual gaps after compact-imports + imported memories/tables +
+    // cross-module register all landed: each remaining manifest has its
+    // own niche cause (active-segment OOB validation corners, GC reftype
+    // short forms, mutable-global shared state across modules).
     "data",
     "elem",
-    "exports",
     "global",
     "imports",
-    "memory_grow",
-    "table_copy",
-    "table_grow",
-    // Cross-module register
     "linking",
   )
 
